@@ -1,0 +1,285 @@
+//! Tailles d'opération et modes d'adressage effectifs (EA) du 68000.
+
+use crate::bus::Bus;
+use crate::cpu::{ADDR_MASK, Cpu};
+
+/// Taille d'une opération.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Size {
+    /// Octet (8 bits).
+    Byte,
+    /// Mot (16 bits).
+    Word,
+    /// Mot long (32 bits).
+    Long,
+}
+
+impl Size {
+    /// Nombre d'octets de la taille.
+    pub fn bytes(self) -> u32 {
+        match self {
+            Size::Byte => 1,
+            Size::Word => 2,
+            Size::Long => 4,
+        }
+    }
+
+    /// Décode le champ taille standard à 2 bits (00=byte, 01=word, 10=long).
+    pub fn from_bits(bits: u16) -> Option<Size> {
+        match bits & 0b11 {
+            0b00 => Some(Size::Byte),
+            0b01 => Some(Size::Word),
+            0b10 => Some(Size::Long),
+            _ => None,
+        }
+    }
+
+    /// Étend une valeur de cette taille en `u32`, en propageant le signe.
+    pub fn sign_extend(self, value: u32) -> u32 {
+        match self {
+            Size::Byte => value as u8 as i8 as i32 as u32,
+            Size::Word => value as u16 as i16 as i32 as u32,
+            Size::Long => value,
+        }
+    }
+
+    /// Masque ne gardant que les bits significatifs de la taille.
+    pub fn mask(self) -> u32 {
+        match self {
+            Size::Byte => 0x0000_00FF,
+            Size::Word => 0x0000_FFFF,
+            Size::Long => 0xFFFF_FFFF,
+        }
+    }
+
+    /// Bit de signe (le bit de poids fort de la taille).
+    pub fn msb(self) -> u32 {
+        match self {
+            Size::Byte => 0x0000_0080,
+            Size::Word => 0x0000_8000,
+            Size::Long => 0x8000_0000,
+        }
+    }
+}
+
+/// Une adresse effective résolue, prête à être lue ou écrite.
+///
+/// On résout l'EA en une fois (en consommant les mots d'extension nécessaires
+/// et en appliquant les effets de bord pré-décrément / post-incrément), puis on
+/// lit/écrit via [`Operand::read`] / [`Operand::write`].
+#[derive(Debug, Clone, Copy)]
+pub enum Operand {
+    /// Registre de données Dn.
+    DataReg(usize),
+    /// Registre d'adresse An.
+    AddrReg(usize),
+    /// Emplacement mémoire à l'adresse résolue.
+    Memory(u32),
+    /// Donnée immédiate déjà extraite du flot d'instructions.
+    Immediate(u32),
+}
+
+impl Operand {
+    /// Lit la valeur de l'opérande à la taille donnée.
+    /// Renvoie `Err((fault_addr, pc_at_fault))` si l'accès mémoire word/long est sur une adresse impaire.
+    pub fn read(self, cpu: &Cpu, bus: &mut impl Bus, size: Size) -> Result<u32, (u32, u32)> {
+        match self {
+            Operand::DataReg(r) => Ok(cpu.d[r] & size.mask()),
+            Operand::AddrReg(r) => Ok(match size {
+                Size::Word => cpu.a[r] as u16 as i16 as i32 as u32 & size.mask(),
+                _ => cpu.a[r] & size.mask(),
+            }),
+            Operand::Memory(addr) => {
+                if size != Size::Byte && addr & 1 != 0 {
+                    return Err((addr, cpu.ea_frame_pc));
+                }
+                Ok(read_sized(bus, addr, size))
+            }
+            Operand::Immediate(v) => Ok(v & size.mask()),
+        }
+    }
+
+    /// Écrit `value` dans l'opérande à la taille donnée.
+    /// Renvoie `Err((fault_addr, pc_at_fault))` si l'accès mémoire word/long est sur une adresse impaire.
+    pub fn write(self, cpu: &mut Cpu, bus: &mut impl Bus, size: Size, value: u32) -> Result<(), (u32, u32)> {
+        match self {
+            Operand::DataReg(r) => {
+                let keep = !size.mask();
+                cpu.d[r] = (cpu.d[r] & keep) | (value & size.mask());
+                Ok(())
+            }
+            Operand::AddrReg(r) => {
+                cpu.a[r] = size.sign_extend(value);
+                Ok(())
+            }
+            Operand::Memory(addr) => {
+                if size != Size::Byte && addr & 1 != 0 {
+                    // Un write effectue un prefetch supplémentaire avant le cycle bus :
+                    // le PC du frame est avancé de 2 par rapport à un read.
+                    return Err((addr, cpu.ea_frame_pc.wrapping_add(2)));
+                }
+                write_sized(bus, addr, size, value);
+                Ok(())
+            }
+            Operand::Immediate(_) => panic!("écriture impossible dans une donnée immédiate"),
+        }
+    }
+}
+
+/// Lit en mémoire une valeur de la taille donnée.
+fn read_sized(bus: &mut impl Bus, addr: u32, size: Size) -> u32 {
+    let addr = addr & ADDR_MASK;
+    match size {
+        Size::Byte => bus.read8(addr) as u32,
+        Size::Word => bus.read16(addr) as u32,
+        Size::Long => bus.read32(addr),
+    }
+}
+
+/// Écrit en mémoire une valeur de la taille donnée.
+fn write_sized(bus: &mut impl Bus, addr: u32, size: Size, value: u32) {
+    let addr = addr & ADDR_MASK;
+    match size {
+        Size::Byte => bus.write8(addr, value as u8),
+        Size::Word => bus.write16(addr, value as u16),
+        Size::Long => bus.write32(addr, value),
+    }
+}
+
+impl Cpu {
+    /// Résout une adresse effective décrite par les champs `mode` (3 bits) et
+    /// `reg` (3 bits) extraits de l'instruction, pour une opération de taille
+    /// `size`. Consomme les mots d'extension nécessaires et applique les
+    /// pré-décréments / post-incréments.
+    ///
+    /// Renvoie `None` pour un encodage de mode invalide.
+    pub fn resolve_ea(
+        &mut self,
+        bus: &mut impl Bus,
+        mode: u16,
+        reg: u16,
+        size: Size,
+    ) -> Option<Operand> {
+        let reg = reg as usize;
+        // PC après le fetch de l'opcode (avant tout mot d'extension de cette EA).
+        // C'est le PC du frame d'address error pour les modes basés sur An :
+        // les déplacements/index relatifs à An n'avancent pas le PC du frame.
+        let pc_before_ext = self.pc;
+        self.ea_frame_pc = pc_before_ext;
+        self.ea_is_pc_relative = false;
+        match mode {
+            // Dn
+            0b000 => Some(Operand::DataReg(reg)),
+            // An
+            0b001 => Some(Operand::AddrReg(reg)),
+            // (An)
+            0b010 => Some(Operand::Memory(self.a[reg])),
+            // (An)+ : post-incrément
+            0b011 => {
+                let addr = self.a[reg];
+                // Address error sur accès LONG à adresse impaire : le post-incrément
+                // (+4) n'est PAS validé (les deux cycles word sont avortés). Pour un
+                // accès WORD, le post-incrément (+2) reste committé. Vérifié sur
+                // CMP/ADD/AND/OR/SUB/CLR/NOT/NEG/TST/MOVEtoCCR/MOVEfromSR.
+                if size == Size::Long && addr & 1 != 0 {
+                    return Some(Operand::Memory(addr));
+                }
+                // A7 reste aligné sur un mot même pour un accès octet.
+                let step = if reg == 7 && size == Size::Byte {
+                    2
+                } else {
+                    size.bytes()
+                };
+                self.a[reg] = self.a[reg].wrapping_add(step);
+                Some(Operand::Memory(addr))
+            }
+            // -(An) : pré-décrément
+            0b100 => {
+                let step = if reg == 7 && size == Size::Byte {
+                    2
+                } else {
+                    size.bytes()
+                };
+                self.a[reg] = self.a[reg].wrapping_sub(step);
+                // Le pré-décrément consomme un cycle de prefetch supplémentaire
+                // pour les accès word/byte uniquement (pas long).
+                if size != Size::Long {
+                    self.ea_frame_pc = self.ea_frame_pc.wrapping_add(2);
+                }
+                Some(Operand::Memory(self.a[reg]))
+            }
+            // (d16,An) : déplacement 16 bits signé depuis An
+            0b101 => {
+                let disp = self.fetch_word(bus) as i16 as i32;
+                let addr = (self.a[reg] as i32).wrapping_add(disp) as u32;
+                Some(Operand::Memory(addr))
+            }
+            // (d8,An,Xn) : adressage indexé avec déplacement 8 bits
+            0b110 => {
+                let addr = self.resolve_indexed(bus, self.a[reg]);
+                Some(Operand::Memory(addr))
+            }
+            // Modes 0b111 : la sélection se fait sur `reg`.
+            0b111 => match reg {
+                // (xxx).W : adresse absolue courte, signe étendu en 32 bits
+                0b000 => {
+                    let addr = self.fetch_word(bus) as i16 as i32 as u32;
+                    // Modes absolus : le PC du frame avance avec la lecture de l'adresse.
+                    self.ea_frame_pc = self.pc;
+                    Some(Operand::Memory(addr))
+                }
+                // (xxx).L : adresse absolue longue
+                0b001 => {
+                    let addr = self.fetch_long(bus);
+                    self.ea_frame_pc = self.pc;
+                    Some(Operand::Memory(addr))
+                }
+                // (d16,PC) : déplacement relatif au PC — espace programme (FC=2/6)
+                0b010 => {
+                    let base = self.pc;
+                    let disp = self.fetch_word(bus) as i16 as i32;
+                    let addr = (base as i32).wrapping_add(disp) as u32;
+                    self.ea_is_pc_relative = true;
+                    Some(Operand::Memory(addr))
+                }
+                // (d8,PC,Xn) : indexé relatif au PC — espace programme (FC=2/6)
+                0b011 => {
+                    let base = self.pc;
+                    let addr = self.resolve_indexed(bus, base);
+                    self.ea_is_pc_relative = true;
+                    Some(Operand::Memory(addr))
+                }
+                // #imm : donnée immédiate
+                0b100 => {
+                    let value = match size {
+                        Size::Byte => self.fetch_word(bus) as u8 as u32,
+                        Size::Word => self.fetch_word(bus) as u32,
+                        Size::Long => self.fetch_long(bus),
+                    };
+                    Some(Operand::Immediate(value))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Résout un mode indexé `(d8,base,Xn)` : un mot d'extension fournit le
+    /// registre d'index, sa taille (W/L), et un déplacement signé sur 8 bits.
+    fn resolve_indexed(&mut self, bus: &mut impl Bus, base: u32) -> u32 {
+        let ext = self.fetch_word(bus);
+        let is_addr = ext & 0x8000 != 0; // bit 15 : A/D
+        let xreg = ((ext >> 12) & 0b111) as usize;
+        let long = ext & 0x0800 != 0; // bit 11 : W/L
+        let disp = ext as i8 as i32; // déplacement 8 bits signé
+
+        let index_full = if is_addr { self.a[xreg] } else { self.d[xreg] };
+        let index = if long {
+            index_full as i32
+        } else {
+            index_full as u16 as i16 as i32
+        };
+
+        (base as i32).wrapping_add(disp).wrapping_add(index) as u32
+    }
+}
