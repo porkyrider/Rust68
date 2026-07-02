@@ -77,6 +77,11 @@ pub struct Cpu {
     /// l'IR dans le frame est le mot suivant dans le flux programme (bus.read16(pc)),
     /// pas l'opcode en cours.
     pub write_ae_ir: Option<u16>,
+    /// Cycles supplémentaires de calcul d'adresse effective pour la dernière EA
+    /// résolue (dépend du mode d'adressage et de la taille — cf. resolve_ea).
+    /// Chaque handler d'instruction l'additionne à son coût de base après avoir
+    /// appelé resolve_ea, sur le même principe que ea_frame_pc/ea_is_pc_relative.
+    pub ea_extra_cycles: u32,
 }
 
 impl Default for Cpu {
@@ -89,8 +94,8 @@ impl Cpu {
     /// Crée un CPU dans un état neutre (avant `reset`).
     pub fn new() -> Self {
         Cpu {
-            d: [0; 8],
-            a: [0; 8],
+            d: [0xFFFF_FFFF; 8],
+            a: [0xFFFF_FFFF; 8],
             pc: 0,
             sr: sr::S,
             usp: 0,
@@ -103,6 +108,7 @@ impl Cpu {
             ea_frame_pc: 0,
             ea_is_pc_relative: false,
             write_ae_ir: None,
+            ea_extra_cycles: 0,
         }
     }
 
@@ -273,10 +279,10 @@ impl Cpu {
 
         bus.write16(sp & ADDR_MASK, access_info);
         // L'adresse fautive est stockée en 32 bits (+2..+5), MSB inclus.
-        bus.write32((sp + 2) & ADDR_MASK, fault_addr);
-        bus.write16((sp + 6) & ADDR_MASK, ir);
-        bus.write16((sp + 8) & ADDR_MASK, saved_sr);
-        bus.write32((sp + 10) & ADDR_MASK, pc_at_access);
+        bus.write32(sp.wrapping_add(2) & ADDR_MASK, fault_addr);
+        bus.write16(sp.wrapping_add(6) & ADDR_MASK, ir);
+        bus.write16(sp.wrapping_add(8) & ADDR_MASK, saved_sr);
+        bus.write32(sp.wrapping_add(10) & ADDR_MASK, pc_at_access);
 
         let new_pc = bus.read32(3 * 4);
         self.pc = new_pc;

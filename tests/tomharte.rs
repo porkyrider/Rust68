@@ -64,6 +64,11 @@ struct TestCase {
     /// qui requièrent la gestion d'exceptions — ces cas sont ignorés.
     #[serde(default)]
     transactions: Vec<Value>,
+    /// Nombre de cycles CPU réels pour ce cas (format ProcessorTests standard).
+    /// `Option` : si le champ est absent (variante de format), on saute juste
+    /// la vérification du cycle-count pour ce cas sans faire échouer le parsing.
+    #[serde(default)]
+    length: Option<u64>,
 }
 
 impl TestCase {
@@ -100,6 +105,17 @@ fn install(cpu: &mut Cpu, bus: &mut FlatBus, s: &State) {
     // On N'écrit PAS en RAM : les adresses au PC peuvent contenir des données
     // initiales que l'instruction va lire (ex. ADD (A0)+,Dn quand A0 == PC).
     cpu.load_prefetch(&s.prefetch);
+}
+
+/// Compare le nombre de cycles réellement consommés à celui attendu par le
+/// test (champ `length`, absent → pas de vérification pour ce cas).
+fn compare_cycles(got: u64, case: &TestCase) -> Result<(), String> {
+    match case.length {
+        Some(want) if want != got => {
+            Err(format!("cycles = {got}, attendu {want}"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Compare l'état final attendu à l'état réel ; renvoie un message si écart.
@@ -156,12 +172,14 @@ fn compare(cpu: &Cpu, bus: &mut FlatBus, expected: &State) -> Result<(), String>
     Ok(())
 }
 
-/// Exécute un fichier de cas de test ; renvoie (réussis, échecs, ignorés).
-fn run_file(path: &PathBuf) -> (usize, usize, usize) {
+/// Exécute un fichier de cas de test ; renvoie (réussis, échecs état, échecs
+/// cycles, ignorés). Un cas peut échouer sur l'état ET sur les cycles ; il
+/// n'est compté qu'une fois dans `fail` mais les deux causes sont reportées.
+fn run_file(path: &PathBuf) -> (usize, usize, usize, usize) {
     let data = std::fs::read_to_string(path).expect("lecture du fichier de test");
     let cases: Vec<TestCase> = serde_json::from_str(&data).expect("JSON TomHarte invalide");
 
-    let (mut ok, mut fail, mut skipped) = (0, 0, 0);
+    let (mut ok, mut fail, mut cycle_fail, mut skipped) = (0, 0, 0, 0);
     for case in &cases {
         // Les cas qui déclenchent des exceptions (address error, vecteur) : on ignore.
         if case.requires_exception_handling() {
@@ -179,24 +197,39 @@ fn run_file(path: &PathBuf) -> (usize, usize, usize) {
             .any(|t| matches!(t.get(0).and_then(|v| v.as_str()), Some("re") | Some("we")));
 
         match cpu.step(&mut bus) {
-            Ok(_) => match compare(&cpu, &mut bus, &case.final_state) {
-                Ok(()) => ok += 1,
-                Err(why) => {
-                    if std::env::var("DIAG").is_ok() {
-                        // Catégorise : champ qui diffère + cas AE ?
-                        let field = why.split(['=', ' ', '[']).next().unwrap_or("?").trim();
-                        eprintln!("DIAG\t{}\tae={}\t{}", field, is_ae, case.name);
-                    } else if fail < 5 {
-                        eprintln!("ÉCHEC [{}] : {why}", case.name);
+            Ok(cycles) => {
+                let state_result = compare(&cpu, &mut bus, &case.final_state);
+                let cycles_result = compare_cycles(cycles as u64, case);
+                match (&state_result, &cycles_result) {
+                    (Ok(()), Ok(())) => ok += 1,
+                    _ => {
+                        if let Err(why) = &state_result {
+                            if std::env::var("DIAG").is_ok() {
+                                let field = why.split(['=', ' ', '[']).next().unwrap_or("?").trim();
+                                eprintln!("DIAG\t{}\tae={}\t{}", field, is_ae, case.name);
+                            } else if fail < 5 {
+                                eprintln!("ÉCHEC [{}] : {why}", case.name);
+                            }
+                        }
+                        if let Err(why) = &cycles_result {
+                            cycle_fail += 1;
+                            if std::env::var("DIAG").is_ok() {
+                                eprintln!("DIAG\tcycles\tae={}\t{}", is_ae, case.name);
+                            } else if state_result.is_ok() && cycle_fail <= 5 {
+                                eprintln!("ÉCHEC CYCLES [{}] : {why}", case.name);
+                            }
+                        }
+                        if state_result.is_err() {
+                            fail += 1;
+                        }
                     }
-                    fail += 1;
                 }
-            },
+            }
             // Opcode pas encore implémenté : on l'ignore (couverture partielle).
             Err(_) => skipped += 1,
         }
     }
-    (ok, fail, skipped)
+    (ok, fail, cycle_fail, skipped)
 }
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
@@ -260,8 +293,8 @@ fn conformite_tomharte() {
     if let Some(ref list) = focus {
         eprintln!("{BOLD}{YELLOW}▶ mode ciblé : {}{RESET}", list.join(", "));
     }
-    eprintln!("{BOLD}{CYAN}{:<22} {:>5}  {:>5}  {:>5}  {:>5}  {:<20}{RESET}",
-        "Instruction", "total", "ok", "fail", "skip", "progression");
+    eprintln!("{BOLD}{CYAN}{:<22} {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:<20}{RESET}",
+        "Instruction", "total", "ok", "fail", "cyc", "skip", "progression");
     eprintln!("{DIM}{}{RESET}", "─".repeat(72));
 
     // Charger la baseline si elle existe (format: "NOM ok fail")
@@ -279,16 +312,17 @@ fn conformite_tomharte() {
         .collect();
     let save_baseline = focus.is_none() && std::env::var("BASELINE").is_ok();
 
-    let (mut total_ok, mut total_fail, mut total_skip) = (0, 0, 0);
+    let (mut total_ok, mut total_fail, mut total_cycle_fail, mut total_skip) = (0, 0, 0, 0);
     let mut new_baseline: Vec<String> = vec![];
     let mut regressions = 0usize;
 
     for f in &files {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
-        let (ok, fail, skip) = run_file(f);
-        total_ok   += ok;
-        total_fail += fail;
-        total_skip += skip;
+        let (ok, fail, cycle_fail, skip) = run_file(f);
+        total_ok         += ok;
+        total_fail       += fail;
+        total_cycle_fail += cycle_fail;
+        total_skip       += skip;
 
         let total = ok + fail;
         let pct   = if total > 0 { ok * 100 / total } else { 100 };
@@ -318,11 +352,12 @@ fn conformite_tomharte() {
             (RED, "✗")
         };
 
-        eprintln!("{color}{marker}{RESET} {:<21} {:>5}  {GREEN}{:>5}{RESET}  {color}{:>5}{RESET}  {DIM}{:>5}{RESET}  {progress}  {DIM}{:>3}%{RESET}{}",
+        eprintln!("{color}{marker}{RESET} {:<21} {:>5}  {GREEN}{:>5}{RESET}  {color}{:>5}{RESET}  {YELLOW}{:>5}{RESET}  {DIM}{:>5}{RESET}  {progress}  {DIM}{:>3}%{RESET}{}",
             name,
             ok + fail + skip,
             ok,
             if fail > 0 { format!("{fail}") } else { String::new() },
+            if cycle_fail > 0 { format!("{cycle_fail}") } else { String::new() },
             if skip > 0 { format!("{skip}") } else { String::new() },
             pct,
             regression_tag,
@@ -335,15 +370,21 @@ fn conformite_tomharte() {
     let grand_total = total_ok + total_fail + total_skip;
     let grand_pct   = if total_ok + total_fail > 0 { total_ok * 100 / (total_ok + total_fail) } else { 100 };
     eprintln!("{DIM}{}{RESET}", "─".repeat(72));
-    eprintln!("{BOLD}  {:<21} {:>5}  {:>5}  {:>5}  {:>5}  {}  {:>3}%{RESET}",
+    eprintln!("{BOLD}  {:<21} {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {}  {:>3}%{RESET}",
         "TOTAL",
         grand_total,
         total_ok,
         if total_fail > 0 { format!("{total_fail}") } else { String::new() },
+        if total_cycle_fail > 0 { format!("{total_cycle_fail}") } else { String::new() },
         if total_skip > 0 { format!("{total_skip}") } else { String::new() },
         bar(total_ok, total_ok + total_fail, 20),
         grand_pct,
     );
+    if total_cycle_fail > 0 {
+        eprintln!("{DIM}({total_cycle_fail} cas ok en registres/RAM mais avec un nombre de cycles \
+incorrect — colonne 'cyc', non bloquant pour l'instant, cf. plan de mise en \
+conformité des timings dans execute.rs){RESET}");
+    }
     eprintln!();
 
     if save_baseline {

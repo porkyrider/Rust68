@@ -146,6 +146,30 @@ fn write_sized(bus: &mut impl Bus, addr: u32, size: Size, value: u32) {
     }
 }
 
+/// Cycles supplémentaires de calcul d'adresse effective (EA), selon le mode
+/// d'adressage et la taille — table "OPERAND EFFECTIVE ADDRESS CALCULATION
+/// TIMES" de Yacht.txt (3rdparty/doc/Yacht.txt, lignes 127-153 du dépôt STAY).
+/// Ce coût s'ajoute au coût de base de l'instruction ; il ne remplace rien.
+pub fn ea_extra_cycles(mode: u16, reg: u16, size: Size) -> u32 {
+    let long = size == Size::Long;
+    match mode {
+        0b000 | 0b001 => 0,                       // Dn, An
+        0b010 | 0b011 => if long { 8 } else { 4 }, // (An), (An)+
+        0b100 => if long { 10 } else { 6 },        // -(An)
+        0b101 => if long { 12 } else { 8 },        // (d16,An)
+        0b110 => if long { 14 } else { 10 },       // (d8,An,Xn)
+        0b111 => match reg {
+            0b000 => if long { 12 } else { 8 },    // (xxx).W
+            0b001 => if long { 16 } else { 12 },   // (xxx).L
+            0b010 => if long { 12 } else { 8 },    // (d16,PC)
+            0b011 => if long { 14 } else { 10 },   // (d8,PC,Xn)
+            0b100 => if long { 8 } else { 4 },     // #imm
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 impl Cpu {
     /// Résout une adresse effective décrite par les champs `mode` (3 bits) et
     /// `reg` (3 bits) extraits de l'instruction, pour une opération de taille
@@ -160,6 +184,7 @@ impl Cpu {
         reg: u16,
         size: Size,
     ) -> Option<Operand> {
+        self.ea_extra_cycles = ea_extra_cycles(mode, reg, size);
         let reg = reg as usize;
         // PC après le fetch de l'opcode (avant tout mot d'extension de cette EA).
         // C'est le PC du frame d'address error pour les modes basés sur An :

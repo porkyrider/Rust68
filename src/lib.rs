@@ -40,7 +40,7 @@ mod cpu;
 mod execute;
 
 pub use addressing::{Operand, Size};
-pub use bus::Bus;
+pub use bus::{Bus, TimedBus};
 pub use cpu::{ADDR_MASK, Cpu, ccr, sr};
 pub use execute::StepError;
 

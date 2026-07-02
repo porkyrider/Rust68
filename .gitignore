@@ -1,3 +1,5 @@
 /target
 /docs
 tomharte_baseline.txt
+.DS_Store
+.claude/

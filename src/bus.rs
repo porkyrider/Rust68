@@ -45,4 +45,98 @@ pub trait Bus {
         self.write16(addr, (value >> 16) as u16);
         self.write16(addr.wrapping_add(2), value as u16);
     }
+
+    /// Appelé lorsque le CPU exécute l'instruction RESET (opcode 0x4E70).
+    /// Sur le 68000, cette instruction génère le signal /RESET vers les
+    /// périphériques externes pendant 124 cycles. Implémentation par défaut
+    /// no-op ; surcharger pour propager le reset aux périphériques.
+    fn reset_bus(&mut self) {}
+
+    /// Vrai si `addr` est soumise à une contention de bus DRAM/vidéo (le
+    /// Shifter/la puce vidéo partage le bus RAM avec le CPU et lui vole des
+    /// cycles selon un motif périodique — modélisé par le CPU comme un
+    /// arrondi à 4 cycles, cf. `Cpu::step`). Par défaut : aucune contention
+    /// (ROM, registres périphériques, ou système sans modèle de contention).
+    /// Les implémentations Atari ST/STE doivent renvoyer `true` pour les
+    /// adresses RAM effectivement peuplées.
+    fn is_contended(&self, addr: u32) -> bool {
+        let _ = addr;
+        false
+    }
+}
+
+/// Bus intercalé qui applique le modèle de wait-state DRAM/vidéo (façon
+/// Steem : `RAM_ACCESS_WS`) à chaque transaction bus réelle, de façon
+/// transparente pour tout le code du CPU (addressing.rs / execute.rs)
+/// puisqu'ils sont génériques sur `impl Bus` et ne savent pas qu'ils
+/// traversent ce wrapper.
+///
+/// `pos` est la position courante sur la grille de 4 cycles — initialisée
+/// depuis `Cpu.cycles` par `Cpu::step` avant chaque instruction et jamais
+/// remise à zéro entre les instructions, pour rester en phase avec
+/// l'horloge vidéo continue. Chaque transaction consomme nominalement 4
+/// cycles ; si `is_contended(addr)` et que la position n'est pas déjà
+/// alignée sur 4, l'écart est perdu (aligné au 4 supérieur) avant la
+/// transaction — exactement le mécanisme Steem.
+pub struct TimedBus<'b, B: Bus> {
+    pub inner: &'b mut B,
+    pub pos: u64,
+    pub access_count: u32,
+}
+
+impl<'b, B: Bus> TimedBus<'b, B> {
+    fn charge(&mut self, addr: u32) {
+        if self.inner.is_contended(addr) {
+            let rem = self.pos & 3;
+            if rem != 0 {
+                self.pos += 4 - rem;
+            }
+        }
+        self.access_count += 1;
+        self.pos += 4;
+    }
+}
+
+impl<'b, B: Bus> Bus for TimedBus<'b, B> {
+    fn read8(&mut self, addr: u32) -> u8 {
+        self.charge(addr);
+        self.inner.read8(addr)
+    }
+
+    fn write8(&mut self, addr: u32, value: u8) {
+        self.charge(addr);
+        self.inner.write8(addr, value);
+    }
+
+    fn read16(&mut self, addr: u32) -> u16 {
+        self.charge(addr);
+        self.inner.read16(addr)
+    }
+
+    fn write16(&mut self, addr: u32, value: u16) {
+        self.charge(addr);
+        self.inner.write16(addr, value);
+    }
+
+    fn read32(&mut self, addr: u32) -> u32 {
+        // Bus 16 bits réel : un accès long = deux cycles bus mot indépendants,
+        // chacun avec son propre alignement de grille (pas un seul accès 32
+        // bits atomique).
+        let hi = self.read16(addr) as u32;
+        let lo = self.read16(addr.wrapping_add(2)) as u32;
+        (hi << 16) | lo
+    }
+
+    fn write32(&mut self, addr: u32, value: u32) {
+        self.write16(addr, (value >> 16) as u16);
+        self.write16(addr.wrapping_add(2), value as u16);
+    }
+
+    fn reset_bus(&mut self) {
+        self.inner.reset_bus();
+    }
+
+    fn is_contended(&self, addr: u32) -> bool {
+        self.inner.is_contended(addr)
+    }
 }

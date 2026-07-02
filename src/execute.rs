@@ -28,6 +28,128 @@ fn ae_write(r: Result<(), (u32, u32)>) -> Result<(), StepError> {
     r.map_err(|(addr, pc)| StepError::AddressError(addr, true, pc))
 }
 
+/// Coût de base de l'écriture destination de MOVE, par mode/taille (Yacht.txt
+/// lignes 338-553 du dépôt STAY : tables `<ea>,Dn` / `<ea>,(An)` / ... par
+/// mode destination). S'ajoute au `ea_extra_cycles` de la SOURCE (capturé par
+/// op_move avant de résoudre la destination) — les deux termes sont
+/// indépendants et non redondants (l'un lit, l'autre écrit).
+fn move_dst_base(dst_mode: u16, dst_reg: u16, size: Size) -> u32 {
+    let long = size == Size::Long;
+    match dst_mode {
+        0b000 | 0b001 => 4,                          // Dn, An (MOVEA)
+        0b010 | 0b011 | 0b100 => if long { 12 } else { 8 },  // (An), (An)+, -(An)
+        0b101 => if long { 16 } else { 12 },          // (d16,An)
+        0b110 => if long { 18 } else { 14 },          // (d8,An,Xn)
+        0b111 => match dst_reg {
+            0b000 => if long { 16 } else { 12 },      // (xxx).W
+            0b001 => if long { 20 } else { 16 },      // (xxx).L
+            _ => if long { 12 } else { 8 },           // non valide en MOVE dst — repli prudent
+        },
+        _ => if long { 12 } else { 8 },
+    }
+}
+
+/// Coût partagé par OR/AND et la forme générique ADD/SUB (Yacht.txt lignes
+/// 1064-1105 et 1258-1299 du dépôt STAY — même famille microcode, même
+/// forme). `to_ea` : direction Dn,<ea> (true) ou <ea>,Dn (false). `ea_is_reg`
+/// (pertinent seulement si `!to_ea`) : source Dn/An, sans coût d'EA mémoire.
+fn logic_op_cost(to_ea: bool, ea_is_reg: bool, size: Size, ea_extra: u32) -> u32 {
+    let long = size == Size::Long;
+    if to_ea {
+        if long { 12 + ea_extra } else { 8 + ea_extra }
+    } else if long {
+        if ea_is_reg { 8 } else { 6 + ea_extra }
+    } else if ea_is_reg { 4 } else { 4 + ea_extra }
+}
+
+/// Coût partagé par CLR/NEG/NEGX/NOT (Yacht.txt lignes 564-586 du dépôt
+/// STAY) : lecture-modification-écriture sur Dn ou en mémoire.
+fn rmw_cost(is_dn: bool, size: Size, ea_extra: u32) -> u32 {
+    let long = size == Size::Long;
+    if is_dn {
+        if long { 6 } else { 4 }
+    } else if long {
+        12 + ea_extra
+    } else {
+        8 + ea_extra
+    }
+}
+
+/// Coût de JSR par mode (Yacht.txt lignes 806-814) — table dédiée, ne suit
+/// pas le motif générique de `ea_extra_cycles`.
+fn jsr_cost(mode: u16, reg: u16) -> u32 {
+    match mode {
+        0b101 => 18,                          // (d16,An)
+        0b110 => 22,                          // (d8,An,Xn)
+        0b111 => match reg {
+            0b000 => 18,                      // (xxx).W
+            0b001 => 20,                      // (xxx).L
+            0b010 => 18,                      // (d16,PC)
+            0b011 => 22,                      // (d8,PC,Xn)
+            _ => 16,
+        },
+        _ => 16,                              // (An)
+    }
+}
+
+/// Coût de JMP par mode (Yacht.txt lignes 817-825).
+fn jmp_cost(mode: u16, reg: u16) -> u32 {
+    match mode {
+        0b101 => 10,
+        0b110 => 14,
+        0b111 => match reg {
+            0b000 => 10,
+            0b001 => 12,
+            0b010 => 10,
+            0b011 => 14,
+            _ => 8,
+        },
+        _ => 8,
+    }
+}
+
+/// Coût de PEA/LEA par mode (Yacht.txt lignes 634-644 / 794-803) — même forme
+/// pour les deux instructions, décalée d'une constante (PEA = LEA + 8).
+fn pea_lea_cost(mode: u16, reg: u16, is_pea: bool) -> u32 {
+    let lea = match mode {
+        0b101 => 8,                           // (d16,An)
+        0b110 => 12,                          // (d8,An,Xn)
+        0b111 => match reg {
+            0b000 => 8,                       // (xxx).W
+            0b001 => 12,                      // (xxx).L
+            0b010 => 8,                       // (d16,PC)
+            0b011 => 12,                      // (d8,PC,Xn)
+            _ => 4,
+        },
+        _ => 4,                               // (An)
+    };
+    if is_pea { lea + 8 } else { lea }
+}
+
+/// Coût de base de MOVEM, par mode/direction (Yacht.txt lignes 654-696 du
+/// dépôt STAY) — indépendant de la taille (word/long ne changent que le coût
+/// par registre, `4` ou `8`, ajouté séparément par le nombre de registres du
+/// masque). `-(An)` (mode 0b100, R→M seulement) partage la base de `(An)`.
+fn movem_base(mode: u16, reg: u16, to_regs: bool) -> u32 {
+    if to_regs {
+        match mode {
+            0b010 | 0b011 => 12,                       // (An), (An)+
+            0b101 => 16,                                // (d16,An)
+            0b110 => 18,                                // (d8,An,Xn)
+            0b111 => if reg == 0b001 { 20 } else { 16 }, // (xxx).L / (xxx).W
+            _ => 12,
+        }
+    } else {
+        match mode {
+            0b010 | 0b100 => 8,                         // (An), -(An)
+            0b101 => 12,                                // (d16,An)
+            0b110 => 14,                                // (d8,An,Xn)
+            0b111 => if reg == 0b001 { 16 } else { 12 }, // (xxx).L / (xxx).W
+            _ => 8,
+        }
+    }
+}
+
 impl Cpu {
     /// Lit en mémoire à `addr` (non masquée) avec détection d'address error.
     /// Renvoie `Err((fault_addr, pc))` si word/long sur adresse impaire.
@@ -88,43 +210,59 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut impl Bus) -> Result<u32, StepError> {
         self.pending_address_error = None;
-        let opcode = self.fetch_word(bus);
+        // Enveloppe le bus pour appliquer les wait-states DRAM/vidéo (Steem
+        // RAM_ACCESS_WS) à chaque transaction réelle. `addressing.rs` et les
+        // handlers d'opcodes sont génériques sur `impl Bus` et n'ont pas
+        // besoin de savoir qu'ils traversent ce wrapper — l'interception est
+        // donc transparente, aucun site d'accès bus n'a besoin d'être modifié.
+        // `pos` reprend `self.cycles` : la grille de 4 cycles reste en phase
+        // avec l'horloge continue à travers les instructions, pas remise à
+        // zéro à chaque step().
+        let mut timed = crate::bus::TimedBus { inner: bus, pos: self.cycles, access_count: 0 };
+        let opcode = self.fetch_word(&mut timed);
         self.current_ir = opcode;
         // PC juste après fetch de l'opcode (= opcode_addr + 2), avant les mots d'extension.
         // C'est le PC à sauvegarder dans le frame si une instruction-fetch AE survient.
         let pc_after_opcode = self.pc;
-        let result = self.execute(bus, opcode);
+        let result = self.execute(&mut timed, opcode);
         match result {
             Ok(cycles) => {
                 // pending_address_error est setté par BSR/BRA pour override le PC du frame.
                 // Pour JMP/RTS, on détecte juste self.pc & 1 et utilise pc_after_opcode.
                 if let Some((fault_addr, is_write, explicit_pc)) = self.pending_address_error.take() {
-                    self.take_address_error_full(bus, fault_addr, is_write, Some(explicit_pc), true);
-                    let ae_cycles = 50u32;
-                    self.cycles = self.cycles.wrapping_add(ae_cycles as u64);
-                    return Ok(ae_cycles);
+                    self.take_address_error_full(&mut timed, fault_addr, is_write, Some(explicit_pc), true);
+                    return Ok(self.finalize_cycles(&timed, 50));
                 }
                 // Après exécution, si PC est impaire → address error sur instruction fetch
                 // (ex: JMP/RTS qui saute à une adresse impaire)
                 if self.pc & 1 != 0 {
                     let fault_addr = self.pc;
                     // PC dans le frame = adresse après fetch de l'opcode courant, PAS le target
-                    self.take_address_error_full(bus, fault_addr, false, Some(pc_after_opcode), true);
-                    let ae_cycles = 50u32;
-                    self.cycles = self.cycles.wrapping_add(ae_cycles as u64);
-                    return Ok(ae_cycles);
+                    self.take_address_error_full(&mut timed, fault_addr, false, Some(pc_after_opcode), true);
+                    return Ok(self.finalize_cycles(&timed, 50));
                 }
-                self.cycles = self.cycles.wrapping_add(cycles as u64);
-                Ok(cycles)
+                Ok(self.finalize_cycles(&timed, cycles))
             }
             Err(StepError::AddressError(fault_addr, is_write, pc_at_fault)) => {
-                self.take_address_error_at(bus, fault_addr, is_write, Some(pc_at_fault));
-                let cycles = 50u32;
-                self.cycles = self.cycles.wrapping_add(cycles as u64);
-                Ok(cycles)
+                self.take_address_error_at(&mut timed, fault_addr, is_write, Some(pc_at_fault));
+                Ok(self.finalize_cycles(&timed, 50))
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Combine les cycles bus réellement observés pendant l'instruction
+    /// (transactions × 4 + wait-states insérés, déjà accumulés dans
+    /// `timed.pos`) avec la part purement interne du coût de table calculé
+    /// par le handler d'opcode (`table_cost` moins les 4 cycles par
+    /// transaction déjà comptés côté bus, pour éviter un double comptage).
+    /// Avance `self.cycles` et renvoie le total réellement consommé.
+    fn finalize_cycles<B: Bus>(&mut self, timed: &crate::bus::TimedBus<B>, table_cost: u32) -> u32 {
+        let bus_cycles = timed.pos - self.cycles;
+        let internal = (table_cost as u64).saturating_sub(4 * timed.access_count as u64);
+        let total = bus_cycles + internal;
+        self.cycles = self.cycles.wrapping_add(total);
+        total as u32
     }
 
     fn execute(&mut self, bus: &mut impl Bus, opcode: u16) -> Result<u32, StepError> {
@@ -169,26 +307,36 @@ impl Cpu {
         }
 
         // BTST/BCHG/BCLR/BSET Dn,<ea> : 0000 rrr 1 tt mmm rrr
+        // Yacht.txt lignes 226-312 : coût mem = base+ea_extra ; coût registre
+        // dépend du numéro de bit (< 16 ou >= 16) et diffère pour BCLR.
         if opcode & 0x0100 != 0 && (opcode >> 8) & 0b111 != 0b100 {
             let bit_reg = ((opcode >> 9) & 0b111) as usize;
             let op = (opcode >> 6) & 0b11;
             let is_mem = mode != 0b000;
             let sz = if is_mem { Size::Byte } else { Size::Long };
             let ea = self.resolve_ea(bus, mode, reg, sz).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let val = ae_read(ea.read(self, bus, sz))?;
             let modulus = if is_mem { 8 } else { 32 };
             let bit = self.d[bit_reg] as u32 % modulus;
             let mask = 1u32 << bit;
             self.set_flag(ccr::Z, val & mask == 0);
             let result = match op {
-                0b00 => { return Ok(6); } // BTST — pas d'écriture
+                0b00 => { // BTST — pas d'écriture
+                    return Ok(if is_mem { 4 + ea_extra } else { 6 });
+                }
                 0b01 => val ^ mask,        // BCHG
                 0b10 => val & !mask,       // BCLR
                 0b11 => val | mask,        // BSET
                 _ => unreachable!(),
             };
             ae_write(ea.write(self, bus, sz, result))?;
-            return Ok(8);
+            let reg_cost = if op == 0b10 { // BCLR
+                if bit < 16 { 8 } else { 10 }
+            } else { // BCHG / BSET
+                if bit < 16 { 6 } else { 8 }
+            };
+            return Ok(if is_mem { 8 + ea_extra } else { reg_cost });
         }
 
         // BTST/BCHG/BCLR/BSET #imm,<ea> : 0000 1000 xx mmm rrr (bits 11-9 = 100)
@@ -198,20 +346,28 @@ impl Cpu {
             let is_mem = mode != 0b000;
             let sz = if is_mem { Size::Byte } else { Size::Long };
             let ea = self.resolve_ea(bus, mode, reg, sz).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let val = ae_read(ea.read(self, bus, sz))?;
             let modulus = if is_mem { 8 } else { 32 };
             let bit = bit_num % modulus;
             let mask = 1u32 << bit;
             self.set_flag(ccr::Z, val & mask == 0);
             let result = match op {
-                0b00 => { return Ok(10); } // BTST
+                0b00 => { // BTST
+                    return Ok(if is_mem { 8 + ea_extra } else { 10 });
+                }
                 0b01 => val ^ mask,         // BCHG
                 0b10 => val & !mask,        // BCLR
                 0b11 => val | mask,         // BSET
                 _ => unreachable!(),
             };
             ae_write(ea.write(self, bus, sz, result))?;
-            return Ok(12);
+            let reg_cost = if op == 0b10 { // BCLR
+                if bit < 16 { 12 } else { 14 }
+            } else { // BCHG / BSET
+                if bit < 16 { 10 } else { 12 }
+            };
+            return Ok(if is_mem { 12 + ea_extra } else { reg_cost });
         }
 
         // ORI/ANDI/EORI to CCR/SR : opcodes fixes
@@ -236,38 +392,36 @@ impl Cpu {
         };
 
         let ea = self.resolve_ea(bus, mode, reg, size).ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
+        let is_dn = mode == 0b000;
         let val = ae_read(ea.read(self, bus, size))?;
+        let long = size == Size::Long;
 
         match op {
-            0b000 => { // ORI
-                let r = val | imm;
+            0b000 | 0b001 | 0b010 | 0b011 | 0b101 => { // ORI/ANDI/SUBI/ADDI/EORI
+                let r = match op {
+                    0b000 => { let r = val | imm; self.set_logic_flags(r, size); r }
+                    0b001 => { let r = val & imm; self.set_logic_flags(r, size); r }
+                    0b010 => self.sub_with_flags(val, imm, size),
+                    0b011 => self.add_with_flags(val, imm, size),
+                    0b101 => { let r = val ^ imm; self.set_logic_flags(r, size); r }
+                    _ => unreachable!(),
+                };
                 ae_write(ea.write(self, bus, size, r))?;
-                self.set_logic_flags(r, size);
+                Ok(if long {
+                    if is_dn { 16 } else { 20 + ea_extra }
+                } else if is_dn { 8 } else { 12 + ea_extra })
             }
-            0b001 => { // ANDI
-                let r = val & imm;
-                ae_write(ea.write(self, bus, size, r))?;
-                self.set_logic_flags(r, size);
-            }
-            0b010 => { // SUBI
-                let r = self.sub_with_flags(val, imm, size);
-                ae_write(ea.write(self, bus, size, r))?;
-            }
-            0b011 => { // ADDI
-                let r = self.add_with_flags(val, imm, size);
-                ae_write(ea.write(self, bus, size, r))?;
-            }
-            0b101 => { // EORI
-                let r = val ^ imm;
-                ae_write(ea.write(self, bus, size, r))?;
-                self.set_logic_flags(r, size);
-            }
-            0b110 => { // CMPI
+            0b110 => { // CMPI — lecture seule
                 self.cmp_flags(val, imm, size);
+                Ok(if long {
+                    if is_dn { 14 } else { 12 + ea_extra }
+                } else {
+                    8 + ea_extra // uniforme, y compris Dn (ea_extra=0 alors)
+                })
             }
-            _ => return Err(StepError::Unimplemented(opcode)),
+            _ => Err(StepError::Unimplemented(opcode)),
         }
-        Ok(8)
     }
 
     // =========================================================================
@@ -380,6 +534,8 @@ impl Cpu {
     fn op_nbcd(&mut self, bus: &mut impl Bus, mode: u16, reg: u16) -> Result<u32, StepError> {
         let x = if self.flag(ccr::X) { 1u32 } else { 0 };
         let ea = self.resolve_ea(bus, mode, reg, Size::Byte).ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
+        let is_dn = mode == 0b000;
         let dst = ae_read(ea.read(self, bus, Size::Byte))?;
 
         // NBCD = 0 - dst - X (BCD)
@@ -407,7 +563,7 @@ impl Cpu {
         self.set_flag(ccr::N, result & 0x80 != 0);
 
         ae_write(ea.write(self, bus, Size::Byte, result))?;
-        Ok(6)
+        Ok(if is_dn { 6 } else { 8 + ea_extra })
     }
 
     // MOVEP : 0000 ddd 1 0z 001 rrr  (ligne 0, dispatché avant MOVE)
@@ -459,6 +615,10 @@ impl Cpu {
         let src_reg  = opcode & 0b111;
         let src = self.resolve_ea(bus, src_mode, src_reg, size).ok_or(StepError::IllegalAddressing)?;
         let value = ae_read(src.read(self, bus, size))?;
+        // Capturer avant que le resolve_ea de la destination n'écrase ea_extra_cycles :
+        // seul le coût de calcul d'EA de la SOURCE s'ajoute (le coût d'écriture dst
+        // est couvert par move_dst_base, dérivé de Yacht.txt, pas du terme générique).
+        let src_extra = self.ea_extra_cycles;
 
         let dst_reg  = (opcode >> 9) & 0b111;
         let dst_mode = (opcode >> 6) & 0b111;
@@ -607,7 +767,7 @@ impl Cpu {
             self.take_address_error_full(bus, fault_addr, true, Some(frame_pc), false);
             return Ok(50);
         }
-        Ok(4)
+        Ok(src_extra + move_dst_base(dst_mode, dst_reg, size))
     }
 
     // =========================================================================
@@ -620,8 +780,9 @@ impl Cpu {
 
         match opcode {
             0x4E71 => return Ok(4),   // NOP
-            0x4E70 => {               // RESET (privilégié)
+            0x4E70 => {               // RESET (privilégié) — génère /RESET sur le bus (124 cycles)
                 if let Some(c) = self.check_privilege(bus) { return Ok(c); }
+                bus.reset_bus();
                 return Ok(132);
             }
             0x4E75 => return self.op_rts(bus),
@@ -708,6 +869,7 @@ impl Cpu {
         if opcode & 0b1111_0001_1100_0000 == 0b0100_0001_1000_0000 {
             let dn_reg = ((opcode >> 9) & 0b111) as usize;
             let ea = self.resolve_ea(bus, mode, reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let upper = ae_read(ea.read(self, bus, Size::Word))? as i16;
             let dn = (self.d[dn_reg] & 0xFFFF) as i16;
             if dn < 0 {
@@ -716,16 +878,16 @@ impl Cpu {
                 self.set_flag(ccr::N, true);
                 let pc_push = self.pc; // opcode_addr + 2 (après fetch opcode + EA)
                 self.take_exception(bus, 6, pc_push);
-                return Ok(40);
+                return Ok(40 + ea_extra);
             } else if dn > upper {
                 self.sr &= !0x000F;
                 let pc_push = self.pc;
                 self.take_exception(bus, 6, pc_push);
-                return Ok(40);
+                return Ok(38 + ea_extra);
             }
             // Dans la plage : effacer N,V,Z,C (comportement MAME)
             self.sr &= !0x000F;
-            return Ok(10);
+            return Ok(10 + ea_extra);
         }
         // EXT : 0100 1000 1 sz 000 rrr — doit précéder MOVEM (même zone de bits)
         if opcode & 0b1111_1111_1011_1000 == 0b0100_1000_1000_0000 {
@@ -749,30 +911,36 @@ impl Cpu {
         if opcode & 0b1111_1111_1100_0000 == 0b0100_0000_1100_0000 {
             let sr = self.sr;
             let ea = self.resolve_ea(bus, mode, reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let is_dn = mode == 0b000;
             // Dummy read avant write (RMW du 68000) : AE rapportée comme read error.
             ae_read(ea.read(self, bus, Size::Word))?;
             ae_write(ea.write(self, bus, Size::Word, sr as u32))?;
-            return Ok(6);
+            return Ok(if is_dn { 6 } else { 8 + ea_extra });
         }
         // MOVE to CCR : 0100 0100 11 mmm rrr
         if opcode & 0b1111_1111_1100_0000 == 0b0100_0100_1100_0000 {
             let ea = self.resolve_ea(bus, mode, reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let val = ae_read(ea.read(self, bus, Size::Word))?;
             self.write_sr(((self.sr & 0xFF00) | (val as u16 & 0x001F)) & 0xA71F);
-            return Ok(12);
+            return Ok(12 + ea_extra);
         }
         // MOVE to SR : 0100 0110 11 mmm rrr (privilégié)
         if opcode & 0b1111_1111_1100_0000 == 0b0100_0110_1100_0000 {
             if let Some(c) = self.check_privilege(bus) { return Ok(c); }
             let ea = self.resolve_ea(bus, mode, reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let val = ae_read(ea.read(self, bus, Size::Word))?;
             self.write_sr(val as u16 & 0xA71F);
-            return Ok(12);
+            return Ok(12 + ea_extra);
         }
         // CLR : 0100 0010 SS mmm rrr
         if opcode & 0b1111_1111_0000_0000 == 0b0100_0010_0000_0000 {
             let size = Size::from_bits(opcode >> 6).ok_or(StepError::IllegalAddressing)?;
             let dst = self.resolve_ea(bus, mode, reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let is_dn = mode == 0b000;
             // Le 68000 effectue un dummy read avant l'écriture (RMW) :
             // une adresse impaire déclenche un *read* error, pas un write error.
             ae_read(dst.read(self, bus, size))?;
@@ -781,58 +949,67 @@ impl Cpu {
             self.set_flag(ccr::Z, true);
             self.set_flag(ccr::V, false);
             self.set_flag(ccr::C, false);
-            return Ok(4);
+            return Ok(rmw_cost(is_dn, size, ea_extra));
         }
         // TAS : 0100 1010 11 mmm rrr — doit précéder TST (même octet haut)
         if opcode & 0b1111_1111_1100_0000 == 0b0100_1010_1100_0000 {
             let ea = self.resolve_ea(bus, mode, reg, Size::Byte).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let is_dn = mode == 0b000;
             let val = ae_read(ea.read(self, bus, Size::Byte))?;
             self.set_flag(ccr::N, val & 0x80 != 0);
             self.set_flag(ccr::Z, val == 0);
             self.set_flag(ccr::V, false);
             self.set_flag(ccr::C, false);
             ae_write(ea.write(self, bus, Size::Byte, val | 0x80))?;
-            return Ok(14);
+            return Ok(if is_dn { 4 } else { 10 + ea_extra });
         }
         // TST : 0100 1010 SS mmm rrr
         if opcode & 0b1111_1111_0000_0000 == 0b0100_1010_0000_0000 {
             let size = Size::from_bits(opcode >> 6).ok_or(StepError::IllegalAddressing)?;
             let ea = self.resolve_ea(bus, mode, reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let val = ae_read(ea.read(self, bus, size))?;
             self.set_logic_flags(val, size);
-            return Ok(4);
+            return Ok(4 + ea_extra);
         }
         // NEG : 0100 0100 SS mmm rrr  (attention : bits 10-8 = 010)
         if opcode & 0b1111_1111_0000_0000 == 0b0100_0100_0000_0000 {
             let size = Size::from_bits(opcode >> 6).ok_or(StepError::IllegalAddressing)?;
             let ea = self.resolve_ea(bus, mode, reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let is_dn = mode == 0b000;
             let val = ae_read(ea.read(self, bus, size))?;
             let result = self.sub_with_flags(0, val, size);
             // X = C pour NEG
             let c = self.flag(ccr::C);
             self.set_flag(ccr::X, c);
             ae_write(ea.write(self, bus, size, result))?;
-            return Ok(4);
+            return Ok(rmw_cost(is_dn, size, ea_extra));
         }
         // NEGX : 0100 0000 SS mmm rrr
         if opcode & 0b1111_1111_0000_0000 == 0b0100_0000_0000_0000 {
             let size = Size::from_bits(opcode >> 6).ok_or(StepError::IllegalAddressing)?;
             let ea = self.resolve_ea(bus, mode, reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let is_dn = mode == 0b000;
             let val = ae_read(ea.read(self, bus, size))?;
             let x = if self.flag(ccr::X) { 1u32 } else { 0 };
             let result = self.subx_with_flags(0, val, x, size);
             ae_write(ea.write(self, bus, size, result))?;
-            return Ok(4);
+            return Ok(rmw_cost(is_dn, size, ea_extra));
         }
         // NOT : 0100 0110 SS mmm rrr
         if opcode & 0b1111_1111_0000_0000 == 0b0100_0110_0000_0000 {
             let size = Size::from_bits(opcode >> 6).ok_or(StepError::IllegalAddressing)?;
             let ea = self.resolve_ea(bus, mode, reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let is_dn = mode == 0b000;
             let val = ae_read(ea.read(self, bus, size))?;
             let result = !val & size.mask();
             ae_write(ea.write(self, bus, size, result))?;
             self.set_logic_flags(result, size);
-            return Ok(4);
+            return Ok(rmw_cost(is_dn, size, ea_extra));
         }
         // NBCD : 0100 1000 00 mmm rrr
         if opcode & 0b1111_1111_1100_0000 == 0b0100_1000_0000_0000 {
@@ -859,7 +1036,7 @@ impl Cpu {
         self.set_sp(self.sp().wrapping_sub(4));
         bus.write32(self.sp() & ADDR_MASK, ret);
         self.pc = addr;
-        Ok(12)
+        Ok(jsr_cost(mode, reg))
     }
 
     fn op_jmp(&mut self, bus: &mut impl Bus, mode: u16, reg: u16) -> Result<u32, StepError> {
@@ -869,7 +1046,7 @@ impl Cpu {
             _ => return Err(StepError::IllegalAddressing),
         };
         self.pc = addr;
-        Ok(8)
+        Ok(jmp_cost(mode, reg))
     }
 
     fn op_rts(&mut self, bus: &mut impl Bus) -> Result<u32, StepError> {
@@ -930,7 +1107,7 @@ impl Cpu {
         };
         self.set_sp(self.sp().wrapping_sub(4));
         bus.write32(self.sp() & ADDR_MASK, addr);
-        Ok(12)
+        Ok(pea_lea_cost(mode, reg, true))
     }
 
     fn op_lea(&mut self, bus: &mut impl Bus, opcode: u16) -> Result<u32, StepError> {
@@ -942,7 +1119,7 @@ impl Cpu {
             Operand::Memory(a) => a,
             _ => return Err(StepError::IllegalAddressing),
         };
-        Ok(4)
+        Ok(pea_lea_cost(mode, reg, false))
     }
 
     fn op_movem(&mut self, bus: &mut impl Bus, opcode: u16) -> Result<u32, StepError> {
@@ -1051,7 +1228,9 @@ impl Cpu {
                 }
             }
         }
-        Ok(8)
+        let m = mask.count_ones();
+        let per_reg = if size == Size::Long { 8 } else { 4 };
+        Ok(movem_base(mode, reg, to_regs) + per_reg * m)
     }
 
     // =========================================================================
@@ -1063,6 +1242,8 @@ impl Cpu {
         let reg  = opcode & 0b111;
 
         // DBcc : 0101 cccc 1100 1rrr
+        // Yacht.txt lignes 952-966 : 10 si la boucle continue (branche prise),
+        // 12 si la condition devient vraie (sortie), 14 si le compteur expire (sortie).
         if opcode & 0b1111_0000_1111_1000 == 0b0101_0000_1100_1000 {
             let cc = (opcode >> 8) & 0b1111;
             let r  = reg as usize;
@@ -1084,22 +1265,30 @@ impl Cpu {
                         self.d[r] = (self.d[r] & 0xFFFF_0000) | (decremented as u32);
                         self.pc = target;
                     }
+                    return Ok(10); // boucle continue
                 } else {
                     self.d[r] = (self.d[r] & 0xFFFF_0000) | (decremented as u32);
+                    return Ok(14); // compteur expiré
                 }
             } else {
                 self.fetch_word(bus); // consomme le déplacement
+                return Ok(12); // condition devenue vraie
             }
-            return Ok(10);
         }
 
         // Scc : 0101 cccc 11 mmm rrr
         if opcode & 0b0000_0000_1100_0000 == 0b0000_0000_1100_0000 {
             let cc = (opcode >> 8) & 0b1111;
             let taken = self.test_condition(cc);
+            let is_dn = mode == 0b000;
             let ea = self.resolve_ea(bus, mode, reg, Size::Byte).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             ae_write(ea.write(self, bus, Size::Byte, if taken { 0xFF } else { 0x00 }))?;
-            return Ok(4);
+            return Ok(if is_dn {
+                if taken { 6 } else { 4 }
+            } else {
+                8 + ea_extra
+            });
         }
 
         // ADDQ / SUBQ
@@ -1107,7 +1296,10 @@ impl Cpu {
         let imm_bits = (opcode >> 9) & 0b111;
         let imm = if imm_bits == 0 { 8u32 } else { imm_bits as u32 };
 
-        // Pour un registre d'adresse, pas de flags, taille toujours Long
+        // Pour un registre d'adresse, pas de flags, taille toujours Long.
+        // Yacht.txt lignes 943-950 : coût réel 8, quelle que soit la taille de
+        // l'instruction (le M68000UM annonce 4 pour B/W, mais Yacht documente
+        // l'erratum confirmé sur silicium réel).
         if mode == 0b001 {
             let r = reg as usize;
             if is_sub {
@@ -1115,11 +1307,13 @@ impl Cpu {
             } else {
                 self.a[r] = self.a[r].wrapping_add(imm);
             }
-            return Ok(4);
+            return Ok(8);
         }
 
         let size = Size::from_bits(opcode >> 6).ok_or(StepError::IllegalAddressing)?;
         let ea = self.resolve_ea(bus, mode, reg, size).ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
+        let is_dn = mode == 0b000;
         let val = ae_read(ea.read(self, bus, size))?;
         let result = if is_sub {
             self.sub_with_flags(val, imm, size)
@@ -1127,7 +1321,10 @@ impl Cpu {
             self.add_with_flags(val, imm, size)
         };
         ae_write(ea.write(self, bus, size, result))?;
-        Ok(4)
+        let long = size == Size::Long;
+        Ok(if is_dn {
+            if long { 8 } else { 4 }
+        } else if long { 12 + ea_extra } else { 8 + ea_extra })
     }
 
     // =========================================================================
@@ -1153,6 +1350,7 @@ impl Cpu {
                 if target & 1 != 0 {
                     self.pending_address_error = Some((target, false, next_pc));
                 }
+                Ok(10)
             }
             0b0001 => {
                 let ret = self.pc;
@@ -1167,14 +1365,24 @@ impl Cpu {
                 if target & 1 != 0 {
                     self.pending_address_error = Some((target, false, target));
                 }
+                Ok(18) // Yacht.txt lignes 1005-1032 : la mise en pile n'était pas comptée
             }
             _ => {
-                if self.test_condition(condition) {
+                // Bcc : Yacht.txt lignes 1005-1032. Forme .B (déplacement non nul) :
+                // prise=10, non prise=8. Forme .W (mot d'extension) : prise=10, non prise=12.
+                let taken = self.test_condition(condition);
+                if taken {
                     self.pc = target;
                 }
+                Ok(if taken {
+                    10
+                } else if byte_disp != 0 {
+                    8
+                } else {
+                    12
+                })
             }
         }
-        Ok(10)
     }
 
     // =========================================================================
@@ -1206,10 +1414,11 @@ impl Cpu {
         if size_bits == 0b011 {
             let opcode_addr = self.pc.wrapping_sub(2); // avant resolve_ea
             let src = self.resolve_ea(bus, mode, ea_reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let divisor = ae_read(src.read(self, bus, Size::Word))?;
             if divisor == 0 {
                 self.take_exception(bus, 5, opcode_addr);
-                return Ok(38);
+                return Ok(38 + ea_extra);
             }
             let dividend = self.d[reg];
             let quotient  = dividend / divisor;
@@ -1228,16 +1437,19 @@ impl Cpu {
                 self.set_flag(ccr::C, false);
             }
             // DIVU ne modifie pas X
-            return Ok(140);
+            // Coût exact data-dependant (76-140) non modélisé : on garde le pire
+            // cas + ea_extra (cf. plan de mise en conformité des timings).
+            return Ok(140 + ea_extra);
         }
         // DIVS : opmode 111
         if size_bits == 0b111 {
             let opcode_addr = self.pc.wrapping_sub(2);
             let src = self.resolve_ea(bus, mode, ea_reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let divisor = ae_read(src.read(self, bus, Size::Word))? as u16 as i16 as i32;
             if divisor == 0 {
                 self.take_exception(bus, 5, opcode_addr);
-                return Ok(38);
+                return Ok(38 + ea_extra);
             }
             let dividend = self.d[reg] as i32;
             let quotient  = dividend / divisor;
@@ -1258,7 +1470,8 @@ impl Cpu {
                 self.set_flag(ccr::C, false);
             }
             // DIVS ne modifie pas X
-            return Ok(158);
+            // Coût exact data-dependant (120-158) non modélisé : pire cas + ea_extra.
+            return Ok(158 + ea_extra);
         }
         // SBCD : 1000 rrr 10000 mrrr
         if opcode & 0b1111_0001_1111_0000 == 0b1000_0001_0000_0000 {
@@ -1269,6 +1482,8 @@ impl Cpu {
         let size = Size::from_bits(size_bits).ok_or(StepError::IllegalAddressing)?;
         let to_ea = opcode & 0x0100 != 0;
         let ea = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
+        let ea_is_reg = mode <= 0b001;
         if to_ea {
             let a = self.d[reg] & size.mask();
             let b = ae_read(ea.read(self, bus, size))?;
@@ -1282,7 +1497,7 @@ impl Cpu {
             ae_write(Operand::DataReg(reg).write(self, bus, size, r))?;
             self.set_logic_flags(r, size);
         }
-        Ok(4)
+        Ok(logic_op_cost(to_ea, ea_is_reg, size, ea_extra))
     }
 
     // =========================================================================
@@ -1338,21 +1553,32 @@ impl Cpu {
             };
             let result = self.subx_with_flags(dst_val, src_val, x, size);
             ae_write(dst_op.write(self, bus, size, result))?;
-            return Ok(if mem_mode { 18 } else { 4 });
+            let long = size == Size::Long;
+            return Ok(if mem_mode {
+                if long { 30 } else { 18 }
+            } else if long { 8 } else { 4 });
         }
 
         // SUBA : opmode 011 ou 111
         if size_bits == 0b011 || size_bits == 0b111 {
             let size = if size_bits == 0b011 { Size::Word } else { Size::Long };
             let src = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let src_is_reg = mode <= 0b001;
             let value = size.sign_extend(ae_read(src.read(self, bus, size))?);
             self.a[reg] = self.a[reg].wrapping_sub(value);
-            return Ok(8);
+            return Ok(if size == Size::Long {
+                if src_is_reg { 8 } else { 6 + ea_extra }
+            } else {
+                8 + ea_extra
+            });
         }
 
         let size = Size::from_bits(size_bits).ok_or(StepError::IllegalAddressing)?;
         let to_ea = opcode & 0x0100 != 0;
         let ea = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
+        let ea_is_reg = mode <= 0b001;
         if to_ea {
             let a = ae_read(ea.read(self, bus, size))?;
             let b = self.d[reg] & size.mask();
@@ -1364,7 +1590,7 @@ impl Cpu {
             let result = self.sub_with_flags(a, b, size);
             ae_write(Operand::DataReg(reg).write(self, bus, size, result))?;
         }
-        Ok(4)
+        Ok(logic_op_cost(to_ea, ea_is_reg, size, ea_extra))
     }
 
     // =========================================================================
@@ -1381,9 +1607,10 @@ impl Cpu {
         if size_bits == 0b011 || size_bits == 0b111 {
             let size = if size_bits == 0b011 { Size::Word } else { Size::Long };
             let src = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let value = size.sign_extend(ae_read(src.read(self, bus, size))?);
             self.cmp_flags(self.a[reg], value, Size::Long);
-            return Ok(6);
+            return Ok(6 + ea_extra);
         }
 
         // EOR : bit 8 = 1, destination ≠ An
@@ -1419,26 +1646,33 @@ impl Cpu {
                 let d = ae_read(Operand::Memory(dst_addr).read(self, bus, size))?;
 
                 self.cmp_flags(d, s, size);
-                return Ok(12);
+                return Ok(if size == Size::Long { 20 } else { 12 });
             }
             // EOR Dn,<ea>
             let size = Size::from_bits(size_bits).ok_or(StepError::IllegalAddressing)?;
             let ea = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let ea_is_reg = mode <= 0b001;
             let a = self.d[reg] & size.mask();
             let b = ae_read(ea.read(self, bus, size))?;
             let r = a ^ b;
             ae_write(ea.write(self, bus, size, r))?;
             self.set_logic_flags(r, size);
-            return Ok(4);
+            let long = size == Size::Long;
+            return Ok(if ea_is_reg {
+                if long { 8 } else { 4 }
+            } else if long { 12 + ea_extra } else { 8 + ea_extra });
         }
 
         // CMP
         let size = Size::from_bits(size_bits).ok_or(StepError::IllegalAddressing)?;
         let ea = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
         let src = ae_read(ea.read(self, bus, size))?;
         let dst = self.d[reg] & size.mask();
         self.cmp_flags(dst, src, size);
-        Ok(4)
+        let base = if size == Size::Long { 6 } else { 4 };
+        Ok(base + ea_extra)
     }
 
     // =========================================================================
@@ -1452,8 +1686,10 @@ impl Cpu {
         let size_bits = (opcode >> 6) & 0b111;
 
         // MULU : opmode 011
+        // Yacht.txt 1211-1234 : coût exact = 38 + 2×(bits à 1 du mot source) + ea_extra.
         if size_bits == 0b011 {
             let src = self.resolve_ea(bus, mode, ea_reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let val = ae_read(src.read(self, bus, Size::Word))?;
             let result = (self.d[reg] & 0xFFFF) * (val & 0xFFFF);
             self.d[reg] = result;
@@ -1461,19 +1697,27 @@ impl Cpu {
             self.set_flag(ccr::Z, result == 0);
             self.set_flag(ccr::V, false);
             self.set_flag(ccr::C, false);
-            return Ok(70);
+            let m = (val as u16).count_ones();
+            return Ok(38 + 2 * m + ea_extra);
         }
         // MULS : opmode 111
+        // Yacht.txt 1211-1234 : m = nb de transitions de bits adjacents (01/10)
+        // dans la valeur 17 bits (source<<1) — même coût que MULU sinon.
         if size_bits == 0b111 {
             let src = self.resolve_ea(bus, mode, ea_reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
-            let val = ae_read(src.read(self, bus, Size::Word))? as u16 as i16 as i32;
+            let ea_extra = self.ea_extra_cycles;
+            let src_word = ae_read(src.read(self, bus, Size::Word))?;
+            let val = src_word as u16 as i16 as i32;
             let result = ((self.d[reg] & 0xFFFF) as u16 as i16 as i32) * val;
             self.d[reg] = result as u32;
             self.set_flag(ccr::N, result < 0);
             self.set_flag(ccr::Z, result == 0);
             self.set_flag(ccr::V, false);
             self.set_flag(ccr::C, false);
-            return Ok(70);
+            // 17 bits : (src<<1) vs (src<<1)>>1 — chaque XOR à 1 est une transition 01/10.
+            let extended = (src_word as u16 as u32) << 1;
+            let m = (extended ^ (extended >> 1)).count_ones();
+            return Ok(38 + 2 * m + ea_extra);
         }
 
         // EXG / ABCD : bit 8 = 1
@@ -1506,6 +1750,8 @@ impl Cpu {
         let size = Size::from_bits(size_bits).ok_or(StepError::IllegalAddressing)?;
         let to_ea = opcode & 0x0100 != 0;
         let ea = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
+        let ea_is_reg = mode <= 0b001;
         if to_ea {
             let a = self.d[reg] & size.mask();
             let b = ae_read(ea.read(self, bus, size))?;
@@ -1519,7 +1765,7 @@ impl Cpu {
             ae_write(Operand::DataReg(reg).write(self, bus, size, r))?;
             self.set_logic_flags(r, size);
         }
-        Ok(4)
+        Ok(logic_op_cost(to_ea, ea_is_reg, size, ea_extra))
     }
 
     // =========================================================================
@@ -1538,13 +1784,21 @@ impl Cpu {
         if size_bits == 0b011 || size_bits == 0b111 {
             let size = if size_bits == 0b011 { Size::Word } else { Size::Long };
             let src = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let src_is_reg = mode <= 0b001;
             let value = size.sign_extend(ae_read(src.read(self, bus, size))?);
             self.a[reg] = self.a[reg].wrapping_add(value);
-            return Ok(8);
+            return Ok(if size == Size::Long {
+                if src_is_reg { 8 } else { 6 + ea_extra }
+            } else {
+                8 + ea_extra
+            });
         }
         let size = Size::from_bits(size_bits).ok_or(StepError::IllegalAddressing)?;
         let to_ea = opcode & 0x0100 != 0;
         let ea = self.resolve_ea(bus, mode, ea_reg, size).ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
+        let ea_is_reg = mode <= 0b001;
         if to_ea {
             let a = self.d[reg] & size.mask();
             let b = ae_read(ea.read(self, bus, size))?;
@@ -1556,7 +1810,7 @@ impl Cpu {
             let result = self.add_with_flags(a, b, size);
             ae_write(Operand::DataReg(reg).write(self, bus, size, result))?;
         }
-        Ok(8)
+        Ok(logic_op_cost(to_ea, ea_is_reg, size, ea_extra))
     }
 
     fn op_addx(&mut self, bus: &mut impl Bus, opcode: u16) -> Result<u32, StepError> {
@@ -1604,7 +1858,10 @@ impl Cpu {
         };
         let result = self.addx_with_flags(src_val, dst_val, x, size);
         ae_write(dst_op.write(self, bus, size, result))?;
-        Ok(if mem_mode { 18 } else { 4 })
+        let long = size == Size::Long;
+        Ok(if mem_mode {
+            if long { 30 } else { 18 }
+        } else if long { 8 } else { 4 })
     }
 
     // =========================================================================
@@ -1620,10 +1877,11 @@ impl Cpu {
             let mode   = (opcode >> 3) & 0b111;
             let reg    = opcode & 0b111;
             let ea = self.resolve_ea(bus, mode, reg, Size::Word).ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
             let val = ae_read(ea.read(self, bus, Size::Word))?;
             let result = self.do_shift(val, 1, dir != 0, shift_type, Size::Word);
             ae_write(ea.write(self, bus, Size::Word, result))?;
-            return Ok(8);
+            return Ok(8 + ea_extra);
         }
 
         // Décalage registre : 1110 ccc d SS i tt rrr
@@ -1643,7 +1901,8 @@ impl Cpu {
         let val    = self.d[dst_reg] & size.mask();
         let result = self.do_shift(val, count, dir != 0, shift_type, size);
         ae_write(Operand::DataReg(dst_reg).write(self, bus, size, result))?;
-        Ok(6 + 2 * count)
+        let base = if size == Size::Long { 8 } else { 6 };
+        Ok(base + 2 * count)
     }
 
     /// Effectue un décalage/rotation et positionne les flags.
