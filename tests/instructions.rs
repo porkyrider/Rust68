@@ -177,7 +177,7 @@ fn line_a_declenche_exception() {
     bus.write32(0x0000, 0x0000_2000); // SSP initial
     bus.write32(0x0004, 0x0000_0400); // PC initial
     bus.write32(0x0028, 0x0000_0800); // vecteur 10 -> 0x0800
-    bus.write16(0x0400, 0xA000);      // Line-A
+    bus.write16(0x0400, 0xA000); // Line-A
     let mut cpu = Cpu::new();
     cpu.reset(&mut bus);
     let result = cpu.step(&mut bus);

@@ -101,7 +101,13 @@ impl Operand {
 
     /// Écrit `value` dans l'opérande à la taille donnée.
     /// Renvoie `Err((fault_addr, pc_at_fault))` si l'accès mémoire word/long est sur une adresse impaire.
-    pub fn write(self, cpu: &mut Cpu, bus: &mut impl Bus, size: Size, value: u32) -> Result<(), (u32, u32)> {
+    pub fn write(
+        self,
+        cpu: &mut Cpu,
+        bus: &mut impl Bus,
+        size: Size,
+        value: u32,
+    ) -> Result<(), (u32, u32)> {
         match self {
             Operand::DataReg(r) => {
                 let keep = !size.mask();
@@ -153,17 +159,71 @@ fn write_sized(bus: &mut impl Bus, addr: u32, size: Size, value: u32) {
 pub fn ea_extra_cycles(mode: u16, reg: u16, size: Size) -> u32 {
     let long = size == Size::Long;
     match mode {
-        0b000 | 0b001 => 0,                       // Dn, An
-        0b010 | 0b011 => if long { 8 } else { 4 }, // (An), (An)+
-        0b100 => if long { 10 } else { 6 },        // -(An)
-        0b101 => if long { 12 } else { 8 },        // (d16,An)
-        0b110 => if long { 14 } else { 10 },       // (d8,An,Xn)
+        0b000 | 0b001 => 0, // Dn, An
+        0b010 | 0b011 => {
+            if long {
+                8
+            } else {
+                4
+            }
+        } // (An), (An)+
+        0b100 => {
+            if long {
+                10
+            } else {
+                6
+            }
+        } // -(An)
+        0b101 => {
+            if long {
+                12
+            } else {
+                8
+            }
+        } // (d16,An)
+        0b110 => {
+            if long {
+                14
+            } else {
+                10
+            }
+        } // (d8,An,Xn)
         0b111 => match reg {
-            0b000 => if long { 12 } else { 8 },    // (xxx).W
-            0b001 => if long { 16 } else { 12 },   // (xxx).L
-            0b010 => if long { 12 } else { 8 },    // (d16,PC)
-            0b011 => if long { 14 } else { 10 },   // (d8,PC,Xn)
-            0b100 => if long { 8 } else { 4 },     // #imm
+            0b000 => {
+                if long {
+                    12
+                } else {
+                    8
+                }
+            } // (xxx).W
+            0b001 => {
+                if long {
+                    16
+                } else {
+                    12
+                }
+            } // (xxx).L
+            0b010 => {
+                if long {
+                    12
+                } else {
+                    8
+                }
+            } // (d16,PC)
+            0b011 => {
+                if long {
+                    14
+                } else {
+                    10
+                }
+            } // (d8,PC,Xn)
+            0b100 => {
+                if long {
+                    8
+                } else {
+                    4
+                }
+            } // #imm
             _ => 0,
         },
         _ => 0,
@@ -185,6 +245,16 @@ impl Cpu {
         size: Size,
     ) -> Option<Operand> {
         self.ea_extra_cycles = ea_extra_cycles(mode, reg, size);
+        // Préfixe d'address error par défaut pour un ae_read/ae_write qui suit
+        // immédiatement : calibré contre ProcessorTests (voir Cpu::fault_prefix).
+        // Byte/Word = 4 (fetch de l'opcode) ; Long = 0 — un accès long, décomposé
+        // en deux transactions mot par TimedBus, ne "paie" pas ce préfixe une
+        // deuxième fois quand la faute survient sur le premier mot. Constaté
+        // identique que ce soit une lecture simple (TST/CMP/DIVU...) ou la
+        // relecture RMW d'un `Dn,<ea>` (OR/AND/EOR/ADD/SUB) — seule la famille
+        // immédiat-vers-mémoire (ORI/ANDI/SUBI/ADDI/EORI, op_line_0) diffère et
+        // s'auto-corrige après cet appel.
+        self.fault_prefix = if size == Size::Long { 0 } else { 4 };
         let reg = reg as usize;
         // PC après le fetch de l'opcode (avant tout mot d'extension de cette EA).
         // C'est le PC du frame d'address error pour les modes basés sur An :

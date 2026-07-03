@@ -111,9 +111,7 @@ fn install(cpu: &mut Cpu, bus: &mut FlatBus, s: &State) {
 /// test (champ `length`, absent → pas de vérification pour ce cas).
 fn compare_cycles(got: u64, case: &TestCase) -> Result<(), String> {
     match case.length {
-        Some(want) if want != got => {
-            Err(format!("cycles = {got}, attendu {want}"))
-        }
+        Some(want) if want != got => Err(format!("cycles = {got}, attendu {want}")),
         _ => Ok(()),
     }
 }
@@ -233,20 +231,32 @@ fn run_file(path: &PathBuf) -> (usize, usize, usize, usize) {
 }
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
-const RESET: &str  = "\x1b[0m";
-const BOLD:  &str  = "\x1b[1m";
-const GREEN: &str  = "\x1b[32m";
-const RED:   &str  = "\x1b[31m";
-const YELLOW:&str  = "\x1b[33m";
-const DIM:   &str  = "\x1b[2m";
-const CYAN:  &str  = "\x1b[36m";
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const YELLOW: &str = "\x1b[33m";
+const DIM: &str = "\x1b[2m";
+const CYAN: &str = "\x1b[36m";
 
 fn bar(ok: usize, total: usize, width: usize) -> String {
-    if total == 0 { return " ".repeat(width); }
+    if total == 0 {
+        return " ".repeat(width);
+    }
     let filled = (ok * width) / total;
-    let empty  = width - filled;
-    let color  = if ok == total { GREEN } else if ok * 10 >= total * 9 { YELLOW } else { RED };
-    format!("{color}{}{DIM}{}{RESET}", "█".repeat(filled), "░".repeat(empty))
+    let empty = width - filled;
+    let color = if ok == total {
+        GREEN
+    } else if ok * 10 >= total * 9 {
+        YELLOW
+    } else {
+        RED
+    };
+    format!(
+        "{color}{}{DIM}{}{RESET}",
+        "█".repeat(filled),
+        "░".repeat(empty)
+    )
 }
 
 #[test]
@@ -262,9 +272,9 @@ fn conformite_tomharte() {
     let dir = PathBuf::from(dir);
 
     // FOCUS=MOVE.l,MOVE.w  → ne tourne que ces fichiers
-    let focus: Option<Vec<String>> = std::env::var("FOCUS").ok().map(|s| {
-        s.split(',').map(|p| p.trim().to_string()).collect()
-    });
+    let focus: Option<Vec<String>> = std::env::var("FOCUS")
+        .ok()
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("répertoire TOMHARTE_DIR illisible")
@@ -293,23 +303,26 @@ fn conformite_tomharte() {
     if let Some(ref list) = focus {
         eprintln!("{BOLD}{YELLOW}▶ mode ciblé : {}{RESET}", list.join(", "));
     }
-    eprintln!("{BOLD}{CYAN}{:<22} {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:<20}{RESET}",
-        "Instruction", "total", "ok", "fail", "cyc", "skip", "progression");
+    eprintln!(
+        "{BOLD}{CYAN}{:<22} {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:<20}{RESET}",
+        "Instruction", "total", "ok", "fail", "cyc", "skip", "progression"
+    );
     eprintln!("{DIM}{}{RESET}", "─".repeat(72));
 
     // Charger la baseline si elle existe (format: "NOM ok fail")
     let baseline_path = std::path::Path::new("tomharte_baseline.txt");
-    let baseline: std::collections::HashMap<String, (usize, usize)> = std::fs::read_to_string(baseline_path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let name = it.next()?.to_string();
-            let ok:   usize = it.next()?.parse().ok()?;
-            let fail: usize = it.next()?.parse().ok()?;
-            Some((name, (ok, fail)))
-        })
-        .collect();
+    let baseline: std::collections::HashMap<String, (usize, usize)> =
+        std::fs::read_to_string(baseline_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let name = it.next()?.to_string();
+                let ok: usize = it.next()?.parse().ok()?;
+                let fail: usize = it.next()?.parse().ok()?;
+                Some((name, (ok, fail)))
+            })
+            .collect();
     let save_baseline = focus.is_none() && std::env::var("BASELINE").is_ok();
 
     let (mut total_ok, mut total_fail, mut total_cycle_fail, mut total_skip) = (0, 0, 0, 0);
@@ -319,24 +332,32 @@ fn conformite_tomharte() {
     for f in &files {
         let name = f.file_stem().unwrap().to_string_lossy().to_string();
         let (ok, fail, cycle_fail, skip) = run_file(f);
-        total_ok         += ok;
-        total_fail       += fail;
+        total_ok += ok;
+        total_fail += fail;
         total_cycle_fail += cycle_fail;
-        total_skip       += skip;
+        total_skip += skip;
 
         let total = ok + fail;
-        let pct   = if total > 0 { ok * 100 / total } else { 100 };
+        let pct = if total > 0 { ok * 100 / total } else { 100 };
         let progress = bar(ok, total, 20);
 
         // Détection de régression vs baseline
         let regression_tag = if let Some(&(base_ok, base_fail)) = baseline.get(&name) {
             if fail > base_fail {
                 regressions += 1;
-                format!("  {RED}▼ régression ({} → {} échecs){RESET}", base_fail, fail)
+                format!(
+                    "  {RED}▼ régression ({} → {} échecs){RESET}",
+                    base_fail, fail
+                )
             } else if fail == 0 && base_fail > 0 {
                 format!("  {GREEN}▲ résolu !{RESET}")
             } else if fail < base_fail {
-                format!("  {GREEN}▲ +{} ({} → {}){RESET}", base_fail - fail, base_fail, fail)
+                format!(
+                    "  {GREEN}▲ +{} ({} → {}){RESET}",
+                    base_fail - fail,
+                    base_fail,
+                    fail
+                )
             } else {
                 String::new()
             }
@@ -352,13 +373,26 @@ fn conformite_tomharte() {
             (RED, "✗")
         };
 
-        eprintln!("{color}{marker}{RESET} {:<21} {:>5}  {GREEN}{:>5}{RESET}  {color}{:>5}{RESET}  {YELLOW}{:>5}{RESET}  {DIM}{:>5}{RESET}  {progress}  {DIM}{:>3}%{RESET}{}",
+        eprintln!(
+            "{color}{marker}{RESET} {:<21} {:>5}  {GREEN}{:>5}{RESET}  {color}{:>5}{RESET}  {YELLOW}{:>5}{RESET}  {DIM}{:>5}{RESET}  {progress}  {DIM}{:>3}%{RESET}{}",
             name,
             ok + fail + skip,
             ok,
-            if fail > 0 { format!("{fail}") } else { String::new() },
-            if cycle_fail > 0 { format!("{cycle_fail}") } else { String::new() },
-            if skip > 0 { format!("{skip}") } else { String::new() },
+            if fail > 0 {
+                format!("{fail}")
+            } else {
+                String::new()
+            },
+            if cycle_fail > 0 {
+                format!("{cycle_fail}")
+            } else {
+                String::new()
+            },
+            if skip > 0 {
+                format!("{skip}")
+            } else {
+                String::new()
+            },
             pct,
             regression_tag,
         );
@@ -368,29 +402,51 @@ fn conformite_tomharte() {
 
     // Ligne totale
     let grand_total = total_ok + total_fail + total_skip;
-    let grand_pct   = if total_ok + total_fail > 0 { total_ok * 100 / (total_ok + total_fail) } else { 100 };
+    let grand_pct = if total_ok + total_fail > 0 {
+        total_ok * 100 / (total_ok + total_fail)
+    } else {
+        100
+    };
     eprintln!("{DIM}{}{RESET}", "─".repeat(72));
-    eprintln!("{BOLD}  {:<21} {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {}  {:>3}%{RESET}",
+    eprintln!(
+        "{BOLD}  {:<21} {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {}  {:>3}%{RESET}",
         "TOTAL",
         grand_total,
         total_ok,
-        if total_fail > 0 { format!("{total_fail}") } else { String::new() },
-        if total_cycle_fail > 0 { format!("{total_cycle_fail}") } else { String::new() },
-        if total_skip > 0 { format!("{total_skip}") } else { String::new() },
+        if total_fail > 0 {
+            format!("{total_fail}")
+        } else {
+            String::new()
+        },
+        if total_cycle_fail > 0 {
+            format!("{total_cycle_fail}")
+        } else {
+            String::new()
+        },
+        if total_skip > 0 {
+            format!("{total_skip}")
+        } else {
+            String::new()
+        },
         bar(total_ok, total_ok + total_fail, 20),
         grand_pct,
     );
     if total_cycle_fail > 0 {
-        eprintln!("{DIM}({total_cycle_fail} cas ok en registres/RAM mais avec un nombre de cycles \
+        eprintln!(
+            "{DIM}({total_cycle_fail} cas ok en registres/RAM mais avec un nombre de cycles \
 incorrect — colonne 'cyc', non bloquant pour l'instant, cf. plan de mise en \
-conformité des timings dans execute.rs){RESET}");
+conformité des timings dans execute.rs){RESET}"
+        );
     }
     eprintln!();
 
     if save_baseline {
         std::fs::write(baseline_path, new_baseline.join("\n") + "\n")
             .expect("écriture baseline impossible");
-        eprintln!("{DIM}baseline sauvegardée dans {}{RESET}", baseline_path.display());
+        eprintln!(
+            "{DIM}baseline sauvegardée dans {}{RESET}",
+            baseline_path.display()
+        );
     } else if focus.is_none() && !baseline.is_empty() {
         eprintln!("{DIM}(relancer avec BASELINE=1 pour mettre à jour la baseline){RESET}");
     }

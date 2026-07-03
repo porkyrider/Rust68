@@ -82,6 +82,19 @@ pub struct Cpu {
     /// Chaque handler d'instruction l'additionne à son coût de base après avoir
     /// appelé resolve_ea, sur le même principe que ea_frame_pc/ea_is_pc_relative.
     pub ea_extra_cycles: u32,
+    /// Préfixe (en cycles) à ajouter devant `ea_extra + 50` si le `ae_read`
+    /// qui suit immédiatement déclenche une address error. Calibré cas par
+    /// cas contre ProcessorTests (les trois formes coexistent, pas de règle
+    /// générale unique) :
+    ///   - 4 (défaut) : simple lecture d'opérande source (DIVU/DIVS, `<ea>,Dn`,
+    ///     TST, CMP...) — le préfixe est juste le fetch de l'opcode.
+    ///   - 0 : relecture RMW de la valeur destination pour un `Dn,<ea>` à deux
+    ///     opérandes registre+mémoire (`OR/AND/EOR/ADD/SUB Dn,<ea>`).
+    ///   - 8 : relecture RMW dans la famille immédiat-vers-mémoire
+    ///     (`ORI/ANDI/SUBI/ADDI/EORI`, partagent `op_line_0`) — le préfixe
+    ///     inclut le fetch de l'immédiat en plus de l'opcode.
+    /// Remis à 4 au début de chaque `step()`.
+    pub fault_prefix: u32,
 }
 
 impl Default for Cpu {
@@ -109,6 +122,7 @@ impl Cpu {
             ea_is_pc_relative: false,
             write_ae_ir: None,
             ea_extra_cycles: 0,
+            fault_prefix: 4,
         }
     }
 
@@ -218,12 +232,7 @@ impl Cpu {
     ///   SP+6..7  : IR (opcode)
     ///   SP+8..9  : SR sauvegardé
     ///   SP+10..13: PC pipeline au moment de l'accès
-    pub fn take_address_error(
-        &mut self,
-        bus: &mut impl Bus,
-        fault_addr: u32,
-        is_write: bool,
-    ) {
+    pub fn take_address_error(&mut self, bus: &mut impl Bus, fault_addr: u32, is_write: bool) {
         self.take_address_error_at(bus, fault_addr, is_write, None)
     }
 
@@ -249,9 +258,17 @@ impl Cpu {
         // Sur le 68000 réel, le pipeline effectue un préfetch avant tout write cycle,
         // avançant le PC de 2 supplémentaires par rapport aux read cycles.
         let pc_at_access = explicit_pc.unwrap_or_else(|| {
-            if is_write { self.pc.wrapping_add(2) } else { self.pc }
+            if is_write {
+                self.pc.wrapping_add(2)
+            } else {
+                self.pc
+            }
         });
-        let ir = if is_write { self.write_ae_ir.unwrap_or(self.current_ir) } else { self.current_ir };
+        let ir = if is_write {
+            self.write_ae_ir.unwrap_or(self.current_ir)
+        } else {
+            self.current_ir
+        };
         self.write_ae_ir = None;
 
         if !self.supervisor() {
@@ -266,10 +283,10 @@ impl Cpu {
         let supervisor = saved_sr & sr::S != 0;
         let is_program = is_instruction_fetch || self.ea_is_pc_relative;
         let fc: u16 = match (supervisor, is_program) {
-            (false, false) => 1,  // user data
-            (false, true)  => 2,  // user program
-            (true,  false) => 5,  // supervisor data
-            (true,  true)  => 6,  // supervisor program
+            (false, false) => 1, // user data
+            (false, true) => 2,  // user program
+            (true, false) => 5,  // supervisor data
+            (true, true) => 6,   // supervisor program
         };
         let rw_bit: u16 = if is_write { 0 } else { 1 };
         let access_info = (ir & 0xFFE0) | (rw_bit << 4) | fc;
