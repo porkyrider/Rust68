@@ -39,6 +39,7 @@ mod bus;
 mod cpu;
 mod execute;
 pub mod peripherals;
+pub mod systems;
 
 pub use addressing::{Operand, Size};
 pub use bus::{Bus, TimedBus};
