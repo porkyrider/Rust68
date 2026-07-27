@@ -1841,14 +1841,18 @@ impl Cpu {
 
         // DIVU : opmode 011
         if size_bits == 0b011 {
-            let opcode_addr = self.pc.wrapping_sub(2); // avant resolve_ea
             let src = self
                 .resolve_ea(bus, mode, ea_reg, Size::Word)
                 .ok_or(StepError::IllegalAddressing)?;
             let ea_extra = self.ea_extra_cycles;
             let divisor = ae_read(src.read(self, bus, Size::Word))?;
             if divisor == 0 {
-                self.take_exception(bus, 5, opcode_addr);
+                // Divide-by-zero (vector 5) is a post-instruction trap, not a
+                // Group 0 fault: the frame's saved PC is the address of the
+                // NEXT instruction (self.pc, already advanced past the
+                // opcode and any EA extension words), not the divide
+                // instruction itself — RTE must not re-execute the DIVU.
+                self.take_exception(bus, 5, self.pc);
                 return Ok(ea_extra + 10);
             }
             let dividend = self.d[reg];
@@ -1873,14 +1877,15 @@ impl Cpu {
         }
         // DIVS : opmode 111
         if size_bits == 0b111 {
-            let opcode_addr = self.pc.wrapping_sub(2);
             let src = self
                 .resolve_ea(bus, mode, ea_reg, Size::Word)
                 .ok_or(StepError::IllegalAddressing)?;
             let ea_extra = self.ea_extra_cycles;
             let divisor = ae_read(src.read(self, bus, Size::Word))? as u16 as i16 as i32;
             if divisor == 0 {
-                self.take_exception(bus, 5, opcode_addr);
+                // See the DIVU branch above: post-instruction trap, frame PC
+                // must be the next instruction, not this DIVS.
+                self.take_exception(bus, 5, self.pc);
                 return Ok(ea_extra + 10);
             }
             let dividend = self.d[reg] as i32;
