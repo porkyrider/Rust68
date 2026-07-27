@@ -363,6 +363,22 @@ impl Cpu {
         // PC juste après fetch de l'opcode (= opcode_addr + 2), avant les mots d'extension.
         // C'est le PC à sauvegarder dans le frame si une instruction-fetch AE survient.
         let pc_after_opcode = self.pc;
+
+        // Le fetch de l'opcode lui-même a-t-il touché une adresse sans chip
+        // select (le "trou" physique) ? Cas typique : un programme qui a
+        // sauté dans une zone non mappée (ex: pile corrompue, ou notre
+        // watchdog de crash qui voit le PC sortir de toute plage valide).
+        if let Some((fault_addr, is_write)) = timed.take_bus_fault() {
+            self.take_bus_error_full(
+                &mut timed,
+                fault_addr,
+                is_write,
+                Some(pc_after_opcode.wrapping_sub(2)),
+                true,
+            );
+            return Ok(self.finalize_cycles(&timed, 50));
+        }
+
         let result = self.execute(&mut timed, opcode);
         match result {
             Ok(cycles) => {
@@ -401,6 +417,18 @@ impl Cpu {
                         Some(pc_after_opcode),
                         true,
                     );
+                    return Ok(self.finalize_cycles(&timed, cycles + 50));
+                }
+                // A donnée/écriture pendant l'exécution a-t-elle touché le "trou"
+                // physique (au-delà de la RAM installée, avant la ROM) ? C'est le
+                // mécanisme utilisé par d'innombrables programmes/démos pour
+                // détecter la RAM installée : ils installent leur propre handler
+                // au vecteur $8 puis scannent la mémoire jusqu'à faire planter
+                // le bus — sans cette exception réelle, le scan continue à
+                // l'infini (ou jusqu'à une borne arbitraire) et finit par
+                // écraser sa propre pile avec les données qu'il écrit.
+                if let Some((fault_addr, is_write)) = timed.take_bus_fault() {
+                    self.take_bus_error_full(&mut timed, fault_addr, is_write, None, false);
                     return Ok(self.finalize_cycles(&timed, cycles + 50));
                 }
                 Ok(self.finalize_cycles(&timed, cycles))

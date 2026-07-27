@@ -63,6 +63,23 @@ pub trait Bus {
         let _ = addr;
         false
     }
+
+    /// Consulté par [`crate::cpu::Cpu::step`] juste après chaque transaction
+    /// bus (fetch d'instruction, puis à nouveau après exécution) pour savoir
+    /// si l'accès le plus récent a touché une adresse sans aucun chip select
+    /// (le "trou" physique entre le haut de la RAM installée et le début de
+    /// la ROM sur un ST/STE réel). Si `Some((fault_addr, is_write))` est
+    /// renvoyé, le CPU déclenche immédiatement un bus error (vecteur 2) au
+    /// lieu de continuer normalement, et l'indicateur doit être consommé
+    /// (remis à `None`) par cet appel.
+    ///
+    /// Implémentation par défaut : jamais de bus error (mapping "toujours
+    /// disponible" — comportement historique de tous les `Bus` existants,
+    /// notamment les bancs de test ProcessorTests qui n'ont pas de notion de
+    /// RAM limitée).
+    fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
+        None
+    }
 }
 
 /// Bus intercalé qui applique le modèle de wait-state DRAM/vidéo (façon
@@ -138,5 +155,9 @@ impl<'b, B: Bus> Bus for TimedBus<'b, B> {
 
     fn is_contended(&self, addr: u32) -> bool {
         self.inner.is_contended(addr)
+    }
+
+    fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
+        self.inner.take_bus_fault()
     }
 }

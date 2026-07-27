@@ -95,7 +95,23 @@ pub struct Cpu {
     ///     inclut le fetch de l'immédiat en plus de l'opcode.
     /// Remis à 4 au début de chaque `step()`.
     pub fault_prefix: u32,
+    /// Journal diagnostique des exceptions prises (vecteur, PC empilé,
+    /// adresse fautive [group 0 seulement, 0 sinon], write?, adresse du
+    /// handler lu dans la table de vecteurs [`bus.read32(vector*4)`],
+    /// cycles) — tampon circulaire (voir `EXCEPTION_LOG_CAP`), pur
+    /// enregistrement sans effet sur l'exécution. Le handler_pc permet de
+    /// distinguer un vecteur resté sur le handler par défaut du ROM d'un
+    /// vecteur patché par le programme en cours (handler en RAM basse).
+    /// Utilisé par les harnais de diagnostic externes
+    /// (crates/app/examples/*) pour retracer une séquence d'exceptions
+    /// sans instrumenter chaque site d'appel séparément.
+    pub exception_log: std::collections::VecDeque<(u8, u32, u32, bool, u32, u64)>,
 }
+
+/// Taille max de `Cpu::exception_log` — assez pour couvrir plusieurs frames
+/// d'activité TRAP/interruption normale sans croître sans borne sur une
+/// exécution longue.
+pub const EXCEPTION_LOG_CAP: usize = 4096;
 
 impl Default for Cpu {
     fn default() -> Self {
@@ -123,7 +139,17 @@ impl Cpu {
             write_ae_ir: None,
             ea_extra_cycles: 0,
             fault_prefix: 4,
+            exception_log: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Enregistre une entrée dans `exception_log`, en purgeant les plus
+    /// anciennes au-delà de `EXCEPTION_LOG_CAP`.
+    fn log_exception(&mut self, vector: u32, pc: u32, fault_addr: u32, is_write: bool, handler_pc: u32) {
+        if self.exception_log.len() >= EXCEPTION_LOG_CAP {
+            self.exception_log.pop_front();
+        }
+        self.exception_log.push_back((vector as u8, pc, fault_addr, is_write, handler_pc, self.cycles));
     }
 
     /// Charge des mots dans la file de préfetch (utilisé par les harnais de test).
@@ -218,6 +244,7 @@ impl Cpu {
         // Lire l'adresse du vecteur
         let vec_addr = (vector * 4) & ADDR_MASK;
         let new_pc = bus.read32(vec_addr);
+        self.log_exception(vector, pc_to_push, 0, false, new_pc);
         // TomHarte convention : final.pc = m_au = new_pc + 4.
         // Notre modèle: cpu.pc + 4 = final.pc → cpu.pc = new_pc.
         self.pc = new_pc;
@@ -249,6 +276,37 @@ impl Cpu {
     pub fn take_address_error_full(
         &mut self,
         bus: &mut impl Bus,
+        fault_addr: u32,
+        is_write: bool,
+        explicit_pc: Option<u32>,
+        is_instruction_fetch: bool,
+    ) {
+        self.take_group0_exception(bus, 3, fault_addr, is_write, explicit_pc, is_instruction_fetch)
+    }
+
+    /// Déclenche une exception bus error (vecteur 2) : un accès (lecture ou
+    /// écriture) à une adresse sans aucun chip select derrière — le "trou"
+    /// physique entre le haut de la RAM installée et le début de la ROM sur
+    /// un ST/STE réel. Même format de frame que l'address error (14 octets),
+    /// seul le vecteur diffère (2 au lieu de 3). C'est le mécanisme que de
+    /// très nombreux programmes/démos utilisent pour détecter la quantité de
+    /// RAM installée : ils installent leur propre handler au vecteur $8 puis
+    /// écrivent à des adresses croissantes jusqu'à faire planter le bus.
+    pub fn take_bus_error_full(
+        &mut self,
+        bus: &mut impl Bus,
+        fault_addr: u32,
+        is_write: bool,
+        explicit_pc: Option<u32>,
+        is_instruction_fetch: bool,
+    ) {
+        self.take_group0_exception(bus, 2, fault_addr, is_write, explicit_pc, is_instruction_fetch)
+    }
+
+    fn take_group0_exception(
+        &mut self,
+        bus: &mut impl Bus,
+        vector: u32,
         fault_addr: u32,
         is_write: bool,
         explicit_pc: Option<u32>,
@@ -301,7 +359,8 @@ impl Cpu {
         bus.write16(sp.wrapping_add(8) & ADDR_MASK, saved_sr);
         bus.write32(sp.wrapping_add(10) & ADDR_MASK, pc_at_access);
 
-        let new_pc = bus.read32(3 * 4);
+        let new_pc = bus.read32(vector * 4);
+        self.log_exception(vector, pc_at_access, fault_addr, is_write, new_pc);
         self.pc = new_pc;
     }
 
