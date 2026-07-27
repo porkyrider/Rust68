@@ -25,15 +25,19 @@ invalides, ">9") sont **résolus** : voir « Bug SBCD » ci-dessous.
 
 ```
 src/
-  cpu.rs          (~440 l.)  — registres, SR, USP/SSP, fetch_word, take_exception,
-                                take_bus_error_full, exception_log (log diagnostic)
+  cpu.rs          (~490 l.)  — registres, SR, USP/SSP, fetch_word, take_exception,
+                                take_bus_error_full, take_interrupt, exception_log
   addressing.rs   (~380 l.)  — Operand, Size, resolve_ea (tous les modes 68000)
-  execute.rs     (~2780 l.)  — décodage et exécution de toutes les instructions
-  bus.rs          (~160 l.)  — trait Bus + FlatBus (16 Mo RAM plate) + TimedBus
-                                (wait-states DRAM/vidéo) + take_bus_fault()
+  execute.rs     (~2790 l.)  — décodage et exécution de toutes les instructions
+  bus.rs          (~195 l.)  — trait Bus + FlatBus (16 Mo RAM plate) + TimedBus
+                                (wait-states DRAM/vidéo) + take_bus_fault() + irq_level/irq_ack
+  peripherals/
+    mfp.rs        (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
   lib.rs                     — exports publics
 tests/
-  instructions.rs            — tests unitaires ciblés
+  instructions.rs            — tests unitaires ciblés (CPU)
+  interrupts.rs               — tests du mécanisme IPL (Cpu::take_interrupt)
+  mfp.rs                      — tests du MFP 68901
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
 ```
 
@@ -133,7 +137,7 @@ l'état registres/RAM, déjà correct à 100 %) :
 2. **Précision data-dépendante** : DIVU/DIVS (algorithme microcode porté de
    WinUAE/Hatari), `fault_prefix` pour l'address error, corrections MULS/JSR/
    MOVEM/CMPI/CMPM/ADDA.l/SUBA.l — voir commit `a21e2ef`.
-3. **Address error sur écriture** (2026-07-27, non commité) :
+3. **Address error sur écriture** (2026-07-27) :
    - `ADDX.w`/`SUBX.w` en mode mémoire `-(An),-(An)` : le préfixe de coût en
      cas d'address error sur la lecture dst était erroné (12 au lieu de 8)
      dès que le registre source n'était pas A7 — vérifié exhaustivement
@@ -165,6 +169,16 @@ passé, voir commentaire dans `op_line_4`/CHK) :
 - `MOVE.w`/`MOVE.l` avec dst `(xxx).L` en address error (13 cas) : varie
   entre deux valeurs (écart de 4) selon un facteur non identifié.
 
+Confirmation empirique (2026-07-27) : pour `MOVE (xxx).L` dst, sur
+l'ensemble des cas structurellement identiques (même src_mode/dst_mode/
+taille) qui déclenchent une address error sur l'écriture, la répartition
+est quasi 50/50 entre les deux coûts possibles (14 cas à correction 0,
+13 cas à correction -4) — changer la constante ne ferait que déplacer
+l'échec vers l'autre moitié, pas le réduire. Ce n'est donc pas une
+formule qui manque mais un vrai plancher matériel (comme documenté pour
+CHK) : ces 401 cas ne sont pas résolubles sans modéliser le pipeline
+d'instruction cycle par cycle (au-delà du modèle actuel table+bus).
+
 ---
 
 ## Harnais de test TomHarte
@@ -185,20 +199,100 @@ régressions et de visualiser les progrès instruction par instruction.
 
 ---
 
+## Interruptions IPL (résolu — mécanisme CPU)
+
+`Cpu::take_interrupt` (appelé par `Cpu::step` avant le fetch de chaque
+opcode, en dehors du `TimedBus`) : reconnaît une demande d'interruption
+externe et la prend si son niveau dépasse le masque IPL courant du SR
+(niveau 7 = NMI, toujours pris). Frame standard 6 octets (SR+PC, pas le
+frame Group 0/1 des address/bus errors), bascule superviseur, masque IPL
+relevé au niveau accepté, cycle d'acquittement via deux nouvelles méthodes
+du trait `Bus` :
+
+- `Bus::irq_level() -> u8` : niveau demandé (0 = aucune demande), à
+  implémenter par le système hôte (GLUE, MFP…). Défaut : 0 (jamais de
+  demande — inchangé pour FlatBus/ProcessorTests).
+- `Bus::irq_ack(level) -> u8` : vecteur à utiliser. Défaut : autovecteur
+  (24+level, cas GLUE HBL/VBL) ; un périphérique vectorisé (MFP 68901)
+  surchargera pour renvoyer son propre vecteur programmé.
+
+Coût approximatif de 44 cycles (aucune suite TomHarte ne couvre les
+interruptions, événements externes et non des opcodes — à calibrer plus
+tard). Testé dans `tests/interrupts.rs` (masquage, prise, NMI, vecteur
+fourni par le périphérique, bascule user→superviseur). Pas encore géré :
+réveil sur STOP, edge-detect propre du niveau 7.
+
+Ce que ce mécanisme ne fournit **pas** encore : aucun périphérique ne
+demande d'interruption pour l'instant (`irq_level` renvoie toujours 0 par
+défaut) — c'est le rôle du MFP 68901 / GLUE, ci-dessous.
+
+---
+
+## MFP 68901 (nouveau module `src/peripherals/mfp.rs`)
+
+Décision d'organisation (2026-07-27) : les périphériques Atari ST vivent
+dans **ce même crate**, sous `src/peripherals/`, plutôt que dans un
+workspace séparé — `rust68` reste un seul crate à publier/tester, au prix
+de mélanger cœur 68k générique et matériel Atari-spécifique.
+
+`peripherals::mfp::Mfp` modélise la puce **seule**, indépendamment de tout
+câblage système : c'est au "board" Atari ST (pas encore implémenté) de
+mapper `Mfp::read`/`write` dans son `Bus`, de brancher `Mfp::iack` sur
+`Bus::irq_ack`, et de relier `Mfp::interrupt_requested()` à `Bus::irq_level`
+(le MFP est câblé sur IPL6 sur ST/STE réel — ce choix appartient au board).
+
+Couvert :
+- 24 registres logiques (`mfp::reg`) : GPIP/AER/DDR, IERA/B, IPRA/B,
+  ISRA/B, IMRA/B, VR, TACR/TBCR/TCDCR + 4 registres de données timer,
+  SCR/UCR/RSR/TSR/UDR (USART).
+- Contrôleur d'interruption à 16 canaux (`mfp::channel`, table fixée par
+  le datasheet) : IPR ne s'arme que si IER actif, `interrupt_requested()`
+  ne remonte que si IMR non masqué, IPR/ISR ne s'effacent que par écriture
+  de 0 (jamais par écriture de 1). `iack()` calcule le vecteur
+  (`VR[7:3] | canal`), efface IPR, arme ISR sauf en mode auto-EOI (bit 3
+  du VR).
+- 4 timers A/B/C/D : mode delay (prescale ÷4/÷10/÷16/÷50/÷64/÷100/÷200) et
+  mode event-count (A/B uniquement, piloté par `pulse_ta`/`pulse_tb`
+  plutôt que par l'horloge). Lire le registre de données d'un timer EN
+  MARCHE renvoie le compte à rebours courant (comportement réel du chip,
+  utilisé par TOS pour lire une horloge sans l'arrêter).
+- GPIP avec détection de front (AER) par broche, sur les 8 canaux dédiés.
+- USART simplifié "au byte" (`push_rx_byte`/`take_tx_byte`) : pas de
+  simulation bit start/stop/parité ni de baud rate réel.
+
+Limitations connues, documentées dans le module :
+- Pas de priorité imbriquée entre canaux (un canal en service ne bloque
+  pas un canal de priorité supérieure de se signaler, mais ne l'empêche
+  pas non plus explicitement — simplification volontaire pour cette v1).
+- `tick()` suppose une horloge CPU fixe à 8 MHz (ST/STE) ; la période d'un
+  timer delay-mode est modélisée comme `(data+1) × prescale` cycles MFP —
+  cette convention (+1) n'a pas été vérifiée contre une référence
+  matérielle externe (aucune suite de test équivalente à TomHarte
+  n'existe pour le MFP) ; à confirmer plus tard si la précision fine
+  compte (Hatari/WinUAE font référence).
+- Si plusieurs périodes s'écoulent en un seul appel `tick()` (cycles très
+  larges), une seule interruption est signalée, pas une par période —
+  sans impact pour un usage normal (tick() appelé à chaque instruction).
+
+Testé dans `tests/mfp.rs` (11 tests : GPIP/AER, IER/IPR/IMR, IACK/priorité/
+auto-EOI, timers delay et event-count, USART).
+
+---
+
 ## Ce qui reste pour l'émulation Atari ST
 
 Le CPU MC68000 est complet et 100 % conforme en état (cycles en cours de
-finalisation). Pour émuler un Atari ST il faut :
+finalisation). L'interruption IPL et le MFP 68901 (chip seul) sont en
+place. Pour émuler un Atari ST complet il faut encore :
 
 | Composant | Priorité |
 |-----------|----------|
-| Interruptions IPL (niveaux 2/4/6) | Haute |
-| MFP 68901 (timers, UART, IRQ) | Haute |
+| Board Atari ST (mapping mémoire, câblage MFP→IPL6, ROM/RAM) | Haute |
 | GLUE (HBL/VBL) | Haute |
 | ACIA 6850 × 2 (clavier/MIDI) | Haute |
 | YM2149 (son + I/O joysticks) | Moyenne |
 | WD1772 (floppy) | Moyenne |
 | Shifter (vidéo ST low/med/high) | Moyenne |
 | Blitter | Basse |
-| Finaliser le timing cycle-exact (2 104 résidus) | Basse |
+| Finaliser le timing cycle-exact (401 résidus, plancher matériel data-dépendant) | Basse |
 | Trace mode (bit T SR) | Basse |
