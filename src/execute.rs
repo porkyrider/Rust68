@@ -250,13 +250,11 @@ fn movem_base(mode: u16, reg: u16, to_regs: bool) -> u32 {
             0b010 | 0b011 => 12, // (An), (An)+
             0b101 => 16,         // (d16,An)
             0b110 => 18,         // (d8,An,Xn)
-            0b111 => {
-                if reg == 0b001 {
-                    20
-                } else {
-                    16
-                }
-            } // (xxx).L / (xxx).W
+            0b111 => match reg {
+                0b001 => 20,      // (xxx).L
+                0b011 => 18,      // (d8,PC,Xn) — même coût que (d8,An,Xn)
+                _ => 16,          // (xxx).W, (d16,PC)
+            },
             _ => 12,
         }
     } else {
@@ -1091,7 +1089,18 @@ impl Cpu {
 
             self.sr = sr_for_frame;
             self.take_address_error_full(bus, fault_addr, true, Some(frame_pc), false);
-            return Ok(50);
+            // Coût = coût déjà engagé pour lire la source (payé en entier, la
+            // lecture a réussi) + coût d'écriture dst réduit à sa variante Word
+            // (un seul transfert 16 bits est tenté avant que l'adresse impaire
+            // ne soit détectée — la moitié haute d'un Long n'est jamais payée)
+            // + 50 (dispatch Group 0). -(An) ajoute +4 : prefetch supplémentaire
+            // avant le write cycle (cf. write_ae_ir plus haut), non recouvert
+            // par le pipeline normal une fois l'exception déclenchée. Vérifié
+            // exhaustivement contre MOVE.w/l TomHarte pour tous les dst_mode
+            // sauf (xxx).L, qui reste data-dépendant (résidu documenté).
+            let predec_extra = if dst_mode == 0b100 { 4 } else { 0 };
+            let dst_ae_cost = src_extra + move_dst_base(dst_mode, dst_reg, Size::Word) + predec_extra + 50;
+            return Ok(dst_ae_cost);
         }
         Ok(src_extra + move_dst_base(dst_mode, dst_reg, size))
     }
@@ -2000,15 +2009,12 @@ impl Cpu {
                             self.a[reg] = saved_dst;
                         }
                         // Fault sur dst : src déjà lu avec succès, son coût réduit
-                        // sert de préfixe (cf. ADDX), +4 en Word — sauf si src=A7
-                        // (SSP), qui garde le préfixe réduit même en Word (calibré
-                        // contre ProcessorTests : "-(A7),-(An)" fault dst = 64, pas 68).
+                        // sert de préfixe (cf. ADDX). Vérifié exhaustivement contre
+                        // les 2500 cas SUBX.w de TomHarte : préfixe 8 dans tous les
+                        // cas (Word ou Long, src=A7 ou non) — "-(An),-(An)" fault dst
+                        // = 64 systématiquement, pas seulement quand src=A7.
                         self.ea_extra_cycles = if size == Size::Long { 10 } else { 6 };
-                        self.fault_prefix = if size == Size::Long || src_reg == 7 {
-                            8
-                        } else {
-                            12
-                        };
+                        self.fault_prefix = 8;
                         return Err(StepError::AddressError(addr, false, pc));
                     }
                 };
@@ -2419,16 +2425,13 @@ impl Cpu {
                     }
                     // Fault sur la lecture dst (deuxième) : la lecture src a déjà
                     // réussi, son coût "-(An)" compte comme préfixe (réduit de 2,
-                    // comme pour MOVEM — l'idle de décrément n'est pas repayé),
-                    // +4 en Word sauf si src=A7 (SSP), qui garde le préfixe réduit
-                    // (calibré contre ProcessorTests) ; ea_extra_cycles porte le
-                    // coût "-(An)" du dst qui, lui, fault.
+                    // comme pour MOVEM — l'idle de décrément n'est pas repayé).
+                    // Vérifié exhaustivement contre les 2500 cas ADDX.w de
+                    // TomHarte : préfixe 8 dans tous les cas (Word ou Long, src=A7
+                    // ou non) ; ea_extra_cycles porte le coût "-(An)" du dst qui,
+                    // lui, fault.
                     self.ea_extra_cycles = if size == Size::Long { 10 } else { 6 };
-                    self.fault_prefix = if size == Size::Long || src_reg == 7 {
-                        8
-                    } else {
-                        12
-                    };
+                    self.fault_prefix = 8;
                     return Err(StepError::AddressError(addr, false, pc));
                 }
             };
