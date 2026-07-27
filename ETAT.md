@@ -33,11 +33,14 @@ src/
                                 (wait-states DRAM/vidéo) + take_bus_fault() + irq_level/irq_ack
   peripherals/
     mfp.rs        (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
+  systems/
+    atari_st.rs   (~140 l.)  — board ST minimal (RAM/ROM/MFP, cf. section dédiée)
   lib.rs                     — exports publics
 tests/
   instructions.rs            — tests unitaires ciblés (CPU)
   interrupts.rs               — tests du mécanisme IPL (Cpu::take_interrupt)
   mfp.rs                      — tests du MFP 68901
+  atari_st.rs                 — tests du board Atari ST (dont 1 test bout-en-bout)
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
 ```
 
@@ -279,15 +282,48 @@ auto-EOI, timers delay et event-count, USART).
 
 ---
 
+## Board Atari ST (nouveau module `src/systems/atari_st.rs`)
+
+`systems::atari_st::AtariSt` implémente `Bus` pour un ST/STE minimal, en
+reliant tout ce qui précède :
+
+- RAM installée à `0x000000` (taille au choix), ROM TOS à `0xFC0000`
+  (`DEFAULT_ROM_BASE`, lecture seule).
+- MFP 68901 mappé aux adresses impaires `0xFFFA01`-`0xFFFA2F` (champ
+  public `AtariSt::mfp`, pour y injecter GPIP/USART/timers depuis
+  l'appelant).
+- Le "trou" physique entre le haut de la RAM installée et `0xFF8000`
+  déclenche un bus error via `take_bus_fault` (mécanisme construit plus
+  tôt spécifiquement pour ce cas — première utilisation concrète).
+- Reste de la zone d'E/S (`0xFF8000`-`0xFFFFFF` : ACIA, PSG, FDC,
+  Shifter…) : chip select réel mais périphérique pas encore émulé →
+  lecture neutre `0xFF`, écriture ignorée (pas de bus error, pour ne pas
+  casser le polling de statut du logiciel).
+- `irq_level`/`irq_ack` câblent `Mfp::interrupt_requested`/`iack` sur
+  IPL6 (câblage matériel réel ST/STE).
+- `reset_bus` réinitialise le MFP (RESET CPU → `/RESET` périphériques).
+
+Limitations connues : pas de miroir ROM `0xE00000` (130ST), pas de
+contention DRAM/vidéo (`is_contended` reste `false`, nécessite le
+Shifter), décodage UDS/LDS des adresses paires adjacentes au MFP non
+modélisé précisément.
+
+Testé dans `tests/atari_st.rs` (8 tests), dont un test d'intégration
+bout-en-bout : un `Cpu` réel prend une interruption GPIP du MFP à travers
+toute la chaîne `Cpu::step` → `Bus::irq_level` → `Bus::irq_ack` →
+`Mfp::iack`, saute au bon handler et relève le masque IPL à 6.
+
+---
+
 ## Ce qui reste pour l'émulation Atari ST
 
 Le CPU MC68000 est complet et 100 % conforme en état (cycles en cours de
-finalisation). L'interruption IPL et le MFP 68901 (chip seul) sont en
-place. Pour émuler un Atari ST complet il faut encore :
+finalisation). L'interruption IPL, le MFP 68901 et un board minimal
+(RAM/ROM/MFP) sont en place. Pour émuler un Atari ST complet il faut
+encore :
 
 | Composant | Priorité |
 |-----------|----------|
-| Board Atari ST (mapping mémoire, câblage MFP→IPL6, ROM/RAM) | Haute |
 | GLUE (HBL/VBL) | Haute |
 | ACIA 6850 × 2 (clavier/MIDI) | Haute |
 | YM2149 (son + I/O joysticks) | Moyenne |
