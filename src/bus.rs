@@ -80,6 +80,29 @@ pub trait Bus {
     fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
         None
     }
+
+    /// Niveau d'interruption (IPL2-0) actuellement demandé par les
+    /// périphériques au CPU : 0 = aucune demande, 1-6 = niveau normal,
+    /// 7 = non masquable (NMI). Consulté par [`crate::cpu::Cpu::step`] avant
+    /// le fetch de chaque instruction : le CPU prend l'interruption si
+    /// `level` est strictement supérieur au masque IPL courant du SR (ou
+    /// toujours pour le niveau 7). Implémentation par défaut : aucune
+    /// demande (bancs de test ProcessorTests, systèmes sans périphérique
+    /// interruptif).
+    fn irq_level(&self) -> u8 {
+        0
+    }
+
+    /// Cycle d'acquittement d'interruption (IACK) pour le niveau `level` que
+    /// le CPU vient d'accepter : le périphérique renvoie le numéro de
+    /// vecteur (0-255) à utiliser pour construire l'adresse du handler.
+    /// Implémentation par défaut : autovecteur (24 + level), le cas le plus
+    /// courant sur Atari ST (GLUE HBL/VBL). Un périphérique vectorisé (MFP
+    /// 68901) doit surcharger cette méthode pour renvoyer son propre
+    /// vecteur programmé pour ce niveau.
+    fn irq_ack(&mut self, level: u8) -> u8 {
+        24 + level
+    }
 }
 
 /// Bus intercalé qui applique le modèle de wait-state DRAM/vidéo (façon
@@ -159,5 +182,13 @@ impl<'b, B: Bus> Bus for TimedBus<'b, B> {
 
     fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
         self.inner.take_bus_fault()
+    }
+
+    fn irq_level(&self) -> u8 {
+        self.inner.irq_level()
+    }
+
+    fn irq_ack(&mut self, level: u8) -> u8 {
+        self.inner.irq_ack(level)
     }
 }

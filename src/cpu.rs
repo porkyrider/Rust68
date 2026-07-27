@@ -364,6 +364,62 @@ impl Cpu {
         self.pc = new_pc;
     }
 
+    /// Vérifie si un périphérique demande une interruption de niveau
+    /// supérieur au masque IPL courant (`SR` bits 8-10) et, si oui, la
+    /// prend. Appelé par [`crate::execute`]`::Cpu::step` avant le fetch de
+    /// chaque instruction.
+    ///
+    /// Prise d'interruption : sauvegarde SR+PC (frame standard 6 octets —
+    /// PAS le frame Group 0/1 de 14 octets des address/bus errors), passe en
+    /// superviseur, désactive la trace, relève le masque IPL au niveau
+    /// accepté (pour ne pas re-déclencher tant qu'il n'a pas baissé), puis
+    /// effectue le cycle d'acquittement ([`Bus::irq_ack`]) pour obtenir le
+    /// vecteur et saute au handler. Renvoie `Some(cycles)` si une
+    /// interruption a été prise (rien d'autre ne s'exécute ce step), `None`
+    /// sinon.
+    ///
+    /// Le niveau 7 est la seule interruption non masquable du 68000 : elle
+    /// est toujours prise quel que soit le masque courant. Les niveaux 1-6
+    /// ne sont pris que si strictement supérieurs au masque (une
+    /// interruption de même niveau ou inférieur ne se déclenche pas tant que
+    /// le masque n'a pas baissé).
+    ///
+    /// Coût approximatif (44 cycles, valeur usuelle citée pour le
+    /// traitement d'exception d'interruption) : aucune suite TomHarte ne
+    /// couvre les interruptions (ce sont des événements externes, pas des
+    /// opcodes) — à calibrer plus tard contre une référence matérielle.
+    pub fn take_interrupt(&mut self, bus: &mut impl Bus) -> Option<u32> {
+        let level = bus.irq_level() & 0x7;
+        if level == 0 {
+            return None;
+        }
+        let current_mask = ((self.sr & sr::IPL_MASK) >> 8) as u8;
+        if level != 7 && level <= current_mask {
+            return None;
+        }
+
+        let saved_sr = self.sr;
+        if !self.supervisor() {
+            self.usp = self.a[SP];
+            self.a[SP] = self.ssp;
+        }
+        self.sr = (saved_sr | sr::S) & !sr::T;
+        self.sr = (self.sr & !sr::IPL_MASK) | ((level as u16) << 8);
+        self.sr &= 0xA71F;
+
+        let sp = self.a[SP].wrapping_sub(6);
+        self.a[SP] = sp;
+        bus.write16(sp & ADDR_MASK, saved_sr);
+        bus.write32(sp.wrapping_add(2) & ADDR_MASK, self.pc);
+
+        let vector = bus.irq_ack(level) as u32;
+        let vec_addr = (vector * 4) & ADDR_MASK;
+        let new_pc = bus.read32(vec_addr);
+        self.log_exception(vector, self.pc, 0, false, new_pc);
+        self.pc = new_pc;
+        Some(44)
+    }
+
     // --- Accès groupés à l'octet CCR ---------------------------------------
 
     /// Renvoie l'octet bas du SR (les flags CCR : X N Z V C).

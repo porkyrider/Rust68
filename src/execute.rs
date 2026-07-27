@@ -341,6 +341,14 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut impl Bus) -> Result<u32, StepError> {
+        // Les interruptions sont reconnues à la frontière entre deux
+        // instructions (pas en cours d'exécution) : vérifiées avant même le
+        // fetch de l'opcode suivant, en dehors de tout TimedBus puisqu'un
+        // cycle IACK n'est pas soumis aux wait-states DRAM/vidéo normaux.
+        if let Some(cycles) = self.take_interrupt(bus) {
+            self.cycles = self.cycles.wrapping_add(cycles as u64);
+            return Ok(cycles);
+        }
         self.pending_address_error = None;
         self.fault_prefix = 4;
         // Enveloppe le bus pour appliquer les wait-states DRAM/vidéo (Steem
