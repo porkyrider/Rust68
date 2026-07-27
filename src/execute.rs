@@ -813,9 +813,16 @@ impl Cpu {
         let hi_correct = if hi_borrow { 6i32 } else { 0 };
 
         let raw = (dst - src - xi + 0x100) & 0xFF;
-        let corrected = (raw - lo_correct - (hi_correct << 4)) & 0xFF;
+        let corrected_raw = raw - lo_correct - (hi_correct << 4);
+        let corrected = corrected_raw & 0xFF;
         let result = corrected as u32;
-        let actual_borrow = hi_borrow;
+        // Le silicium détecte l'emprunt sur la valeur *avant* masquage 0xFF :
+        // avec des nibbles BCD invalides (>9), `hi_borrow` (calculé nibble
+        // par nibble) peut rester faux alors que la correction décimale fait
+        // quand même passer le résultat sous zéro (ex: dst=0xb2, src=0xad →
+        // hi=0, mais corrected_raw=-1). TomHarte montre que le vrai C/X suit
+        // ce deuxième cas aussi, d'où le OR des deux conditions.
+        let actual_borrow = hi_borrow || corrected_raw < 0;
 
         self.set_flag(ccr::C, actual_borrow);
         self.set_flag(ccr::X, actual_borrow);
