@@ -10,7 +10,8 @@
 //! Câblage d'interruption réel ST/STE, par priorité décroissante :
 //! MFP → IPL6, VBL (GLUE) → IPL4, HBL (GLUE) → IPL2. Les deux ACIA
 //! (clavier + MIDI) ne génèrent pas d'IPL directement : leurs sorties IRQ
-//! sont OR câblées sur `GPIP4` du MFP (câblage réel ST/STE).
+//! sont OR câblées sur `GPIP4` du MFP (câblage réel ST/STE). Le WD1772
+//! (`/INTRQ`) est câblé sur `GPIP5` (câblage réel ST/STE).
 //!
 //! Le Shifter (vidéo) est piloté par le rythme HBL/VBL du GLUE : `tick`
 //! détecte les changements de `Glue::current_line`/`frame_count` et
@@ -35,11 +36,17 @@
 //! - `AtariSt::tick` doit être appelé explicitement par l'appelant après
 //!   chaque `Cpu::step` (ce crate ne fait pas progresser les
 //!   périphériques tout seul) — voir l'exemple sur `tick`.
+//! - Registres DMA/WD1772 simplifiés : sélecteur de registre FDC
+//!   (`DMA_MODE`, bits 0-1) modélisé, mais pas le registre de nombre de
+//!   secteurs ni la sélection FDC/HDC réels du contrôleur DMA ST — notre
+//!   modèle de transfert "instantané par secteur" n'en a pas besoin
+//!   fonctionnellement (voir `peripherals::wd1772` pour le détail).
 
 use crate::peripherals::acia::{self, Acia};
 use crate::peripherals::glue::{Glue, VideoMode};
 use crate::peripherals::mfp::Mfp;
 use crate::peripherals::shifter::{self, Shifter};
+use crate::peripherals::wd1772::{self, DmaChannel, RawDiskImage, Wd1772};
 use crate::peripherals::ym2149::{self, Ym2149};
 use crate::{ADDR_MASK, Bus};
 
@@ -64,6 +71,19 @@ pub const ACIA_MIDI_DATA: u32 = 0xFFFC06;
 pub const YM2149_SELECT: u32 = 0xFF8800;
 /// YM2149 : registre de données du registre actuellement sélectionné.
 pub const YM2149_DATA: u32 = 0xFF8802;
+
+/// WD1772 : registre multiplexé (Commande/Statut/Piste/Secteur/Donnée
+/// selon le sélecteur `DMA_MODE`), sur ST/STE réel.
+pub const FDC_DATA: u32 = 0xFF8604;
+/// Contrôleur DMA : sélecteur de registre FDC (bits 0-1, voir
+/// limitations — modèle simplifié).
+pub const DMA_MODE: u32 = 0xFF8606;
+/// Compteur d'adresse DMA, octet haut.
+pub const DMA_ADDR_HIGH: u32 = 0xFF8609;
+/// Compteur d'adresse DMA, octet médian.
+pub const DMA_ADDR_MID: u32 = 0xFF860B;
+/// Compteur d'adresse DMA, octet bas.
+pub const DMA_ADDR_LOW: u32 = 0xFF860D;
 
 /// Début de la zone d'E/S général (ACIA, PSG, FDC, Shifter…) sur ST/STE.
 pub const IO_BASE: u32 = 0xFF8000;
@@ -112,7 +132,39 @@ pub struct AtariSt {
     /// avec "aucune ligne écoulée" quand `current_line` revient à 0.
     last_absolute_line: u64,
     last_frame: u64,
+    /// WD1772 (contrôleur de disquette). Champ public : câbler `/INTRQ`
+    /// n'est pas nécessaire à la main, `Self::tick` s'en charge (relayé
+    /// sur `GPIP5` du MFP).
+    pub wd1772: Wd1772,
+    /// Disque inséré dans le lecteur A, s'il y en a un. Champ public :
+    /// insérer/éjecter directement (`st.floppy_a = Some(RawDiskImage::new(...))`).
+    pub floppy_a: Option<RawDiskImage>,
+    dma_register_select: u8,
+    dma_address: u32,
     bus_fault: Option<(u32, bool)>,
+}
+
+/// Canal DMA reliant le WD1772 à la RAM du board à l'adresse DMA courante
+/// (voir `peripherals::wd1772::DmaChannel`) : le WD1772 ne connaît pas la
+/// RAM, seulement ce canal.
+struct RamDmaChannel<'a> {
+    ram: &'a mut [u8],
+    address: &'a mut u32,
+}
+
+impl<'a> DmaChannel for RamDmaChannel<'a> {
+    fn pull(&mut self) -> u8 {
+        let byte = self.ram.get(*self.address as usize).copied().unwrap_or(0);
+        *self.address = self.address.wrapping_add(1);
+        byte
+    }
+
+    fn push(&mut self, byte: u8) {
+        if let Some(slot) = self.ram.get_mut(*self.address as usize) {
+            *slot = byte;
+        }
+        *self.address = self.address.wrapping_add(1);
+    }
 }
 
 impl AtariSt {
@@ -134,6 +186,10 @@ impl AtariSt {
             framebuffer: Vec::new(),
             last_absolute_line: 0,
             last_frame: 0,
+            wd1772: Wd1772::new(),
+            floppy_a: None,
+            dma_register_select: 0,
+            dma_address: 0,
             bus_fault: None,
         }
     }
@@ -159,6 +215,7 @@ impl AtariSt {
         self.ym2149.tick(cpu_cycles);
         let acia_irq = self.acia_keyboard.irq_requested() || self.acia_midi.irq_requested();
         self.mfp.set_gpip_input(4, acia_irq);
+        self.mfp.set_gpip_input(5, self.wd1772.interrupt_requested());
 
         let frame_now = self.glue.frame_count();
         if frame_now != self.last_frame {
@@ -228,6 +285,11 @@ impl Bus for AtariSt {
             YM2149_SELECT => return self.ym2149.read(ym2149::bus_offset::SELECT),
             YM2149_DATA => return self.ym2149.read(ym2149::bus_offset::DATA),
             _ if Self::is_shifter_addr(addr) => return self.shifter.read(addr),
+            FDC_DATA => return self.wd1772.read(self.dma_register_select),
+            DMA_MODE => return self.dma_register_select,
+            DMA_ADDR_HIGH => return (self.dma_address >> 16) as u8,
+            DMA_ADDR_MID => return (self.dma_address >> 8) as u8,
+            DMA_ADDR_LOW => return self.dma_address as u8,
             _ => {}
         }
         if self.in_rom(addr) {
@@ -279,6 +341,35 @@ impl Bus for AtariSt {
                 self.shifter.write(addr, value);
                 return;
             }
+            FDC_DATA => {
+                if self.dma_register_select == wd1772::reg::COMMAND_STATUS {
+                    let mut channel = RamDmaChannel {
+                        ram: &mut self.ram,
+                        address: &mut self.dma_address,
+                    };
+                    self.wd1772
+                        .execute_command(value, self.floppy_a.as_mut(), &mut channel);
+                } else {
+                    self.wd1772.write_simple_register(self.dma_register_select, value);
+                }
+                return;
+            }
+            DMA_MODE => {
+                self.dma_register_select = value & 0x03;
+                return;
+            }
+            DMA_ADDR_HIGH => {
+                self.dma_address = (self.dma_address & 0x00FFFF) | ((value as u32) << 16);
+                return;
+            }
+            DMA_ADDR_MID => {
+                self.dma_address = (self.dma_address & 0xFF00FF) | ((value as u32) << 8);
+                return;
+            }
+            DMA_ADDR_LOW => {
+                self.dma_address = (self.dma_address & 0xFFFF00) | value as u32;
+                return;
+            }
             _ => {}
         }
         if self.in_rom(addr) {
@@ -300,6 +391,11 @@ impl Bus for AtariSt {
         self.acia_midi = Acia::new();
         self.ym2149 = Ym2149::new();
         self.shifter = Shifter::new();
+        self.wd1772 = Wd1772::new();
+        self.dma_register_select = 0;
+        self.dma_address = 0;
+        // Le disque inséré (floppy_a), lui, n'est pas éjecté par /RESET :
+        // c'est un support physique, pas un état de la puce.
         // Le GLUE n'est pas réinitialisé (voir ci-dessus) : resynchroniser
         // juste le suivi de ligne/trame sur sa position courante pour ne
         // pas déclencher un rattrapage massif au prochain tick().

@@ -8,4 +8,5 @@ pub mod acia;
 pub mod glue;
 pub mod mfp;
 pub mod shifter;
+pub mod wd1772;
 pub mod ym2149;

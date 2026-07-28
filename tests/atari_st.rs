@@ -3,10 +3,12 @@
 use rust68::peripherals::acia;
 use rust68::peripherals::mfp::{channel, reg};
 use rust68::peripherals::shifter::addr as shifter_addr;
+use rust68::peripherals::wd1772::{self, FloppyDisk, RawDiskImage, SECTOR_SIZE};
 use rust68::peripherals::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
-    DEFAULT_ROM_BASE, IO_BASE, MFP_BASE, YM2149_DATA, YM2149_SELECT,
+    DEFAULT_ROM_BASE, DMA_ADDR_HIGH, DMA_ADDR_LOW, DMA_ADDR_MID, DMA_MODE, FDC_DATA, IO_BASE,
+    MFP_BASE, YM2149_DATA, YM2149_SELECT,
 };
 use rust68::{Bus, Cpu};
 
@@ -51,7 +53,7 @@ fn trou_physique_declenche_bus_fault() {
 #[test]
 fn peripherique_non_emule_repond_neutre_sans_fault() {
     let mut st = AtariSt::new(0x1000, vec![]);
-    let addr = IO_BASE + 0x604; // ex: zone FDC/DMA, pas encore modélisée
+    let addr = IO_BASE + 0x900; // ex: zone Blitter (STE), pas encore modélisée
     assert_eq!(st.read8(addr), 0xFF);
     assert_eq!(st.take_bus_fault(), None, "chip select réel : pas de bus error");
     st.write8(addr, 0x12); // ne doit pas paniquer, simplement ignoré
@@ -332,4 +334,105 @@ fn reset_bus_reinitialise_le_shifter_et_resynchronise_le_suivi() {
     let lignes_avant = st.framebuffer.len();
     st.tick(4);
     assert!(st.framebuffer.len() <= lignes_avant + 1);
+}
+
+fn disque_de_test() -> RawDiskImage {
+    let mut data = vec![0u8; 9 * SECTOR_SIZE];
+    data[0] = 0xAB; // secteur 1, piste 0, face 0 : motif reconnaissable
+    RawDiskImage::new(data, 80, 1, 9)
+}
+
+#[test]
+fn fdc_registres_multiplexes_via_dma_mode() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(DMA_MODE, wd1772::reg::TRACK);
+    st.write8(FDC_DATA, 42);
+    assert_eq!(st.wd1772.read(wd1772::reg::TRACK), 42);
+    assert_eq!(st.read8(FDC_DATA), 42);
+}
+
+#[test]
+fn dma_compteur_adresse_round_trip() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(DMA_ADDR_HIGH, 0x00);
+    st.write8(DMA_ADDR_MID, 0x02);
+    st.write8(DMA_ADDR_LOW, 0x10);
+    assert_eq!(st.read8(DMA_ADDR_HIGH), 0x00);
+    assert_eq!(st.read8(DMA_ADDR_MID), 0x02);
+    assert_eq!(st.read8(DMA_ADDR_LOW), 0x10);
+}
+
+/// Test d'intégration bout-en-bout : insère un disque, positionne le
+/// secteur et l'adresse DMA, déclenche Read Sector via l'écriture du
+/// registre de commande, et vérifie que la RAM a reçu le secteur.
+#[test]
+fn read_sector_bout_en_bout_via_dma() {
+    let mut st = AtariSt::new(0x2000, vec![]);
+    st.floppy_a = Some(disque_de_test());
+
+    st.write8(DMA_ADDR_HIGH, 0x00);
+    st.write8(DMA_ADDR_MID, 0x10);
+    st.write8(DMA_ADDR_LOW, 0x00); // adresse DMA = 0x1000
+
+    st.write8(DMA_MODE, wd1772::reg::SECTOR);
+    st.write8(FDC_DATA, 1); // secteur 1
+
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
+    st.write8(FDC_DATA, 0b1000_0000); // Read Sector, m=0
+
+    assert_eq!(st.read8(0x1000), 0xAB, "le motif du secteur 1 doit être en RAM");
+    assert!(st.wd1772.interrupt_requested());
+}
+
+#[test]
+fn write_sector_bout_en_bout_via_dma() {
+    let mut st = AtariSt::new(0x2000, vec![]);
+    st.floppy_a = Some(disque_de_test());
+
+    // Prépare 512 octets à 0x55 en RAM à partir de 0x1000.
+    for i in 0..SECTOR_SIZE as u32 {
+        st.write8(0x1000 + i, 0x55);
+    }
+    st.write8(DMA_ADDR_HIGH, 0x00);
+    st.write8(DMA_ADDR_MID, 0x10);
+    st.write8(DMA_ADDR_LOW, 0x00);
+
+    st.write8(DMA_MODE, wd1772::reg::SECTOR);
+    st.write8(FDC_DATA, 2); // secteur 2
+
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
+    st.write8(FDC_DATA, 0b1010_0000); // Write Sector, m=0
+
+    let secteur_2 = st.floppy_a.as_ref().unwrap().read_sector(0, 0, 2).unwrap();
+    assert!(secteur_2.iter().all(|&b| b == 0x55));
+}
+
+#[test]
+fn irq_wd1772_relayee_via_gpip5_du_mfp() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.floppy_a = Some(disque_de_test());
+    st.mfp.write(reg::DDR, 0x00);
+    st.mfp.write(reg::AER, 1 << 5); // front montant
+    st.mfp.write(reg::IERB, 1 << channel::GPIP5);
+    st.mfp.write(reg::IMRB, 1 << channel::GPIP5);
+
+    assert_eq!(st.irq_level(), 0);
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
+    st.write8(FDC_DATA, 0b0000_0000); // Restore
+
+    st.tick(4); // relaie /INTRQ vers GPIP5
+    assert_eq!(st.irq_level(), 6, "l'IRQ WD1772 doit remonter jusqu'au MFP (IPL6)");
+}
+
+#[test]
+fn reset_bus_reinitialise_le_wd1772() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.floppy_a = Some(disque_de_test());
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
+    st.write8(FDC_DATA, 0b0000_0000); // Restore -> lève /INTRQ
+    assert!(st.wd1772.interrupt_requested());
+
+    st.reset_bus();
+
+    assert!(!st.wd1772.interrupt_requested(), "reset_bus doit réinitialiser le WD1772");
 }
