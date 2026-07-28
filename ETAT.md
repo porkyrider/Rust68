@@ -1,6 +1,19 @@
 # Rust68 — État de l'émulateur MC68000
 
-> Dernière mise à jour : 2026-07-27
+> Dernière mise à jour : 2026-07-28
+
+## Licence
+
+Projet sous **GPL-3.0-or-later** (voir [LICENSE](LICENSE)), décision prise
+le 2026-07-28. Avant cette date, `Cargo.toml` déclarait « MIT OR
+Apache-2.0 » sans fichiers de licence réels ; en vérifiant la provenance du
+code avant de les ajouter, il s'est avéré que `divu_core_cycles`/
+`divs_core_cycles` (commit `a21e2ef`) étaient un port direct de code GPLv2
+(WinUAE), incompatible avec une licence permissive. Plutôt que de rester
+en MIT/Apache (ce qui aurait exigé de réécrire ce code en clean-room, ce
+qui a été fait quand même par rigueur — voir section Timing), le projet
+passe en GPL pour interdire explicitement toute réutilisation dans un
+projet fermé/commercial sans republication des modifications.
 
 ## Score TomHarte actuel
 
@@ -141,9 +154,16 @@ l'état registres/RAM, déjà correct à 100 %) :
 
 1. **Coûts de base par instruction** (`ea_extra_cycles`, wait-states
    DRAM/vidéo via `TimedBus`) — voir commit `29b183d`.
-2. **Précision data-dépendante** : DIVU/DIVS (algorithme microcode porté de
-   WinUAE/Hatari), `fault_prefix` pour l'address error, corrections MULS/JSR/
-   MOVEM/CMPI/CMPM/ADDA.l/SUBA.l — voir commit `a21e2ef`.
+2. **Précision data-dépendante** : DIVU/DIVS (algorithme microcode),
+   `fault_prefix` pour l'address error, corrections MULS/JSR/MOVEM/CMPI/
+   CMPM/ADDA.l/SUBA.l — voir commit `a21e2ef`. **Note de provenance** : la
+   version originale de `divu_core_cycles`/`divs_core_cycles` de ce commit
+   était un port direct de code GPLv2 (WinUAE `getDivu68kCycles`/
+   `getDivs68kCycles`), incompatible avec la licence du projet — remplacée
+   depuis (2026-07-28) par une réimplémentation indépendante à partir de la
+   description technique publique de Jorge Cwik (Atari-Forum, 2005),
+   revalidée par recherche exhaustive contre TomHarte (0 écart, 2500/2500
+   DIVU et DIVS). Voir aussi la section Licence ci-dessous.
 3. **Address error sur écriture** (2026-07-27) :
    - `ADDX.w`/`SUBX.w` en mode mémoire `-(An),-(An)` : le préfixe de coût en
      cas d'address error sur la lecture dst était erroné (12 au lieu de 8)
