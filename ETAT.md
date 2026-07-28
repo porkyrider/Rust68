@@ -50,8 +50,9 @@ src/
     glue.rs       (~125 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
     acia.rs       (~150 l.)  — MC6850 ACIA (chip seul, cf. section dédiée)
     ym2149.rs     (~375 l.)  — PSG YM2149 (chip seul, cf. section dédiée)
+    shifter.rs    (~265 l.)  — vidéo Shifter (chip seul, cf. section dédiée)
   systems/
-    atari_st.rs   (~265 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149, cf. section dédiée)
+    atari_st.rs   (~345 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter, cf. section dédiée)
   lib.rs                     — exports publics
 tests/
   instructions.rs            — tests unitaires ciblés (CPU)
@@ -60,7 +61,8 @@ tests/
   glue.rs                      — tests du GLUE (HBL/VBL)
   acia.rs                      — tests du MC6850 ACIA
   ym2149.rs                    — tests du PSG YM2149
-  atari_st.rs                 — tests du board Atari ST (dont 3 tests bout-en-bout)
+  shifter.rs                   — tests de la vidéo Shifter
+  atari_st.rs                 — tests du board Atari ST (dont plusieurs tests bout-en-bout)
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
 ```
 
@@ -444,17 +446,54 @@ ports).
 
 ---
 
+## Shifter (nouveau module `src/peripherals/shifter.rs`)
+
+`peripherals::shifter::Shifter` modélise la puce vidéo seule : lit la RAM
+vidéo ligne par ligne et la convertit en pixels RGB 24 bits selon la
+résolution programmée (basse 320×200/4 plans, moyenne 640×200/2 plans,
+haute 640×400/1 plan monochrome). Mappé dans `AtariSt` (champ public
+`shifter`, adresses `$FF8201`/`03` base vidéo, `$FF8205`/`07`/`09` compteur
+vidéo, `$FF8240`-`$FF825E` palette 16 couleurs, `$FF8260` résolution).
+
+- Déinterlacement des plans (format bitplane word-interleaved standard
+  Atari ST : pour un groupe de 16 pixels, un mot consécutif par plan) —
+  fait mot par mot puis bit par bit, MSB en premier.
+- Palette 16 couleurs au format ST (3×3 bits RGB), convertie en RGB 24
+  bits par réplication de bits (`v<<5 | v<<2 | v>>1`, exacte aux deux
+  extrémités 0/255).
+- Câblé dans `AtariSt::tick` sur le rythme HBL/VBL du GLUE : détecte les
+  changements de `Glue::current_line`/`frame_count` (via un compteur de
+  ligne **absolu**, pas le compteur bouclant du GLUE, pour ne pas
+  confondre "une trame complète vient de s'écouler" avec "aucune ligne
+  écoulée" quand `current_line` revient à 0) et alimente
+  [`AtariSt::framebuffer`] (`Vec<Vec<(u8,u8,u8)>>`, une entrée par ligne).
+
+Limitations documentées dans le module : format de palette ST uniquement
+(pas l'extension 12 bits STE) ; compteur vidéo toujours accepté en
+écriture (comportement STE, pas lecture-seule comme sur ST d'origine) ;
+pas de défilement fin ; convention de polarité du mode haute résolution
+(bit=1 → noir) documentée mais non vérifiée contre une capture matérielle
+réelle ; pas de contention DRAM/vidéo modélisée pour l'accès Shifter (le
+mécanisme `Bus::is_contended`/`TimedBus` existe déjà génériquement mais
+n'est pas branché sur les lectures du Shifter).
+
+Testé dans `tests/shifter.rs` (8 tests : registres, rendu basse/moyenne/
+haute résolution avec motifs de bits connus, avancement du compteur,
+RAM insuffisante) et `tests/atari_st.rs` (5 tests supplémentaires, dont
+un rendu de trame PAL complète de 313 lignes).
+
+---
+
 ## Ce qui reste pour l'émulation Atari ST
 
 Le CPU MC68000 est complet, 100 % conforme en état ET 100 % cycle-exact
 (voir section Timing). L'interruption IPL, le MFP 68901, le GLUE
-(HBL/VBL), les deux ACIA 6850, le YM2149 et un board minimal
-(RAM/ROM/MFP/GLUE/ACIA/YM2149) sont en place. Pour émuler un Atari ST
-complet il faut encore :
+(HBL/VBL), les deux ACIA 6850, le YM2149, le Shifter et un board minimal
+(RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter) sont en place. Pour émuler un
+Atari ST complet il faut encore :
 
 | Composant | Priorité |
 |-----------|----------|
 | WD1772 (floppy) | Moyenne |
-| Shifter (vidéo ST low/med/high) | Moyenne |
 | Blitter | Basse |
 | Trace mode (bit T SR) | Basse |
