@@ -1128,11 +1128,21 @@ impl Cpu {
             // ne soit détectée — la moitié haute d'un Long n'est jamais payée)
             // + 50 (dispatch Group 0). -(An) ajoute +4 : prefetch supplémentaire
             // avant le write cycle (cf. write_ae_ir plus haut), non recouvert
-            // par le pipeline normal une fois l'exception déclenchée. Vérifié
-            // exhaustivement contre MOVE.w/l TomHarte pour tous les dst_mode
-            // sauf (xxx).L, qui reste data-dépendant (résidu documenté).
+            // par le pipeline normal une fois l'exception déclenchée.
             let predec_extra = if dst_mode == 0b100 { 4 } else { 0 };
-            let dst_ae_cost = src_extra + move_dst_base(dst_mode, dst_reg, Size::Word) + predec_extra + 50;
+            // (xxx).L : -4 supplémentaire si la source a nécessité une
+            // lecture mémoire (pas Dn/An direct) — le recouvrement du
+            // fetch des 2 mots d'extension d'adresse avec le cycle de
+            // lecture source change le timing du write raté. Trouvé et
+            // vérifié par recherche exhaustive contre les 27 cas TomHarte
+            // dst=(xxx).L en address error (0 écart) : correction nulle si
+            // src est Dn/An, -4 sinon.
+            let abs_long_mem_src_extra = if is_dst_abs_long && !is_src_reg { -4i32 } else { 0 };
+            let dst_ae_cost = (src_extra as i32
+                + move_dst_base(dst_mode, dst_reg, Size::Word) as i32
+                + predec_extra as i32
+                + abs_long_mem_src_extra
+                + 50) as u32;
             return Ok(dst_ae_cost);
         }
         Ok(src_extra + move_dst_base(dst_mode, dst_reg, size))
@@ -1262,13 +1272,19 @@ impl Cpu {
                 self.set_flag(ccr::N, true);
                 let pc_push = self.pc; // opcode_addr + 2 (après fetch opcode + EA)
                 self.take_exception(bus, 6, pc_push);
-                // NOTE : deux cas "dn<0" structurellement identiques (registre
-                // direct, ea_extra=0) attendent 38 ET 40 selon ProcessorTests —
-                // CHK a une dépendance aux données/pipeline non résolue ici
-                // (comparable à la remarque MAME sur TRAPV). Ne pas retoucher
-                // sans nouvelle piste : un essai de "toujours 38" a empiré le
-                // résultat (388 → 402 échecs cycles).
-                return Ok(40 + ea_extra);
+                // Le coût du trap "dn<0" dépend du résultat de la soustraction
+                // interne dn-upper (comme un CMP), PAS de la comparaison
+                // mathématique vraie : quand dn est très négatif et upper très
+                // positif, dn-upper déborde la plage 16 bits signée et son bit
+                // de signe (après retenue/troncature) peut différer du signe
+                // "réel" de dn-upper. Trouvé et vérifié par recherche
+                // exhaustive contre les 181 cas TomHarte "dn<0" (0 écart) :
+                // 40 cycles si (dn-upper), tronqué 16 bits signés, est <= 0 ;
+                // 38 sinon. Un essai antérieur de "toujours 38" avait empiré
+                // le score (388 → 402 échecs) faute d'avoir identifié cette
+                // règle.
+                let diff = dn.wrapping_sub(upper);
+                return Ok((if diff <= 0 { 40 } else { 38 }) + ea_extra);
             } else if dn > upper {
                 self.sr &= !0x000F;
                 let pc_push = self.pc;
