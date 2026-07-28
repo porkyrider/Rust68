@@ -1,4 +1,4 @@
-//! Board Atari ST : mapping mémoire réel + câblage MFP → IPL6.
+//! Board Atari ST : mapping mémoire réel + câblage MFP/GLUE → IPL.
 //!
 //! Implémente [`crate::Bus`] pour un ST/STE minimal : RAM installée à
 //! `0x000000`, ROM TOS à `0xFC0000`, MFP 68901 aux adresses impaires
@@ -6,6 +6,9 @@
 //! installée et le début de la zone d'E/S (`0xFF8000`) déclenche un bus
 //! error via [`crate::Bus::take_bus_fault`] — c'est le mécanisme que de
 //! nombreux programmes/démos utilisent pour détecter la RAM installée.
+//!
+//! Câblage d'interruption réel ST/STE, par priorité décroissante :
+//! MFP → IPL6, VBL (GLUE) → IPL4, HBL (GLUE) → IPL2.
 //!
 //! ## Limitations connues (v1)
 //! - Seuls RAM/ROM/MFP sont réellement mappés. Le reste de la zone d'E/S
@@ -20,7 +23,11 @@
 //!   normalement flottantes sur un vrai bus 8 bits) retombent dans le
 //!   stub d'E/S générique plutôt que de modéliser précisément le
 //!   comportement de décodage UDS/LDS.
+//! - `AtariSt::tick` doit être appelé explicitement par l'appelant après
+//!   chaque `Cpu::step` (ce crate ne fait pas progresser les
+//!   périphériques tout seul) — voir l'exemple sur `tick`.
 
+use crate::peripherals::glue::{Glue, VideoMode};
 use crate::peripherals::mfp::Mfp;
 use crate::{ADDR_MASK, Bus};
 
@@ -39,30 +46,54 @@ pub const IO_END: u32 = 0x00FF_FFFF;
 /// Adresse de base usuelle de la ROM TOS (192 Ko, TOS 1.x/2.x).
 pub const DEFAULT_ROM_BASE: u32 = 0xFC0000;
 
-/// Board Atari ST minimal : RAM + ROM + MFP 68901.
+/// Board Atari ST minimal : RAM + ROM + MFP 68901 + GLUE (HBL/VBL).
 pub struct AtariSt {
     ram: Vec<u8>,
     rom: Vec<u8>,
     rom_base: u32,
     /// Puce MFP 68901, câblée sur IPL6 (voir `Bus::irq_level`). Champ
     /// public : l'appelant a besoin d'y injecter des événements externes
-    /// (`set_gpip_input`, `push_rx_byte`…) et de faire progresser ses
-    /// timers via `tick()`.
+    /// (`set_gpip_input`, `push_rx_byte`…). Faire progresser ses timers
+    /// passe par [`Self::tick`], pas directement par `Mfp::tick`.
     pub mfp: Mfp,
+    /// Puce GLUE (timing HBL/VBL), câblée sur IPL2/IPL4. Champ public :
+    /// utile en lecture pour synchroniser un rendu vidéo externe sur
+    /// `current_line()`/`frame_count()`.
+    pub glue: Glue,
     bus_fault: Option<(u32, bool)>,
 }
 
 impl AtariSt {
-    /// Crée un board avec `ram_size` octets de RAM installée à `0x000000`
-    /// et `rom` (typiquement un dump TOS) mappée à `DEFAULT_ROM_BASE`.
+    /// Crée un board avec `ram_size` octets de RAM installée à `0x000000`,
+    /// `rom` (typiquement un dump TOS) mappée à `DEFAULT_ROM_BASE`, et le
+    /// GLUE cadencé en PAL 50 Hz (le cas le plus courant — voir
+    /// [`VideoMode`] pour du NTSC).
     pub fn new(ram_size: usize, rom: Vec<u8>) -> Self {
         AtariSt {
             ram: vec![0; ram_size],
             rom,
             rom_base: DEFAULT_ROM_BASE,
             mfp: Mfp::new(),
+            glue: Glue::new(VideoMode::Pal50),
             bus_fault: None,
         }
+    }
+
+    /// Fait progresser les périphériques (MFP + GLUE) de `cpu_cycles`
+    /// cycles CPU. À appeler par l'appelant après chaque `Cpu::step` :
+    ///
+    /// ```
+    /// use rust68::{Cpu, systems::atari_st::AtariSt};
+    ///
+    /// let mut st = AtariSt::new(0x1000, vec![]);
+    /// let mut cpu = Cpu::new();
+    /// cpu.reset(&mut st);
+    /// let cycles = cpu.step(&mut st).unwrap();
+    /// st.tick(cycles);
+    /// ```
+    pub fn tick(&mut self, cpu_cycles: u32) {
+        self.mfp.tick(cpu_cycles);
+        self.glue.tick(cpu_cycles);
     }
 
     fn mfp_offset(addr: u32) -> Option<u8> {
@@ -118,6 +149,9 @@ impl Bus for AtariSt {
 
     fn reset_bus(&mut self) {
         // L'instruction RESET génère /RESET vers les périphériques externes.
+        // Le GLUE n'est PAS réinitialisé : sur silicium réel, le timing
+        // vidéo continue de tourner indépendamment d'un /RESET CPU (le
+        // moniteur reste synchronisé).
         self.mfp = Mfp::new();
     }
 
@@ -126,15 +160,31 @@ impl Bus for AtariSt {
     }
 
     fn irq_level(&self) -> u8 {
-        // Câblage matériel ST/STE : sortie IRQ du MFP sur IPL6 du CPU.
-        if self.mfp.interrupt_requested() { 6 } else { 0 }
+        // Câblage matériel ST/STE, par priorité décroissante :
+        // MFP (IPL6) > VBL (IPL4) > HBL (IPL2).
+        if self.mfp.interrupt_requested() {
+            6
+        } else if self.glue.vbl_pending() {
+            4
+        } else if self.glue.hbl_pending() {
+            2
+        } else {
+            0
+        }
     }
 
     fn irq_ack(&mut self, level: u8) -> u8 {
-        if level == 6 {
-            self.mfp.iack()
-        } else {
-            24 + level
+        match level {
+            6 => self.mfp.iack(),
+            4 => {
+                self.glue.ack_vbl();
+                24 + 4 // autovecteur niveau 4
+            }
+            2 => {
+                self.glue.ack_hbl();
+                24 + 2 // autovecteur niveau 2
+            }
+            _ => 24 + level,
         }
     }
 }

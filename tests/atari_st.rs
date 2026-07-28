@@ -76,6 +76,69 @@ fn reset_bus_reinitialise_le_mfp() {
     assert_eq!(st.mfp.read(reg::IERA), 0, "reset_bus doit réinitialiser le MFP");
 }
 
+#[test]
+fn priorite_mfp_vbl_hbl() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    assert_eq!(st.irq_level(), 0);
+
+    // Une ligne complète (512 cycles PAL) : HBL seul en attente.
+    st.tick(512);
+    assert_eq!(st.irq_level(), 2, "HBL seul en attente : IPL2");
+
+    // Une trame complète (313 lignes) : VBL doit dominer HBL.
+    st.tick(512 * 312);
+    assert_eq!(st.irq_level(), 4, "VBL présent : IPL4 domine HBL (IPL2)");
+
+    // Le MFP domine tout le reste.
+    st.mfp.write(reg::DDR, 0x00);
+    st.mfp.write(reg::AER, 0x01);
+    st.mfp.write(reg::IERB, 1 << channel::GPIP0);
+    st.mfp.write(reg::IMRB, 1 << channel::GPIP0);
+    st.mfp.set_gpip_input(0, true);
+    assert_eq!(st.irq_level(), 6, "MFP présent : IPL6 domine VBL/HBL");
+
+    // Acquitter dans l'ordre de priorité.
+    st.irq_ack(6);
+    assert_eq!(st.irq_level(), 4, "MFP acquitté : VBL redevient visible");
+    let vbl_vector = st.irq_ack(4);
+    assert_eq!(vbl_vector, 28, "autovecteur niveau 4 = 24+4");
+    assert_eq!(st.irq_level(), 2, "VBL acquitté : HBL redevient visible");
+    let hbl_vector = st.irq_ack(2);
+    assert_eq!(hbl_vector, 26, "autovecteur niveau 2 = 24+2");
+    assert_eq!(st.irq_level(), 0);
+}
+
+#[test]
+fn tick_fait_progresser_mfp_et_glue_ensemble() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
+    st.mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
+    st.mfp.write(reg::TADR, 200);
+    st.mfp.write(reg::TACR, 7); // ÷200, la période la plus lente
+
+    for _ in 0..600 {
+        st.tick(512); // 600 lignes : largement > 1 trame et > 1 période timer
+    }
+
+    assert!(st.glue.frame_count() >= 1, "le GLUE doit avoir avancé");
+    assert!(
+        st.mfp.read(reg::IPRA) & (1 << (channel::TIMER_A - 8)) != 0,
+        "le MFP doit avoir avancé aussi"
+    );
+}
+
+#[test]
+fn reset_bus_ne_touche_pas_le_glue() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.tick(512 * 313); // 1 trame complète : VBL en attente
+    assert!(st.glue.vbl_pending());
+    st.reset_bus();
+    assert!(
+        st.glue.vbl_pending(),
+        "le timing vidéo continue indépendamment d'un /RESET CPU"
+    );
+}
+
 /// Test d'intégration bout-en-bout : un CPU réel prend une interruption
 /// générée par le MFP via le board, à travers tout le mécanisme
 /// Cpu::step -> Bus::irq_level -> Bus::irq_ack -> Mfp::iack.
