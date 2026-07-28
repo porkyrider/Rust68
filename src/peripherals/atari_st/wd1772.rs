@@ -236,7 +236,7 @@ impl Wd1772 {
     /// de façon synchrone : toutes les commandes se terminent avant que
     /// cette fonction ne rende la main (voir limitations du module). `disk`
     /// est `None` pour simuler un lecteur sans disque (`NOT_READY`).
-    pub fn execute_command<D: FloppyDisk>(
+    pub fn execute_command<D: FloppyDisk + ?Sized>(
         &mut self,
         command: u8,
         disk: Option<&mut D>,
@@ -274,7 +274,7 @@ impl Wd1772 {
         }
     }
 
-    fn write_protect_bit<D: FloppyDisk>(&self, disk: &D) -> u8 {
+    fn write_protect_bit<D: FloppyDisk + ?Sized>(&self, disk: &D) -> u8 {
         if disk.write_protected() {
             status::WRITE_PROTECT
         } else {
@@ -282,7 +282,7 @@ impl Wd1772 {
         }
     }
 
-    fn execute_type1<D: FloppyDisk>(&mut self, command: u8, disk: &D) {
+    fn execute_type1<D: FloppyDisk + ?Sized>(&mut self, command: u8, disk: &D) {
         self.status = status::BUSY;
         match command >> 4 {
             0b0000 => {
@@ -328,7 +328,7 @@ impl Wd1772 {
         }
     }
 
-    fn execute_type2<D: FloppyDisk>(&mut self, command: u8, disk: &mut D, dma: &mut impl DmaChannel) {
+    fn execute_type2<D: FloppyDisk + ?Sized>(&mut self, command: u8, disk: &mut D, dma: &mut impl DmaChannel) {
         let is_write = command & 0x20 != 0;
         let multiple = command & 0x10 != 0;
         self.status = status::BUSY;

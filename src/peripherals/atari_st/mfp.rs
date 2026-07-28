@@ -487,8 +487,12 @@ impl Mfp {
     /// de se re-déclencher immédiatement, ce mode ne bloque pas les
     /// interruptions de même priorité).
     ///
-    /// Renvoie le vecteur complet : bits 7-3 = `VR[7:3]` (programmé par le
-    /// logiciel), bits 2-0 = numéro de canal.
+    /// Renvoie le vecteur complet : bits 7-4 = `VR[7:4]` (base programmée
+    /// par le logiciel), bits 3-0 = numéro de canal (0-15 — le bit 3 du VR
+    /// lui-même n'en fait PAS partie : c'est le bit S ci-dessus, un
+    /// contrôle séparé, pas un bit de poids fort du vecteur — une confusion
+    /// facile puisque son adresse bit coïncide avec le bit haut du champ
+    /// canal).
     pub fn iack(&mut self) -> u8 {
         let Some(chan) = self.highest_priority_pending() else {
             // Interruption fantôme (retirée avant l'IACK) : vecteur spurious
@@ -501,7 +505,7 @@ impl Mfp {
         if self.vr & AUTO_EOI == 0 {
             self.isr |= mask;
         }
-        (self.vr & 0xF8) | chan
+        (self.vr & 0xF0) | chan
     }
 
     /// Acquitte manuellement un canal en mode "software end-of-interrupt"

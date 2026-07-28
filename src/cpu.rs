@@ -117,6 +117,18 @@ pub struct Cpu {
     /// `step` suivant (pour préserver la priorité trace-avant-interruption
     /// du silicium réel).
     pub trace_pending: bool,
+    /// Vrai juste après une instruction qui a modifié le SR (donc
+    /// potentiellement le masque IPL) — `MOVE`/`ANDI`/`ORI`/`EORI to SR`,
+    /// `RTE`, `STOP`. Documenté (MC68000 User Manual, cycle CPU Space) :
+    /// les lignes IPL ne sont réévaluées qu'au 3ᵉ front descendant
+    /// d'horloge du dernier cycle bus d'une instruction, ce qui retarde
+    /// d'exactement une instruction la prise en compte d'un masque IPL
+    /// tout juste abaissé — un programme qui démasque une interruption
+    /// dispose donc garantie d'au moins une instruction avant qu'elle ne
+    /// puisse effectivement se déclencher. `take_interrupt` consomme ce
+    /// drapeau (le remet à faux) à chaque appel, qu'une interruption soit
+    /// prise ou non.
+    pub sr_write_pending_delay: bool,
 }
 
 /// Taille max de `Cpu::exception_log` — assez pour couvrir plusieurs frames
@@ -152,6 +164,7 @@ impl Cpu {
             fault_prefix: 4,
             exception_log: std::collections::VecDeque::new(),
             trace_pending: false,
+            sr_write_pending_delay: false,
         }
     }
 
@@ -401,8 +414,16 @@ impl Cpu {
     /// couvre les interruptions (ce sont des événements externes, pas des
     /// opcodes) — à calibrer plus tard contre une référence matérielle.
     pub fn take_interrupt(&mut self, bus: &mut impl Bus) -> Option<u32> {
+        // Consommé à chaque appel (une instruction = un appel), qu'une
+        // interruption soit prise ou non — voir la doc du champ.
+        let delay = self.sr_write_pending_delay;
+        self.sr_write_pending_delay = false;
+
         let level = bus.irq_level() & 0x7;
         if level == 0 {
+            return None;
+        }
+        if delay {
             return None;
         }
         let current_mask = ((self.sr & sr::IPL_MASK) >> 8) as u8;
@@ -458,6 +479,7 @@ impl Cpu {
 
     /// Écrit le SR en gérant le switch USP/SSP si le bit S change.
     pub fn write_sr(&mut self, new_sr: u16) {
+        self.sr_write_pending_delay = true;
         let old_super = self.supervisor();
         self.sr = new_sr;
         let new_super = self.supervisor();

@@ -1205,6 +1205,18 @@ impl Cpu {
                 self.take_exception(bus, 4, pc_push);
                 return Ok(34);
             }
+            0x4E7A | 0x4E7B => {
+                // MOVEC (68010+ uniquement) : sur un vrai MC68000, cet
+                // opcode n'existe pas — exception "illegal instruction"
+                // vecteur 4, comme ILLEGAL ci-dessus. C'est exactement ce
+                // que du logiciel (TOS y compris, pour détecter le type de
+                // CPU au boot) exploite délibérément : installer un
+                // gestionnaire temporaire au vecteur 4 puis exécuter MOVEC
+                // pour le déclencher sur un 68000.
+                let pc_push = self.pc.wrapping_sub(2);
+                self.take_exception(bus, 4, pc_push);
+                return Ok(34);
+            }
             0x4E76 => {
                 // TRAPV : exception vecteur 7 si V=1
                 if self.flag(ccr::V) {
@@ -1372,6 +1384,19 @@ impl Cpu {
             let val = ae_read(ea.read(self, bus, Size::Word))?;
             self.write_sr(val as u16 & 0xA71F);
             return Ok(12 + ea_extra);
+        }
+        // MOVE from CCR : 0100 0010 11 mmm rrr (68010+ uniquement) — réutilise
+        // la valeur SS=11, non définie pour CLR sur un 68000 réel (CLR ne
+        // connaît que byte/word/long = 00/01/10). Doit précéder le test CLR
+        // ci-dessous (son masque plus large, 0xFF00, matcherait sinon aussi
+        // cette plage et tenterait — à tort — un `Size::from_bits` invalide).
+        // Sur un vrai MC68000 cet opcode n'existe pas : exception "illegal
+        // instruction" vecteur 4, comme MOVEC ci-dessus (même genre de sonde
+        // de détection de CPU par du logiciel, TOS y compris).
+        if opcode & 0b1111_1111_1100_0000 == 0b0100_0010_1100_0000 {
+            let pc_push = self.pc.wrapping_sub(2);
+            self.take_exception(bus, 4, pc_push);
+            return Ok(34);
         }
         // CLR : 0100 0010 SS mmm rrr
         if opcode & 0b1111_1111_0000_0000 == 0b0100_0010_0000_0000 {

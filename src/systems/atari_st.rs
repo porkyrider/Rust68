@@ -20,11 +20,16 @@
 //!
 //! ## Limitations connues (v1)
 //! - RAM/ROM/MFP/ACIA×2/YM2149/Shifter sont réellement mappés. Le reste de
-//!   la zone d'E/S (`0xFF8000`-`0xFFFFFF` : FDC/DMA…) répond `0xFF` en
-//!   lecture et ignore les écritures — chip select réel mais périphérique
-//!   pas encore émulé, plutôt qu'un bus error qui casserait tout polling
-//!   de statut par le logiciel.
-//! - Pas de miroir ROM à `0xE00000` (modèles 130ST très anciens).
+//!   la zone d'E/S (`0xFF8000`-`0xFFFFFF` : FDC/DMA…) et le port cartouche
+//!   (`0xFA0000`-`0xFBFFFF`) répondent `0xFF` en lecture et ignorent les
+//!   écritures — chip select réel mais périphérique pas encore émulé (ou,
+//!   pour la cartouche, absente), plutôt qu'un bus error qui casserait
+//!   tout polling de statut par le logiciel ou la sonde de cartouche que
+//!   fait la ROM TOS au boot (`cmpi.l #$fa52235f,$fa0000`).
+//! - `rom_base` vaut `DEFAULT_ROM_BASE` (`0xFC0000`, TOS <= 1.04) par
+//!   défaut ; [`AtariSt::set_rom_base`] permet de le changer à `0xE00000`
+//!   pour les TOS >= 1.06 (256 Ko, ne tiendrait de toute façon pas entre
+//!   `0xFC0000` et `IO_BASE`). Pas de mirroring simultané aux deux adresses.
 //! - Pas de modèle de contention DRAM/vidéo (`is_contended` reste à
 //!   `false`) : le Shifter est maintenant implémenté mais son accès
 //!   mémoire n'est pas (encore) modélisé comme volant des cycles bus au
@@ -47,7 +52,7 @@ use crate::peripherals::atari_st::blitter::{self, Blitter};
 use crate::peripherals::atari_st::glue::{Glue, VideoMode};
 use crate::peripherals::atari_st::mfp::Mfp;
 use crate::peripherals::atari_st::shifter::{self, Shifter};
-use crate::peripherals::atari_st::wd1772::{self, DmaChannel, RawDiskImage, Wd1772};
+use crate::peripherals::atari_st::wd1772::{self, DmaChannel, FloppyDisk, Wd1772};
 use crate::peripherals::atari_st::ym2149::{self, Ym2149};
 use crate::{ADDR_MASK, Bus};
 
@@ -94,8 +99,56 @@ pub const IO_BASE: u32 = 0xFF8000;
 /// Fin de l'espace d'adressage (24 bits).
 pub const IO_END: u32 = 0x00FF_FFFF;
 
+/// Port cartouche (ROM externe, ex: cartouches jeu). Contrairement au
+/// "trou" physique au-dessus de la RAM installée (qui déclenche un bus
+/// error, voir [`crate::Bus::take_bus_fault`]), une cartouche absente
+/// répond en lecture flottante (`0xFF`) SANS bus error — le boot ROM TOS
+/// sonde justement cette zone (`cmpi.l #$fa52235f,$fa0000` : signature de
+/// cartouche) pour détecter une cartouche sans jamais planter s'il n'y en
+/// a pas.
+pub const CARTRIDGE_BASE: u32 = 0xFA0000;
+pub const CARTRIDGE_END: u32 = 0xFBFFFF;
+
+/// Lignes visibles par trame (200, en basse/moyenne résolution, quel que
+/// soit PAL/NTSC — voir [`AtariSt::tick`] pour l'usage vis-à-vis du Timer B
+/// du MFP).
+const VISIBLE_LINES: usize = 200;
+
+/// DMA sound + Microwire (STE), non implémenté : simple stub qui répond
+/// `0x00` en lecture (pas `0xFF` comme le reste de la zone d'E/S non
+/// émulée) et ignore les écritures. Nécessaire car le TOS >= 1.62 (STE)
+/// écrit puis relit le registre Microwire (`$FF8922`) en boucle en
+/// attendant qu'il retombe à zéro (fin de décalage série) au tout début du
+/// boot — avec la réponse générique `0xFF` (bits toujours à 1), cette
+/// attente ne se termine jamais. Pas une émulation réelle du DMA
+/// sound/LMC1992 : juste de quoi ne pas bloquer indéfiniment un TOS STE
+/// qui sonde cette zone.
+pub const STE_DMA_SOUND_BASE: u32 = 0xFF8900;
+pub const STE_DMA_SOUND_END: u32 = 0xFF893F;
+
 /// Adresse de base usuelle de la ROM TOS (192 Ko, TOS 1.x/2.x).
 pub const DEFAULT_ROM_BASE: u32 = 0xFC0000;
+
+/// Registre de configuration mémoire (MMU), sur ST/STE réel. Écrire ici
+/// désactive l'overlay ROM à l'adresse 0 (voir [`AtariSt::overlay`]) — le
+/// TOS le fait très tôt au boot, juste après avoir sondé le cookie de
+/// warmstart, pour reprendre normalement le contrôle des adresses basses
+/// une fois son propre code d'amorçage terminé.
+pub const MEMORY_CONF: u32 = 0xFF8001;
+
+/// Broche GPIP du MFP câblée sur le signal "MONO DETECT" du connecteur
+/// moniteur, sur ST/STE réel : un moniteur monochrome met ce signal à la
+/// masse (broche lue à 0), tandis qu'un moniteur couleur (ou l'absence de
+/// moniteur) laisse une résistance de tirage le maintenir à l'état haut
+/// (broche lue à 1). Le TOS lit cette broche très tôt au boot pour choisir
+/// entre le mode haute résolution monochrome (640×400 N&B) et les modes
+/// couleur (320×200/640×200) — sans ce câblage, la broche resterait à son
+/// état par défaut (0), et le TOS conclurait à tort à un moniteur
+/// monochrome. Ce board modélise un moniteur couleur : la broche est donc
+/// maintenue à 1 en permanence, y compris après un `/RESET` logiciel
+/// (`Bus::reset_bus`) puisque le signal reflète un branchement physique
+/// externe, pas un état interne du MFP que `/RESET` réinitialiserait.
+const GPIP_MONO_DETECT: u8 = 7;
 
 /// Board Atari ST minimal : RAM + ROM + MFP 68901 + GLUE (HBL/VBL).
 pub struct AtariSt {
@@ -141,8 +194,11 @@ pub struct AtariSt {
     /// sur `GPIP5` du MFP).
     pub wd1772: Wd1772,
     /// Disque inséré dans le lecteur A, s'il y en a un. Champ public :
-    /// insérer/éjecter directement (`st.floppy_a = Some(RawDiskImage::new(...))`).
-    pub floppy_a: Option<RawDiskImage>,
+    /// insérer/éjecter directement (`st.floppy_a = Some(Box::new(RawDiskImage::new(...)))`).
+    /// Type objet (`dyn FloppyDisk`) plutôt qu'un format concret : accepte
+    /// aussi bien `RawDiskImage` (`.st`) que `peripherals::atari_st::stx::StxImage`
+    /// (`.stx`) sans que ce board ait à connaître le format du fichier.
+    pub floppy_a: Option<Box<dyn FloppyDisk>>,
     dma_register_select: u8,
     dma_address: u32,
     /// Blitter (STE). Champ public surtout pour la lecture directe des
@@ -150,8 +206,37 @@ pub struct AtariSt {
     /// du registre de contrôle (voir `Bus::write8` sur `BLITTER_BASE +
     /// blitter::reg::CONTROL`).
     pub blitter: Blitter,
+    /// Overlay ROM à l'adresse 0 (câblage matériel réel ST/STE) : tant que
+    /// vrai, les LECTURES dans `0x000000..OVERLAY_SIZE` renvoient le
+    /// contenu de la ROM (pas de la RAM sous-jacente), tandis que les
+    /// ÉCRITURES continuent d'aller en RAM normalement — exactement le
+    /// comportement réel (la ROM est en lecture seule de toute façon).
+    /// Actif par défaut à la création (et après un `/RESET`), désactivé
+    /// par la première écriture dans [`MEMORY_CONF`] (le TOS le fait très
+    /// tôt au boot). Sans cet overlay : (1) le vecteur de reset (SSP/PC lus
+    /// à `0x000000`/`0x000004`) ne serait pas satisfait par de la RAM
+    /// neuve (zéros), et (2) la technique standard de détection de RAM du
+    /// TOS — zéroter le vecteur de bus error à `0x000008` puis sonder
+    /// au-delà de la RAM installée, ce qui fait rebondir l'exécution sur
+    /// l'adresse 0 à chaque échec — ne retomberait pas sur du code ROM
+    /// valide (le `bra.s` d'en-tête TOS) mais sur de la RAM à zéro,
+    /// dégénérant en exécution de code arbitraire. L'overlay ne couvre
+    /// volontairement qu'une petite fenêtre ([`OVERLAY_SIZE`], pas toute la
+    /// ROM) : au-delà, des adresses basses comme les variables système
+    /// `memvalid`/`phystop` (`$420`, `$42E`…) doivent rester de la vraie
+    /// RAM, sans quoi leur vérification par le TOS n'aurait aucun sens
+    /// (une variable système censée persister à travers un redémarrage à
+    /// chaud ne peut pas être en lecture seule dans la ROM).
+    overlay: bool,
     bus_fault: Option<(u32, bool)>,
 }
+
+/// Taille de la fenêtre d'overlay ROM à l'adresse 0 (voir [`AtariSt::overlay`]).
+/// Couvre largement l'en-tête TOS et le tout début du code d'amorçage
+/// (`os_entry`/`os_version`/`os_reseth`/`os_beg`/… puis les premières
+/// instructions réelles), sans empiéter sur les variables système basses
+/// (`memvalid` etc. commencent à `$420`).
+const OVERLAY_SIZE: u32 = 0x200;
 
 /// Canal DMA reliant le WD1772 à la RAM du board à l'adresse DMA courante
 /// (voir `peripherals::atari_st::wd1772::DmaChannel`) : le WD1772 ne connaît pas la
@@ -201,11 +286,20 @@ impl AtariSt {
     /// GLUE cadencé en PAL 50 Hz (le cas le plus courant — voir
     /// [`VideoMode`] pour du NTSC).
     pub fn new(ram_size: usize, rom: Vec<u8>) -> Self {
+        let mut mfp = Mfp::new();
+        mfp.set_gpip_input(GPIP_MONO_DETECT, true); // moniteur couleur (voir la constante)
+        // État de repos réel de GPIP4/GPIP5 (`/IRQ` ACIA, `/INTRQ` WD1772,
+        // actifs bas, tirés au niveau haut par défaut — voir `Self::tick`) :
+        // sans cette initialisation, l'état interne par défaut du MFP (0)
+        // masquerait la toute première transition vers "interruption active"
+        // (elle calculerait aussi 0, donc aucun front détecté).
+        mfp.set_gpip_input(4, true);
+        mfp.set_gpip_input(5, true);
         AtariSt {
             ram: vec![0; ram_size],
             rom,
             rom_base: DEFAULT_ROM_BASE,
-            mfp: Mfp::new(),
+            mfp,
             glue: Glue::new(VideoMode::Pal50),
             acia_keyboard: Acia::new(),
             acia_midi: Acia::new(),
@@ -219,8 +313,18 @@ impl AtariSt {
             dma_register_select: 0,
             dma_address: 0,
             blitter: Blitter::new(),
+            overlay: true,
             bus_fault: None,
         }
+    }
+
+    /// Change l'adresse de base de la ROM après construction. Utile pour
+    /// les TOS >= 1.06, mappés à `0xE00000` sur ST/STE réel plutôt qu'à
+    /// [`DEFAULT_ROM_BASE`] (`0xFC0000`, valable pour TOS <= 1.04) — la
+    /// taille de 256 Ko de ces TOS plus récents ne tiendrait de toute façon
+    /// pas entre `0xFC0000` et le début de la zone d'E/S (`0xFF8000`).
+    pub fn set_rom_base(&mut self, base: u32) {
+        self.rom_base = base;
     }
 
     /// Fait progresser les périphériques (MFP + GLUE + YM2149) de
@@ -242,9 +346,20 @@ impl AtariSt {
         self.mfp.tick(cpu_cycles);
         self.glue.tick(cpu_cycles);
         self.ym2149.tick(cpu_cycles);
+        // `/IRQ` (ACIA) et `/INTRQ` (WD1772) sont des signaux matériels réels
+        // actifs bas (asserted = niveau logique 0, comme leur nom l'indique)
+        // câblés directement sur GPIP4/GPIP5 — sans inverseur, GPIP doit
+        // donc lire 0 quand l'interruption est active, 1 au repos. Un TOS
+        // réel sonde parfois ce niveau brut directement (pas seulement via
+        // le canal d'interruption edge-triggered du MFP) : au boot, par
+        // exemple, la détection du nombre de lecteurs de disquette attend
+        // que GPIP5 passe à 0 après une commande WD1772, avec un timeout —
+        // sans cette inversion, le bit ne descend jamais à 0 et le TOS
+        // conclut à tort qu'aucun lecteur n'est présent (`_nflops` reste à
+        // 0, aucune icône A: sur le bureau).
         let acia_irq = self.acia_keyboard.irq_requested() || self.acia_midi.irq_requested();
-        self.mfp.set_gpip_input(4, acia_irq);
-        self.mfp.set_gpip_input(5, self.wd1772.interrupt_requested());
+        self.mfp.set_gpip_input(4, !acia_irq);
+        self.mfp.set_gpip_input(5, !self.wd1772.interrupt_requested());
 
         let frame_now = self.glue.frame_count();
         if frame_now != self.last_frame {
@@ -268,6 +383,18 @@ impl AtariSt {
                 self.framebuffer.resize(idx + 1, Vec::new());
             }
             self.framebuffer[idx] = row;
+            // Câblage matériel réel ST/STE : l'entrée externe TBI du Timer B
+            // du MFP est reliée au signal de balayage actif (DE), pas au
+            // HBL brut — elle ne pulse donc que pendant les lignes visibles
+            // (200 lignes, quel que soit PAL/NTSC), pas pendant le
+            // blanking vertical. C'est exactement ce que le boot TOS
+            // exploite pour détecter qu'il vient d'entrer en VBL : il
+            // programme le Timer B en mode event-count puis attend que la
+            // valeur cesse de changer (~615 lectures stables), ce qui
+            // n'arrive jamais tant qu'on reste dans la zone visible.
+            if idx < VISIBLE_LINES {
+                self.mfp.pulse_tb();
+            }
             guard += 1;
         }
     }
@@ -304,6 +431,9 @@ impl AtariSt {
 impl Bus for AtariSt {
     fn read8(&mut self, addr: u32) -> u8 {
         let addr = addr & ADDR_MASK;
+        if self.overlay && addr < OVERLAY_SIZE && (addr as usize) < self.rom.len() {
+            return self.rom[addr as usize];
+        }
         if (addr as usize) < self.ram.len() {
             return self.ram[addr as usize];
         }
@@ -324,12 +454,13 @@ impl Bus for AtariSt {
             DMA_ADDR_MID => return (self.dma_address >> 8) as u8,
             DMA_ADDR_LOW => return self.dma_address as u8,
             _ if Self::is_blitter_addr(addr) => return self.blitter.read(addr - BLITTER_BASE),
+            _ if (STE_DMA_SOUND_BASE..=STE_DMA_SOUND_END).contains(&addr) => return 0x00,
             _ => {}
         }
         if self.in_rom(addr) {
             return self.rom[(addr - self.rom_base) as usize];
         }
-        if (IO_BASE..=IO_END).contains(&addr) {
+        if (IO_BASE..=IO_END).contains(&addr) || (CARTRIDGE_BASE..=CARTRIDGE_END).contains(&addr) {
             return 0xFF;
         }
         self.bus_fault = Some((addr, false));
@@ -347,6 +478,10 @@ impl Bus for AtariSt {
             return;
         }
         match addr {
+            MEMORY_CONF => {
+                self.overlay = false;
+                return;
+            }
             ACIA_KEYBOARD_CONTROL => {
                 self.acia_keyboard.write(acia::reg::CONTROL_STATUS, value);
                 return;
@@ -382,7 +517,7 @@ impl Bus for AtariSt {
                         address: &mut self.dma_address,
                     };
                     self.wd1772
-                        .execute_command(value, self.floppy_a.as_mut(), &mut channel);
+                        .execute_command(value, self.floppy_a.as_deref_mut(), &mut channel);
                 } else {
                     self.wd1772.write_simple_register(self.dma_register_select, value);
                 }
@@ -423,8 +558,8 @@ impl Bus for AtariSt {
         if self.in_rom(addr) {
             return; // ROM : écriture ignorée (lecture seule sur silicium réel)
         }
-        if (IO_BASE..=IO_END).contains(&addr) {
-            return; // périphérique non émulé : écriture ignorée
+        if (IO_BASE..=IO_END).contains(&addr) || (CARTRIDGE_BASE..=CARTRIDGE_END).contains(&addr) {
+            return; // périphérique/cartouche non émulé : écriture ignorée
         }
         self.bus_fault = Some((addr, true));
     }
@@ -435,6 +570,9 @@ impl Bus for AtariSt {
         // vidéo continue de tourner indépendamment d'un /RESET CPU (le
         // moniteur reste synchronisé).
         self.mfp = Mfp::new();
+        self.mfp.set_gpip_input(GPIP_MONO_DETECT, true);
+        self.mfp.set_gpip_input(4, true);
+        self.mfp.set_gpip_input(5, true);
         self.acia_keyboard = Acia::new();
         self.acia_midi = Acia::new();
         self.ym2149 = Ym2149::new();
@@ -443,6 +581,7 @@ impl Bus for AtariSt {
         self.dma_register_select = 0;
         self.dma_address = 0;
         self.blitter = Blitter::new();
+        self.overlay = true;
         // Le disque inséré (floppy_a), lui, n'est pas éjecté par /RESET :
         // c'est un support physique, pas un état de la puce.
         // Le GLUE n'est pas réinitialisé (voir ci-dessus) : resynchroniser

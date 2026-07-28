@@ -10,9 +10,27 @@ use rust68::peripherals::atari_st::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
     BLITTER_BASE, DEFAULT_ROM_BASE, DMA_ADDR_HIGH, DMA_ADDR_LOW, DMA_ADDR_MID, DMA_MODE, FDC_DATA,
-    IO_BASE, MFP_BASE, YM2149_DATA, YM2149_SELECT,
+    IO_BASE, MFP_BASE, STE_DMA_SOUND_BASE, YM2149_DATA, YM2149_SELECT,
 };
 use rust68::{Bus, Cpu};
+
+#[test]
+fn gpip7_indique_moniteur_couleur_meme_apres_reset() {
+    // GPIP7 = signal "MONO DETECT" du connecteur moniteur sur ST/STE réel :
+    // à la masse (0) pour un moniteur monochrome, tiré à 1 sinon. Sans ce
+    // câblage, le TOS lirait 0 par défaut et forcerait à tort le mode haute
+    // résolution monochrome (320×200 couleur attendu par défaut ici). Le
+    // signal reflète un branchement physique externe, pas un état MFP
+    // réinitialisable : il doit rester à 1 même après un `/RESET` logiciel.
+    let mut st = AtariSt::new(0x1000, vec![]);
+    assert_eq!(st.read8(MFP_BASE) & 0x80, 0x80, "GPIP7 = 1 (moniteur couleur)");
+    st.reset_bus();
+    assert_eq!(
+        st.read8(MFP_BASE) & 0x80,
+        0x80,
+        "GPIP7 reste à 1 après /RESET"
+    );
+}
 
 #[test]
 fn ram_lecture_ecriture() {
@@ -55,10 +73,22 @@ fn trou_physique_declenche_bus_fault() {
 #[test]
 fn peripherique_non_emule_repond_neutre_sans_fault() {
     let mut st = AtariSt::new(0x1000, vec![]);
-    let addr = IO_BASE + 0x900; // ex: zone Blitter (STE), pas encore modélisée
+    let addr = IO_BASE + 0x950; // zone encore libre, au-delà du stub DMA sound/Microwire
     assert_eq!(st.read8(addr), 0xFF);
     assert_eq!(st.take_bus_fault(), None, "chip select réel : pas de bus error");
     st.write8(addr, 0x12); // ne doit pas paniquer, simplement ignoré
+}
+
+#[test]
+fn stub_dma_sound_microwire_repond_zero_pas_0xff() {
+    // Contrairement au reste de la zone d'E/S non émulée (0xFF, voir le
+    // test précédent) : un TOS STE écrit puis relit le registre Microwire
+    // en boucle en attendant qu'il retombe à zéro (fin de décalage série).
+    // Avec 0xFF (bits toujours à 1), cette attente ne se termine jamais.
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(STE_DMA_SOUND_BASE + 0x22, 0x34);
+    assert_eq!(st.read8(STE_DMA_SOUND_BASE + 0x22), 0x00);
+    assert_eq!(st.take_bus_fault(), None);
 }
 
 #[test]
@@ -210,7 +240,11 @@ fn acia_mappees_aux_bonnes_adresses() {
 fn irq_acia_relayee_via_gpip4_du_mfp() {
     let mut st = AtariSt::new(0x1000, vec![]);
     st.mfp.write(reg::DDR, 0x00); // GPIP4 en entrée
-    st.mfp.write(reg::AER, 1 << 4); // front montant
+    // `/IRQ` de l'ACIA est un signal réel actif bas câblé sans inverseur :
+    // GPIP4 passe de 1 (repos) à 0 quand l'IRQ s'active, un front DESCENDANT
+    // (AER=0, la valeur par défaut — pas besoin de l'écrire explicitement,
+    // gardé ici pour la lisibilité du test).
+    st.mfp.write(reg::AER, 0);
     st.mfp.write(reg::IERB, 1 << channel::GPIP4);
     st.mfp.write(reg::IMRB, 1 << channel::GPIP4);
 
@@ -370,7 +404,7 @@ fn dma_compteur_adresse_round_trip() {
 #[test]
 fn read_sector_bout_en_bout_via_dma() {
     let mut st = AtariSt::new(0x2000, vec![]);
-    st.floppy_a = Some(disque_de_test());
+    st.floppy_a = Some(Box::new(disque_de_test()));
 
     st.write8(DMA_ADDR_HIGH, 0x00);
     st.write8(DMA_ADDR_MID, 0x10);
@@ -389,7 +423,7 @@ fn read_sector_bout_en_bout_via_dma() {
 #[test]
 fn write_sector_bout_en_bout_via_dma() {
     let mut st = AtariSt::new(0x2000, vec![]);
-    st.floppy_a = Some(disque_de_test());
+    st.floppy_a = Some(Box::new(disque_de_test()));
 
     // Prépare 512 octets à 0x55 en RAM à partir de 0x1000.
     for i in 0..SECTOR_SIZE as u32 {
@@ -412,9 +446,12 @@ fn write_sector_bout_en_bout_via_dma() {
 #[test]
 fn irq_wd1772_relayee_via_gpip5_du_mfp() {
     let mut st = AtariSt::new(0x1000, vec![]);
-    st.floppy_a = Some(disque_de_test());
+    st.floppy_a = Some(Box::new(disque_de_test()));
     st.mfp.write(reg::DDR, 0x00);
-    st.mfp.write(reg::AER, 1 << 5); // front montant
+    // `/INTRQ` du WD1772 est un signal réel actif bas câblé sans inverseur :
+    // GPIP5 passe de 1 (repos) à 0 quand /INTRQ s'active, un front DESCENDANT
+    // (AER=0, la valeur par défaut — gardé explicite ici pour la lisibilité).
+    st.mfp.write(reg::AER, 0);
     st.mfp.write(reg::IERB, 1 << channel::GPIP5);
     st.mfp.write(reg::IMRB, 1 << channel::GPIP5);
 
@@ -429,7 +466,7 @@ fn irq_wd1772_relayee_via_gpip5_du_mfp() {
 #[test]
 fn reset_bus_reinitialise_le_wd1772() {
     let mut st = AtariSt::new(0x1000, vec![]);
-    st.floppy_a = Some(disque_de_test());
+    st.floppy_a = Some(Box::new(disque_de_test()));
     st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
     st.write8(FDC_DATA, 0b0000_0000); // Restore -> lève /INTRQ
     assert!(st.wd1772.interrupt_requested());

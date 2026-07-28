@@ -95,7 +95,7 @@ fn iack_calcule_le_vecteur_et_arme_isr_sauf_en_auto_eoi() {
     mfp.set_gpip_input(0, true);
 
     let vector = mfp.iack();
-    assert_eq!(vector, 0x40, "vecteur = VR[7:3] | canal (canal 0 ici)");
+    assert_eq!(vector, 0x40, "vecteur = VR[7:4] | canal (canal 0 ici)");
     assert_eq!(
         mfp.read(reg::ISRB) & 1,
         1,
@@ -113,6 +113,39 @@ fn iack_calcule_le_vecteur_et_arme_isr_sauf_en_auto_eoi() {
     mfp.set_gpip_input(0, true);
     mfp.iack();
     assert_eq!(mfp.read(reg::ISRB) & 1, 0, "auto-EOI : ISR reste à 0");
+}
+
+#[test]
+fn iack_exclut_le_bit_s_auto_eoi_du_vecteur() {
+    // Le bit 3 du VR (S, auto-EOI) est un bit de contrôle séparé, PAS le
+    // bit de poids fort du numéro de canal : seuls VR[7:4] forment la base
+    // du vecteur, les 4 bits de canal (0-15) occupent tout le bas. Un TOS
+    // réel programme VR=0x48 (base 0x40, auto-EOI actif) puis installe ses
+    // gestionnaires à `0x100 + canal*4` (vecteur `0x40 | canal`) — confondre
+    // le bit S avec le bit haut du canal calculerait `0x48 | canal` à la
+    // place, un décalage de 8 vecteurs (32 octets) qui fait vectorer vers
+    // un gestionnaire jamais installé (bug réel rencontré en faisant
+    // démarrer un TOS réel : Timer C, VR=0x48, vectorait vers `$134`
+    // au lieu de `$114` où le TOS avait réellement installé son
+    // gestionnaire).
+    let mut mfp = Mfp::new();
+    mfp.write(reg::IERB, 1 << channel::TIMER_C);
+    mfp.write(reg::IMRB, 1 << channel::TIMER_C);
+    mfp.write(reg::VR, 0x48);
+    // Timer C en mode delay, prescaler ÷4 (control=1), data=1 : décompte
+    // dès le premier tick et déclenche `request()` en interne. La donnée
+    // doit être écrite AVANT le contrôle : `reload()` (déclenché par
+    // l'écriture de TCDCR) recharge le compteur depuis la donnée.
+    mfp.write(reg::TCDR, 1);
+    mfp.write(reg::TCDCR, 0x01 << 4);
+    mfp.tick(100);
+
+    let vector = mfp.iack();
+    assert_eq!(
+        vector,
+        0x40 | channel::TIMER_C,
+        "VR=0x48 avec S=1 : vecteur = VR[7:4](0x40) | canal, pas VR[7:3](0x48) | canal"
+    );
 }
 
 #[test]
