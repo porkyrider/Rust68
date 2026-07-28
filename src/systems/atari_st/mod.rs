@@ -2,10 +2,23 @@
 //!
 //! Implémente [`crate::Bus`] pour un ST/STE minimal : RAM installée à
 //! `0x000000`, ROM TOS à `0xFC0000`, MFP 68901 aux adresses impaires
-//! `0xFFFA01`-`0xFFFA2F`. Le "trou" physique entre le haut de la RAM
-//! installée et le début de la zone d'E/S (`0xFF8000`) déclenche un bus
-//! error via [`crate::Bus::take_bus_fault`] — c'est le mécanisme que de
-//! nombreux programmes/démos utilisent pour détecter la RAM installée.
+//! `0xFFFA01`-`0xFFFA2F`. Sur silicium réel, le MMU répond toujours
+//! /DTACK dans tout l'espace d'adressage "RAM ST" (4 Mo, voir
+//! [`ST_RAM_ADDRESS_SPACE`]) — même au-delà de la RAM physiquement
+//! installée, l'accès ne déclenche **jamais** de bus error dans cette
+//! plage (contrairement au vrai "trou" entre 4 Mo et le début de la zone
+//! d'E/S, `0xFF8000`, qui lui déclenche un bus error via
+//! [`crate::Bus::take_bus_fault`] — mécanisme que de nombreux
+//! programmes/démos utilisent pour détecter la RAM installée une fois le
+//! TOS démarré). Au-delà de la RAM réellement installée mais dans les
+//! 4 Mo, un accès "flotte" : modélisé ici par une valeur fixe non
+//! stockée (jamais ce qui vient d'être écrit), plutôt que la valeur
+//! réelle (capacité résiduelle du bus selon le dernier cycle, non
+//! reproductible dans un émulateur déterministe) — c'est justement cette
+//! absence de persistance, pas une histoire d'adressage replié, que le
+//! TOS observe pour sa propre détection de RAM au tout début du boot
+//! froid (écrire un motif, le relire, conclure "pas de RAM ici" si ça ne
+//! correspond pas).
 //!
 //! Câblage d'interruption réel ST/STE, par priorité décroissante :
 //! MFP → IPL6, VBL (GLUE) → IPL4, HBL (GLUE) → IPL2. Les deux ACIA
@@ -136,7 +149,25 @@ pub const DEFAULT_ROM_BASE: u32 = 0xFC0000;
 /// TOS le fait très tôt au boot, juste après avoir sondé le cookie de
 /// warmstart, pour reprendre normalement le contrôle des adresses basses
 /// une fois son propre code d'amorçage terminé.
+///
+/// Bits 1-0 = taille annoncée de la banque 0, bits 3-2 = banque 1
+/// (`00`=128 Ko, `01`=512 Ko, `10`=2 Mo, `11`=réservé). Le TOS l'écrit
+/// lui-même pendant la détection de RAM au boot froid, mais ce champ ne
+/// pilote **pas** l'accès mémoire (voir [`ST_RAM_ADDRESS_SPACE`]) : sur
+/// silicium réel il ajuste surtout le timing de rafraîchissement DRAM
+/// (différent selon la densité des puces), pas le décodage d'adresse
+/// lui-même. On le stocke simplement pour une relecture logicielle
+/// cohérente.
 pub const MEMORY_CONF: u32 = 0xFF8001;
+
+/// Taille de l'espace d'adressage "RAM ST" sur ST/STE réel (4 Mo, deux
+/// banques MMU de 2 Mo chacune) : le MMU y répond toujours /DTACK, même
+/// sans RAM physique à l'adresse précise accédée — jamais de bus error
+/// dans cette plage (voir [`AtariSt::in_floating_st_ram`]), contrairement
+/// au vrai "trou" au-delà, avant `IO_BASE`. Confirmé par la communauté
+/// Atari (ex : accéder à de la RAM ST non peuplée renvoie des données
+/// résiduelles du dernier cycle de bus, pas un bus error).
+const ST_RAM_ADDRESS_SPACE: u32 = 4 * 1024 * 1024;
 
 /// Broche GPIP du MFP câblée sur le signal "MONO DETECT" du connecteur
 /// moniteur, sur ST/STE réel : un moniteur monochrome met ce signal à la
@@ -230,6 +261,10 @@ pub struct AtariSt {
     /// (une variable système censée persister à travers un redémarrage à
     /// chaud ne peut pas être en lecture seule dans la ROM).
     overlay: bool,
+    /// Copie de la dernière valeur écrite dans [`MEMORY_CONF`] (registre
+    /// MMU) : purement pour une relecture logicielle cohérente, ne pilote
+    /// pas l'accès mémoire (voir sa doc et [`ST_RAM_ADDRESS_SPACE`]).
+    memory_conf: u8,
     /// Vrai si le Blitter est physiquement présent sur cette machine. De
     /// série sur STE/Mega STE ; absent sur 520ST/1040ST (le Mega ST avait
     /// juste un support de puce, pas toujours peuplé — voir
@@ -325,6 +360,7 @@ impl AtariSt {
             dma_address: 0,
             blitter: Blitter::new(),
             overlay: true,
+            memory_conf: 0,
             blitter_present: true,
             bus_fault: None,
         }
@@ -437,6 +473,16 @@ impl AtariSt {
         addr >= self.rom_base && addr - self.rom_base < self.rom.len() as u32
     }
 
+    /// Vrai si `addr` (déjà connue hors de la RAM installée, c'est-à-dire
+    /// `addr >= self.ram.len()`) tombe dans l'espace d'adressage "RAM ST"
+    /// fixe de 4 Mo (voir [`ST_RAM_ADDRESS_SPACE`]) — où un accès ne
+    /// déclenche **jamais** de bus error sur silicium réel, même sans RAM
+    /// physique à cette adresse précise (le MMU répond /DTACK dans toute
+    /// cette plage, contrairement au vrai "trou" au-delà, avant `IO_BASE`).
+    fn in_floating_st_ram(addr: u32) -> bool {
+        addr < ST_RAM_ADDRESS_SPACE
+    }
+
     fn is_shifter_addr(addr: u32) -> bool {
         matches!(
             addr,
@@ -462,6 +508,12 @@ impl Bus for AtariSt {
         }
         if (addr as usize) < self.ram.len() {
             return self.ram[addr as usize];
+        }
+        if Self::in_floating_st_ram(addr) {
+            // Au-delà de la RAM installée mais dans l'espace "RAM ST" (4 Mo) :
+            // jamais de bus error sur silicium réel (voir la doc du module),
+            // valeur fixe non stockée (jamais ce qui vient d'être écrit).
+            return 0x00;
         }
         if let Some(off) = Self::mfp_offset(addr) {
             return self.mfp.read(off);
@@ -489,14 +541,25 @@ impl Bus for AtariSt {
         if (IO_BASE..=IO_END).contains(&addr) || (CARTRIDGE_BASE..=CARTRIDGE_END).contains(&addr) {
             return 0xFF;
         }
+        if std::env::var("RUST68_TRACE_VECTORS").is_ok() {
+            eprintln!("[trace] bus fault en lecture : addr={addr:#x}");
+        }
         self.bus_fault = Some((addr, false));
         0xFF
     }
 
     fn write8(&mut self, addr: u32, value: u8) {
         let addr = addr & ADDR_MASK;
+        if addr < 16 && std::env::var("RUST68_TRACE_VECTORS").is_ok() {
+            eprintln!("[trace] écriture vecteur bas : addr={addr:#x} value={value:#04x} overlay={}", self.overlay);
+        }
         if (addr as usize) < self.ram.len() {
             self.ram[addr as usize] = value;
+            return;
+        }
+        if Self::in_floating_st_ram(addr) {
+            // Au-delà de la RAM installée mais dans l'espace "RAM ST" (4 Mo) :
+            // écriture "flottante", jamais persistée (voir la doc du module).
             return;
         }
         if let Some(off) = Self::mfp_offset(addr) {
@@ -505,6 +568,10 @@ impl Bus for AtariSt {
         }
         match addr {
             MEMORY_CONF => {
+                self.memory_conf = value;
+                if std::env::var("RUST68_TRACE_VECTORS").is_ok() {
+                    eprintln!("[trace] MEMORY_CONF écrit : overlay désactivé (value={value:#04x})");
+                }
                 self.overlay = false;
                 return;
             }
@@ -587,6 +654,9 @@ impl Bus for AtariSt {
         if (IO_BASE..=IO_END).contains(&addr) || (CARTRIDGE_BASE..=CARTRIDGE_END).contains(&addr) {
             return; // périphérique/cartouche non émulé : écriture ignorée
         }
+        if std::env::var("RUST68_TRACE_VECTORS").is_ok() {
+            eprintln!("[trace] bus fault en écriture : addr={addr:#x} value={value:#04x}");
+        }
         self.bus_fault = Some((addr, true));
     }
 
@@ -608,6 +678,7 @@ impl Bus for AtariSt {
         self.dma_address = 0;
         self.blitter = Blitter::new();
         self.overlay = true;
+        self.memory_conf = 0;
         // Le disque inséré (floppy_a), lui, n'est pas éjecté par /RESET :
         // c'est un support physique, pas un état de la puce.
         // Le GLUE n'est pas réinitialisé (voir ci-dessus) : resynchroniser

@@ -83,14 +83,46 @@ fn mfp_mappe_aux_adresses_impaires() {
 
 #[test]
 fn trou_physique_declenche_bus_fault() {
-    let mut st = AtariSt::new(0x1000, vec![]); // RAM minuscule : tout le reste est un trou
-    let addr = 0x0000_2000; // au-delà de la RAM installée, avant IO_BASE
+    let mut st = AtariSt::new(0x1000, vec![]); // RAM minuscule
+    // Au-delà de l'espace d'adressage "RAM ST" fixe de 4 Mo (voir
+    // `acces_flottant_au_dela_de_la_ram_dans_les_4_mo` ci-dessous) : un
+    // vrai trou, sans aucun chip select.
+    let addr = 0x0050_0000;
     let value = st.read8(addr);
     assert_eq!(value, 0xFF);
     assert_eq!(st.take_bus_fault(), Some((addr, false)));
     // Le fault doit être consommé (remis à None) par take_bus_fault.
     assert_eq!(st.take_bus_fault(), None);
 }
+
+#[test]
+fn acces_flottant_au_dela_de_la_ram_dans_les_4_mo() {
+    // Sur silicium réel, le MMU répond toujours /DTACK dans tout l'espace
+    // d'adressage "RAM ST" (4 Mo) — jamais de bus error au-delà de la RAM
+    // installée tant qu'on reste dans cette plage, même sans RAM physique
+    // à l'adresse précise. Un accès y "flotte" : contrairement à de la
+    // vraie RAM, une lecture ne renvoie PAS ce qui vient d'être écrit —
+    // c'est justement ce que le TOS observe (pas un repliement d'adresse)
+    // pour sa détection de RAM au tout début du boot froid.
+    let mut st = AtariSt::new(0x1000, vec![]); // 4 Ko de RAM réelle
+
+    st.write8(0x0010_0000, 0x42); // bien au-delà des 4 Ko réels, mais < 4 Mo
+    assert_eq!(
+        st.read8(0x0010_0000),
+        0x00,
+        "accès flottant : ne renvoie jamais ce qui vient d'être écrit"
+    );
+    assert_eq!(st.take_bus_fault(), None, "dans les 4 Mo : jamais de bus error");
+
+    // Juste en dessous de la limite de 4 Mo : toujours flottant.
+    assert_eq!(st.read8(ST_RAM_ADDRESS_SPACE_TEST - 1), 0x00);
+    assert_eq!(st.take_bus_fault(), None);
+}
+
+/// Copie locale de la limite de 4 Mo (constante privée du module) pour
+/// garder le test lisible sans exposer publiquement une valeur qui n'a
+/// pas vocation à être une API stable.
+const ST_RAM_ADDRESS_SPACE_TEST: u32 = 4 * 1024 * 1024;
 
 #[test]
 fn peripherique_non_emule_repond_neutre_sans_fault() {

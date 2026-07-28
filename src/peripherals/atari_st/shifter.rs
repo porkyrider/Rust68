@@ -132,6 +132,24 @@ impl Shifter {
         self.resolution
     }
 
+    /// Les 16 mots de palette bruts (voir [`Self::color_to_rgb`] pour leur
+    /// décodage) — utile pour du diagnostic externe (voir `RUST68_DEBUG`
+    /// dans `atari_st_sdl2`).
+    pub fn palette_raw(&self) -> &[u16; 16] {
+        &self.palette
+    }
+
+    /// Adresse de base vidéo courante (registre, voir [`addr::VIDEO_BASE_HIGH`]/
+    /// [`addr::VIDEO_BASE_MID`]) — diagnostic externe.
+    pub fn video_base(&self) -> u32 {
+        self.video_base
+    }
+
+    /// Compteur vidéo courant — diagnostic externe.
+    pub fn video_counter(&self) -> u32 {
+        self.video_counter
+    }
+
     /// Lit le registre à l'adresse bus `addr` (voir [`addr`]).
     pub fn read(&self, bus_addr: u32) -> u8 {
         match bus_addr {

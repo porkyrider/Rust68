@@ -144,10 +144,18 @@ fn main() {
     // référence TOS : `memvalid`/`memval2`/`memval3`/`phystop`) pour que le
     // TOS prenne directement le chemin "redémarrage à chaud" et saute
     // cette détection.
-    st.write32(0x420, 0x752019F3); // memvalid
-    st.write32(0x43A, 0x237698AA); // memval2
-    st.write32(0x51A, 0x5555AAAA); // memval3
-    st.write32(0x42E, ram_size as u32); // phystop
+    //
+    // `RUST68_COLD_BOOT=1` désactive ce raccourci (boot froid réel, plus
+    // lent) — utile pour vérifier si un problème d'affichage vient d'une
+    // initialisation normalement faite pendant le boot froid (palette,
+    // config bureau...) que le chemin "redémarrage à chaud" suppose déjà
+    // faite et saute.
+    if std::env::var("RUST68_COLD_BOOT").is_err() {
+        st.write32(0x420, 0x752019F3); // memvalid
+        st.write32(0x43A, 0x237698AA); // memval2
+        st.write32(0x51A, 0x5555AAAA); // memval3
+        st.write32(0x42E, ram_size as u32); // phystop
+    }
 
     let mut cpu = Cpu::new();
     cpu.reset(&mut st);
@@ -228,6 +236,17 @@ fn main() {
     // l'émulation progresse sans être bloquée, sans instrumenter chaque
     // instruction en usage normal.
     let debug = std::env::var("RUST68_DEBUG").is_ok();
+    // `RUST68_TRACE_STEPS=N` : trace pc/sr/opcode des N premiers pas CPU
+    // (diagnostic ponctuel, ex. pour observer la détection RAM au boot
+    // froid instruction par instruction).
+    let trace_steps: u64 = std::env::var("RUST68_TRACE_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let trace_stride: u64 = std::env::var("RUST68_TRACE_STRIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     let mut step_count: u64 = 0;
     let mut last_report = std::time::Instant::now();
 
@@ -274,6 +293,9 @@ fn main() {
                         sdl2::mouse::MouseButton::Right => mouse_right = true,
                         _ => {}
                     }
+                    if debug {
+                        eprintln!("[mouse] down {mouse_btn:?} -> left={mouse_left} right={mouse_right}");
+                    }
                     queue_mouse_packet(&mut ikbd_tx_queue, 0, 0, mouse_left, mouse_right);
                 }
                 Event::MouseButtonUp { mouse_btn, .. } => {
@@ -281,6 +303,9 @@ fn main() {
                         sdl2::mouse::MouseButton::Left => mouse_left = false,
                         sdl2::mouse::MouseButton::Right => mouse_right = false,
                         _ => {}
+                    }
+                    if debug {
+                        eprintln!("[mouse] up {mouse_btn:?} -> left={mouse_left} right={mouse_right}");
                     }
                     queue_mouse_packet(&mut ikbd_tx_queue, 0, 0, mouse_left, mouse_right);
                 }
@@ -293,6 +318,16 @@ fn main() {
         // l'audio au fil de l'eau.
         let frame_before = st.glue.frame_count();
         loop {
+            if step_count < trace_steps && step_count % trace_stride == 0 {
+                eprintln!(
+                    "[trace] step={step_count} pc={:#08x} sr={:#06x} opcode={:#06x} a7={:#08x} ssp={:#08x}",
+                    cpu.pc,
+                    cpu.sr,
+                    (st.read8(cpu.pc) as u16) << 8 | st.read8(cpu.pc.wrapping_add(1)) as u16,
+                    cpu.a[7],
+                    cpu.ssp
+                );
+            }
             let cycles = match cpu.step(&mut st) {
                 Ok(cycles) => cycles,
                 Err(e) => {
@@ -312,6 +347,9 @@ fn main() {
                 let rdrf = st.acia_keyboard.read(rust68::peripherals::atari_st::acia::reg::CONTROL_STATUS) & 0x01 != 0;
                 if !rdrf {
                     if let Some(byte) = ikbd_tx_queue.pop_front() {
+                        if debug {
+                            eprintln!("[mouse] octet remis à l'ACIA : {byte:#04x} (reste {} en attente)", ikbd_tx_queue.len());
+                        }
                         st.acia_keyboard.push_rx_byte(byte);
                     }
                 }
@@ -319,8 +357,13 @@ fn main() {
 
             if debug && last_report.elapsed().as_secs_f64() >= 1.0 {
                 eprintln!(
-                    "steps={step_count} pc={:#08x} sr={:#06x}",
-                    cpu.pc, cpu.sr
+                    "steps={step_count} pc={:#08x} sr={:#06x} video_base={:#08x} video_counter={:#08x} phystop={:#08x} v_bas_ad={:#08x}",
+                    cpu.pc,
+                    cpu.sr,
+                    st.shifter.video_base(),
+                    st.shifter.video_counter(),
+                    st.read32(0x42E),
+                    st.read32(0x44E)
                 );
                 last_report = std::time::Instant::now();
             }
@@ -538,12 +581,21 @@ fn queue_mouse_packet(
     right: bool,
 ) {
     let header = 0xF8 | (left as u8) | ((right as u8) << 1);
+    let debug = std::env::var("RUST68_DEBUG").is_ok();
     loop {
         let cx = dx.clamp(-128, 127);
         let cy = dy.clamp(-128, 127);
         queue.push_back(header);
         queue.push_back(cx as i8 as u8);
         queue.push_back(cy as i8 as u8);
+        if debug {
+            eprintln!(
+                "[mouse] paquet mis en attente : {header:#04x} {:#04x} {:#04x} (file={} octets)",
+                cx as i8 as u8,
+                cy as i8 as u8,
+                queue.len()
+            );
+        }
         dx -= cx;
         dy -= cy;
         if dx == 0 && dy == 0 {
