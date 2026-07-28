@@ -34,15 +34,17 @@ src/
   peripherals/
     mfp.rs        (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
     glue.rs       (~125 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
+    acia.rs       (~150 l.)  — MC6850 ACIA (chip seul, cf. section dédiée)
   systems/
-    atari_st.rs   (~190 l.)  — board ST minimal (RAM/ROM/MFP/GLUE, cf. section dédiée)
+    atari_st.rs   (~240 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA, cf. section dédiée)
   lib.rs                     — exports publics
 tests/
   instructions.rs            — tests unitaires ciblés (CPU)
   interrupts.rs               — tests du mécanisme IPL (Cpu::take_interrupt)
   mfp.rs                      — tests du MFP 68901
   glue.rs                      — tests du GLUE (HBL/VBL)
-  atari_st.rs                 — tests du board Atari ST (dont 2 tests bout-en-bout)
+  acia.rs                      — tests du MC6850 ACIA
+  atari_st.rs                 — tests du board Atari ST (dont 3 tests bout-en-bout)
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
 ```
 
@@ -294,32 +296,39 @@ reliant tout ce qui précède :
 - MFP 68901 mappé aux adresses impaires `0xFFFA01`-`0xFFFA2F` (champ
   public `AtariSt::mfp`, pour y injecter GPIP/USART/timers depuis
   l'appelant).
+- ACIA clavier (`0xFFFC00`/`0xFFFC02`) et ACIA MIDI (`0xFFFC04`/
+  `0xFFFC06`), adresses paires (champs publics `acia_keyboard`/
+  `acia_midi`) — voir section ACIA ci-dessous.
 - Le "trou" physique entre le haut de la RAM installée et `0xFF8000`
   déclenche un bus error via `take_bus_fault` (mécanisme construit plus
   tôt spécifiquement pour ce cas — première utilisation concrète).
-- Reste de la zone d'E/S (`0xFF8000`-`0xFFFFFF` : ACIA, PSG, FDC,
-  Shifter…) : chip select réel mais périphérique pas encore émulé →
-  lecture neutre `0xFF`, écriture ignorée (pas de bus error, pour ne pas
-  casser le polling de statut du logiciel).
+- Reste de la zone d'E/S (`0xFF8000`-`0xFFFFFF` : PSG, FDC, Shifter…) :
+  chip select réel mais périphérique pas encore émulé → lecture neutre
+  `0xFF`, écriture ignorée (pas de bus error, pour ne pas casser le
+  polling de statut du logiciel).
 - `irq_level`/`irq_ack` câblent MFP (IPL6), VBL (IPL4) et HBL (IPL2) par
-  priorité décroissante — voir section GLUE ci-dessous.
-- `reset_bus` réinitialise le MFP (RESET CPU → `/RESET` périphériques) ;
-  le GLUE, lui, n'est **pas** réinitialisé (le timing vidéo continue
-  indépendamment d'un `/RESET` CPU sur silicium réel).
-- `AtariSt::tick(cpu_cycles)` fait progresser MFP + GLUE ensemble ; à
-  appeler explicitement par l'appelant après chaque `Cpu::step` (ce crate
-  ne fait pas progresser les périphériques tout seul).
+  priorité décroissante — voir section GLUE ci-dessous. Les deux ACIA ne
+  génèrent pas d'IPL directement : leurs IRQ sont OR câblées sur `GPIP4`
+  du MFP (câblage réel), relayé par `AtariSt::tick`.
+- `reset_bus` réinitialise MFP + ACIA×2 (RESET CPU → `/RESET`
+  périphériques) ; le GLUE, lui, n'est **pas** réinitialisé (le timing
+  vidéo continue indépendamment d'un `/RESET` CPU sur silicium réel).
+- `AtariSt::tick(cpu_cycles)` fait progresser MFP + GLUE et relaie l'IRQ
+  ACIA→GPIP4 ; à appeler explicitement par l'appelant après chaque
+  `Cpu::step` (ce crate ne fait pas progresser les périphériques tout
+  seul).
 
 Limitations connues : pas de miroir ROM `0xE00000` (130ST), pas de
 contention DRAM/vidéo (`is_contended` reste `false`, nécessite le
 Shifter), décodage UDS/LDS des adresses paires adjacentes au MFP non
 modélisé précisément.
 
-Testé dans `tests/atari_st.rs` (11 tests), dont un test d'intégration
+Testé dans `tests/atari_st.rs` (14 tests), dont un test d'intégration
 bout-en-bout : un `Cpu` réel prend une interruption GPIP du MFP à travers
 toute la chaîne `Cpu::step` → `Bus::irq_level` → `Bus::irq_ack` →
-`Mfp::iack`, saute au bon handler et relève le masque IPL à 6 ; et un
-test de priorité MFP > VBL > HBL acquittés dans l'ordre.
+`Mfp::iack`, saute au bon handler et relève le masque IPL à 6 ; un test
+de priorité MFP > VBL > HBL acquittés dans l'ordre ; et un test de bout
+en bout ACIA → GPIP4 → MFP → IPL6.
 
 ---
 
@@ -348,16 +357,38 @@ ligne en fin de trame, PAL vs NTSC, plusieurs lignes en un seul `tick`).
 
 ---
 
+## ACIA 6850 (nouveau module `src/peripherals/acia.rs`)
+
+`peripherals::acia::Acia` modélise une puce MC6850 seule ; l'Atari ST en
+embarque **deux** (clavier, MIDI), chacune une instance séparée dans
+`AtariSt` (`acia_keyboard`/`acia_midi`), dont les IRQ sont OR câblées sur
+`GPIP4` du MFP (voir section Board).
+
+- Registres CONTROL/STATUS et DATA, flags RDRF/TDRE/OVRN/FE fidèles au
+  MC6850 : lire DATA efface RDRF+OVRN ensemble ; écrire CONTROL avec
+  bits0-1=`11` déclenche un Master Reset (efface les flags, réarme TDRE).
+- Pas de FIFO de réception (comme le silicium réel) : un octet reçu alors
+  que le précédent n'a pas été lu déclenche `OVRN` et le nouvel octet est
+  **perdu** (contrairement au MFP, dont l'USART simplifié met en file).
+- `irq_requested()` : `(RDRF && RIE) || (TDRE && TIE)` — `DCD`/`CTS`
+  toujours à 0 (pas de handshake externe simulé), `PE` toujours à 0 (pas
+  de simulation de parité).
+- `push_rx_byte`/`take_tx_byte` : même modèle "au byte" que le MFP.
+
+Testé dans `tests/acia.rs` (7 tests : reset, réception/lecture, overrun,
+transmission, IRQ soumise à RIE/TIE, master reset).
+
+---
+
 ## Ce qui reste pour l'émulation Atari ST
 
 Le CPU MC68000 est complet et 100 % conforme en état (cycles en cours de
-finalisation). L'interruption IPL, le MFP 68901, le GLUE (HBL/VBL) et un
-board minimal (RAM/ROM/MFP/GLUE) sont en place. Pour émuler un Atari ST
-complet il faut encore :
+finalisation). L'interruption IPL, le MFP 68901, le GLUE (HBL/VBL), les
+deux ACIA 6850 et un board minimal (RAM/ROM/MFP/GLUE/ACIA) sont en place.
+Pour émuler un Atari ST complet il faut encore :
 
 | Composant | Priorité |
 |-----------|----------|
-| ACIA 6850 × 2 (clavier/MIDI) | Haute |
 | YM2149 (son + I/O joysticks) | Moyenne |
 | WD1772 (floppy) | Moyenne |
 | Shifter (vidéo ST low/med/high) | Moyenne |
