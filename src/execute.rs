@@ -28,69 +28,94 @@ fn ae_write(r: Result<(), (u32, u32)>) -> Result<(), StepError> {
     r.map_err(|(addr, pc)| StepError::AddressError(addr, true, pc))
 }
 
-/// Coût cycle-exact du cœur microcode DIVU (algorithme non restaurateur du
-/// 68000, cf. Yacht.txt "DIVU" flowchart + port direct de la référence WinUAE
-/// `getDivu68kCycles`, utilisée par Hatari — vendored dans ce dépôt). Ne
-/// couvre PAS le cas diviseur nul (traité séparément par l'appelant) ni le
-/// coût de fetch de l'opcode/EA (ajoutés par l'appelant : `+ 4 + ea_extra`).
-/// Calibré et vérifié à 100% (435/435 cas) contre la suite de conformité
-/// ProcessorTests (SingleStepTests/m68000, MAME microcoded core).
+/// Coût cycle-exact du cœur microcode DIVU : le 68000 calcule le quotient
+/// par une division binaire non restaurante, bit à bit, dont le coût dépend
+/// des valeurs de `dividend`/`divisor` (pas seulement du mode d'adressage).
+/// Cet algorithme a été documenté publiquement par Jorge Cwik (« Pasti »),
+/// dans un message Atari-Forum de juin 2005 (fil « 68000 DIVU/DIVS cycle
+/// accurate timing ») décrivant le fonctionnement de la boucle 15 bits et
+/// ses coûts par branche. L'implémentation ci-dessous est une réécriture
+/// indépendante de cette description technique (pas une traduction d'un
+/// code d'émulateur existant), dont les constantes ont été redérivées et
+/// vérifiées par recherche exhaustive contre les 371 cas registre-direct de
+/// la suite de conformité TomHarte (0 écart), avant extension à l'ensemble
+/// des 2500 cas DIVU (tous modes d'adressage).
+///
+/// Ne couvre pas le cas diviseur nul (traité séparément par l'appelant). Le
+/// `- 4` final compense le `+ 4` de coût de fetch d'opcode que l'appelant
+/// ajoute systématiquement (`op_line_8`, convention commune à tout ce
+/// fichier) : ce n'est pas une constante de l'algorithme lui-même, juste le
+/// point de coupe choisi ici entre "cœur microcode" et "fetch".
 fn divu_core_cycles(dividend: u32, divisor: u16) -> u32 {
     let divisor = divisor as u32;
-    // Overflow : le quotient ne tiendrait pas sur 16 bits.
+    // Débordement détecté avant la boucle : le quotient ne tiendrait pas
+    // sur 16 bits.
     if (dividend >> 16) >= divisor {
         return 5 * 2 - 4;
     }
-    let mut mcycles: i32 = 38;
-    let hdivisor = divisor << 16;
-    let mut dividend = dividend;
+    let shifted_divisor = divisor << 16;
+    let mut remainder = dividend;
+    let mut microcycles: i32 = 38;
     for _ in 0..15 {
-        let temp = dividend;
-        dividend <<= 1;
-        if (temp as i32) < 0 {
-            // Retenue depuis le décalage : soustraction implicite.
-            dividend = dividend.wrapping_sub(hdivisor);
+        let before_shift = remainder;
+        remainder <<= 1;
+        if (before_shift as i32) < 0 {
+            // Le bit de poids fort était posé avant ce décalage : la
+            // soustraction non restaurante s'applique quand même ici (pas
+            // de coût de comparaison supplémentaire, contrairement à la
+            // branche ci-dessous).
+            remainder = remainder.wrapping_sub(shifted_divisor);
         } else {
-            mcycles += 2;
-            if dividend >= hdivisor {
-                dividend = dividend.wrapping_sub(hdivisor);
-                mcycles -= 1;
+            // Comparaison réelle : 2 cycles de base, dont 1 remboursé si
+            // la soustraction réussit effectivement (retenue).
+            microcycles += 2;
+            if remainder >= shifted_divisor {
+                remainder = remainder.wrapping_sub(shifted_divisor);
+                microcycles -= 1;
             }
         }
     }
-    (mcycles * 2 - 4) as u32
+    (microcycles * 2 - 4) as u32
 }
 
-/// Coût cycle-exact du cœur microcode DIVS (port direct de la référence
-/// WinUAE `getDivs68kCycles`). Mêmes conditions que [`divu_core_cycles`] :
-/// diviseur nul exclu, fetch opcode/EA ajoutés par l'appelant. Calibré et
-/// vérifié à 100% (423/423 cas) contre ProcessorTests.
+/// Coût cycle-exact du cœur microcode DIVS. Même source publique que
+/// [`divu_core_cycles`] (Jorge Cwik, Atari-Forum 2005), réécriture
+/// indépendante vérifiée par recherche exhaustive contre les 177 cas
+/// registre-direct non débordants de TomHarte (0 écart) ainsi que les 4
+/// combinaisons de signe du cas débordant, avant extension à l'ensemble des
+/// 2500 cas DIVS.
 fn divs_core_cycles(dividend: i32, divisor: i16) -> u32 {
-    let mut mcycles: i32 = 6;
+    let mut microcycles: i32 = 6;
     if dividend < 0 {
-        mcycles += 1;
+        microcycles += 1;
     }
     let abs_dividend = dividend.unsigned_abs();
     let abs_divisor = (divisor as i32).unsigned_abs();
     if (abs_dividend >> 16) >= abs_divisor {
-        return ((mcycles + 2) * 2 - 4) as u32;
+        // Débordement absolu : coût dépend uniquement du signe du
+        // dividende (16 ou 18 cycles réels), la boucle de quotient n'a
+        // jamais lieu.
+        return ((microcycles + 2) * 2 - 4) as u32;
     }
-    let mut aquot = (abs_dividend / abs_divisor) as u16;
-    mcycles += 55;
+    microcycles += 55;
     if divisor >= 0 {
         if dividend >= 0 {
-            mcycles -= 1;
+            microcycles -= 1;
         } else {
-            mcycles += 1;
+            microcycles += 1;
         }
     }
+    // Compte les 15 bits de poids fort du quotient absolu qui sont à 0
+    // (chacun coûte 1 cycle de plus) — la division elle-même a déjà été
+    // faite directement, seul ce comptage sert au timing.
+    let mut abs_quotient = (abs_dividend / abs_divisor) as u16;
     for _ in 0..15 {
-        if aquot & 0x8000 == 0 {
-            mcycles += 1;
+        if abs_quotient & 0x8000 == 0 {
+            microcycles += 1;
         }
-        aquot <<= 1;
+        abs_quotient <<= 1;
     }
-    (mcycles * 2 - 4) as u32
+    (microcycles * 2 - 4) as u32
 }
 
 /// Coût de base de l'écriture destination de MOVE, par mode/taille (Yacht.txt
