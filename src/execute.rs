@@ -2,7 +2,7 @@
 
 use crate::addressing::{Operand, Size};
 use crate::bus::Bus;
-use crate::cpu::{ADDR_MASK, Cpu, ccr};
+use crate::cpu::{ADDR_MASK, Cpu, ccr, sr};
 
 /// Erreur d'exécution non gérée.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,6 +462,30 @@ impl Cpu {
                     self.take_bus_error_full(&mut timed, fault_addr, is_write, None, false);
                     return Ok(self.finalize_cycles(&timed, cycles + 50));
                 }
+                // Trace (bit T du SR) : si l'instruction s'est terminée
+                // normalement (aucun des cas ci-dessus, ni une exception
+                // logicielle interne à l'instruction elle-même — TRAP,
+                // CHK, division par zéro, ILLEGAL, Line-A/F, violation de
+                // privilège — puisque take_exception efface déjà T en
+                // entrant dans SON propre frame, donc self.sr.T ne peut
+                // être encore posé ici que si l'instruction s'est vraiment
+                // terminée normalement), le 68000 déclenche l'exception
+                // vecteur 9 avant l'instruction suivante. Le bit T est
+                // relu APRÈS l'instruction (pas celui du début) : une
+                // instruction qui pose T elle-même (MOVE/ANDI/ORI to SR,
+                // RTE qui dépile un SR avec T=1) déclenche donc la trace
+                // dès la fin de CETTE instruction — comportement réel
+                // documenté du 68000, pas une approximation.
+                //
+                // La suite TomHarte capture volontairement l'effet d'UNE
+                // instruction sans enchaîner sur la trace même quand T=1
+                // en entrée (ex: NOP avec T=1 : final.sr == initial.sr,
+                // aucun frame poussé) : `step` ne prend donc PAS
+                // l'exception elle-même, il pose juste `trace_pending` à
+                // vrai — c'est à l'appelant (une vraie boucle d'émulation,
+                // pas le harnais de conformité) d'appeler
+                // `take_trace_exception` s'il veut l'effet réel.
+                self.trace_pending = self.sr & sr::T != 0;
                 Ok(self.finalize_cycles(&timed, cycles))
             }
             Err(StepError::AddressError(fault_addr, is_write, pc_at_fault)) => {

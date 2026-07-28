@@ -106,6 +106,17 @@ pub struct Cpu {
     /// (crates/app/examples/*) pour retracer une séquence d'exceptions
     /// sans instrumenter chaque site d'appel séparément.
     pub exception_log: std::collections::VecDeque<(u8, u32, u32, bool, u32, u64)>,
+    /// Vrai si la dernière instruction s'est terminée normalement (aucune
+    /// exception interne) avec le bit T du SR posé : le 68000 réel
+    /// déclencherait l'exception trace (vecteur 9) avant l'instruction
+    /// suivante. `step` ne la prend PAS lui-même (la suite de conformité
+    /// TomHarte capture volontairement l'effet d'une seule instruction
+    /// sans enchaîner sur la trace, même quand T=1 en entrée) : c'est à
+    /// l'appelant de vérifier ce champ après chaque `step` et d'appeler
+    /// [`Cpu::take_trace_exception`] s'il veut l'effet réel, avant le
+    /// `step` suivant (pour préserver la priorité trace-avant-interruption
+    /// du silicium réel).
+    pub trace_pending: bool,
 }
 
 /// Taille max de `Cpu::exception_log` — assez pour couvrir plusieurs frames
@@ -140,6 +151,7 @@ impl Cpu {
             ea_extra_cycles: 0,
             fault_prefix: 4,
             exception_log: std::collections::VecDeque::new(),
+            trace_pending: false,
         }
     }
 
@@ -418,6 +430,22 @@ impl Cpu {
         self.log_exception(vector, self.pc, 0, false, new_pc);
         self.pc = new_pc;
         Some(44)
+    }
+
+    /// Prend l'exception trace (vecteur 9) si [`Self::trace_pending`] est
+    /// vrai — voir sa documentation pour le contrat d'appel attendu.
+    /// Frame standard 6 octets (SR+PC), comme les interruptions. Renvoie
+    /// `Some(34)` (coût usuel du dispatch d'exception, cf. TRAP/TRAPV/
+    /// ILLEGAL) si la trace a été prise, `None` sinon.
+    pub fn take_trace_exception(&mut self, bus: &mut impl Bus) -> Option<u32> {
+        if !self.trace_pending {
+            return None;
+        }
+        self.trace_pending = false;
+        let pc_push = self.pc;
+        self.take_exception(bus, 9, pc_push);
+        self.cycles = self.cycles.wrapping_add(34);
+        Some(34)
     }
 
     // --- Accès groupés à l'octet CCR ---------------------------------------
