@@ -123,4 +123,10 @@ impl Glue {
     pub fn frame_count(&self) -> u64 {
         self.frame
     }
+
+    /// Nombre de lignes par trame dans le mode vidéo courant — utile pour
+    /// détecter le bouclage de `current_line()` d'un tick à l'autre.
+    pub fn lines_per_frame(&self) -> u32 {
+        self.mode.lines_per_frame()
+    }
 }

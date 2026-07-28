@@ -2,6 +2,7 @@
 
 use rust68::peripherals::acia;
 use rust68::peripherals::mfp::{channel, reg};
+use rust68::peripherals::shifter::addr as shifter_addr;
 use rust68::peripherals::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
@@ -266,4 +267,69 @@ fn reset_bus_reinitialise_le_ym2149() {
     st.reset_bus();
     st.write8(YM2149_SELECT, ym2149::reg::AMPLITUDE_A);
     assert_eq!(st.read8(YM2149_DATA), 0, "reset_bus doit réinitialiser le YM2149");
+}
+
+#[test]
+fn shifter_registres_mappes_correctement() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(shifter_addr::VIDEO_BASE_HIGH, 0x00);
+    st.write8(shifter_addr::VIDEO_BASE_MID, 0x10); // base vidéo = 0x001000
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+    assert_eq!(st.read8(shifter_addr::VIDEO_BASE_MID), 0x10);
+    assert_eq!(st.shifter.resolution(), rust68::peripherals::shifter::Resolution::Low);
+}
+
+/// Test d'intégration bout-en-bout : écrit un motif connu en RAM vidéo,
+/// avance le board d'une ligne complète (512 cycles CPU, PAL), et vérifie
+/// que le framebuffer contient les pixels attendus.
+#[test]
+fn tick_rend_une_ligne_video_dans_le_framebuffer() {
+    let mut st = AtariSt::new(0x10000, vec![]);
+    // Base vidéo = 0x000000 (par défaut), résolution basse.
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+    // Palette couleur 1 = blanc.
+    let c1 = shifter_addr::PALETTE_BASE + 2;
+    st.write8(c1, 0x07);
+    st.write8(c1 + 1, 0x77);
+    // Plan 0, premier mot = 0x8000 (pixel 0 posé -> couleur 1).
+    st.write8(0x0000, 0x80);
+    st.write8(0x0001, 0x00);
+
+    st.tick(512); // une ligne PAL complète
+
+    assert!(!st.framebuffer.is_empty(), "une ligne doit avoir été rendue");
+    let line0 = &st.framebuffer[st.glue.current_line() as usize];
+    assert_eq!(line0.len(), 320);
+    assert_eq!(line0[0], (255, 255, 255), "pixel 0 -> couleur 1 (blanc)");
+    assert_eq!(line0[1], (0, 0, 0), "pixel 1 -> couleur 0 (noir)");
+}
+
+#[test]
+fn tick_rend_une_trame_complete() {
+    let mut st = AtariSt::new(0x1_0000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+    st.tick(512 * 313); // une trame PAL complète (313 lignes)
+    assert_eq!(st.framebuffer.len(), 313);
+    assert!(
+        st.framebuffer.iter().all(|line| line.len() == 320),
+        "chaque ligne rendue doit avoir la largeur de la résolution basse"
+    );
+}
+
+#[test]
+fn reset_bus_reinitialise_le_shifter_et_resynchronise_le_suivi() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b01); // moyenne résolution
+    st.tick(512 * 5);
+    st.reset_bus();
+    assert_eq!(
+        st.shifter.resolution(),
+        rust68::peripherals::shifter::Resolution::Low,
+        "reset_bus doit réinitialiser le Shifter"
+    );
+    // Pas de rattrapage massif au tick suivant : un seul tick court ne doit
+    // rendre au plus qu'une ligne.
+    let lignes_avant = st.framebuffer.len();
+    st.tick(4);
+    assert!(st.framebuffer.len() <= lignes_avant + 1);
 }

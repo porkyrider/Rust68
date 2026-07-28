@@ -12,15 +12,22 @@
 //! (clavier + MIDI) ne génèrent pas d'IPL directement : leurs sorties IRQ
 //! sont OR câblées sur `GPIP4` du MFP (câblage réel ST/STE).
 //!
+//! Le Shifter (vidéo) est piloté par le rythme HBL/VBL du GLUE : `tick`
+//! détecte les changements de `Glue::current_line`/`frame_count` et
+//! déclenche `Shifter::render_scanline`/`start_frame` en conséquence,
+//! accumulant l'image dans [`AtariSt::framebuffer`].
+//!
 //! ## Limitations connues (v1)
-//! - RAM/ROM/MFP/ACIA×2/YM2149 sont réellement mappés. Le reste de la zone
-//!   d'E/S (`0xFF8000`-`0xFFFFFF` : FDC/DMA, Shifter…) répond `0xFF` en
+//! - RAM/ROM/MFP/ACIA×2/YM2149/Shifter sont réellement mappés. Le reste de
+//!   la zone d'E/S (`0xFF8000`-`0xFFFFFF` : FDC/DMA…) répond `0xFF` en
 //!   lecture et ignore les écritures — chip select réel mais périphérique
 //!   pas encore émulé, plutôt qu'un bus error qui casserait tout polling
 //!   de statut par le logiciel.
 //! - Pas de miroir ROM à `0xE00000` (modèles 130ST très anciens).
 //! - Pas de modèle de contention DRAM/vidéo (`is_contended` reste à
-//!   `false` : nécessite le Shifter, pas encore implémenté).
+//!   `false`) : le Shifter est maintenant implémenté mais son accès
+//!   mémoire n'est pas (encore) modélisé comme volant des cycles bus au
+//!   CPU.
 //! - Les adresses paires adjacentes à un registre MFP (ex: `0xFFFA00`,
 //!   normalement flottantes sur un vrai bus 8 bits) retombent dans le
 //!   stub d'E/S générique plutôt que de modéliser précisément le
@@ -32,6 +39,7 @@
 use crate::peripherals::acia::{self, Acia};
 use crate::peripherals::glue::{Glue, VideoMode};
 use crate::peripherals::mfp::Mfp;
+use crate::peripherals::shifter::{self, Shifter};
 use crate::peripherals::ym2149::{self, Ym2149};
 use crate::{ADDR_MASK, Bus};
 
@@ -89,6 +97,21 @@ pub struct AtariSt {
     /// sortie audio via `channel_level`, injecter les entrées des ports
     /// A/B (joystick/souris/lecteur, câblage non interprété par ce board).
     pub ym2149: Ym2149,
+    /// Shifter (vidéo). Champ public surtout pour la lecture directe des
+    /// registres si besoin ; en pratique l'image se lit via
+    /// [`Self::framebuffer`], déjà rendue.
+    pub shifter: Shifter,
+    /// Image de la trame en cours de construction : une ligne par entrée
+    /// (indexée comme `Glue::current_line`), mise à jour au rythme HBL par
+    /// [`Self::tick`]. Contient l'image de la trame précédente jusqu'à ce
+    /// que la ligne correspondante de la trame courante soit rendue.
+    pub framebuffer: Vec<Vec<(u8, u8, u8)>>,
+    /// Compteur monotone (jamais remis à zéro, contrairement à
+    /// `Glue::current_line` qui boucle) : nécessaire pour détecter le
+    /// passage d'une trame complète (313 lignes en PAL) sans le confondre
+    /// avec "aucune ligne écoulée" quand `current_line` revient à 0.
+    last_absolute_line: u64,
+    last_frame: u64,
     bus_fault: Option<(u32, bool)>,
 }
 
@@ -107,13 +130,18 @@ impl AtariSt {
             acia_keyboard: Acia::new(),
             acia_midi: Acia::new(),
             ym2149: Ym2149::new(),
+            shifter: Shifter::new(),
+            framebuffer: Vec::new(),
+            last_absolute_line: 0,
+            last_frame: 0,
             bus_fault: None,
         }
     }
 
     /// Fait progresser les périphériques (MFP + GLUE + YM2149) de
-    /// `cpu_cycles` cycles CPU, et relaie l'IRQ combinée des deux ACIA sur
-    /// `GPIP4` du MFP (OR câblé, câblage réel ST/STE). À appeler par
+    /// `cpu_cycles` cycles CPU, relaie l'IRQ combinée des deux ACIA sur
+    /// `GPIP4` du MFP (OR câblé, câblage réel ST/STE), et déclenche le
+    /// rendu vidéo (`Shifter`) au rythme HBL/VBL du GLUE. À appeler par
     /// l'appelant après chaque `Cpu::step` :
     ///
     /// ```
@@ -131,6 +159,31 @@ impl AtariSt {
         self.ym2149.tick(cpu_cycles);
         let acia_irq = self.acia_keyboard.irq_requested() || self.acia_midi.irq_requested();
         self.mfp.set_gpip_input(4, acia_irq);
+
+        let frame_now = self.glue.frame_count();
+        if frame_now != self.last_frame {
+            self.last_frame = frame_now;
+            self.shifter.start_frame();
+        }
+        let lines_per_frame = self.glue.lines_per_frame() as u64;
+        // Compteur absolu (jamais remis à zéro) pour ne pas confondre "une
+        // trame entière vient de s'écouler" avec "aucune ligne écoulée"
+        // quand current_line() revient à 0 en bouclant.
+        let absolute_line_now = frame_now * lines_per_frame + self.glue.current_line() as u64;
+        // Borne défensive : ne rattrape jamais plus d'une trame complète en
+        // un seul tick (cas normal : 0 ou 1 ligne, tick() étant appelé après
+        // chaque instruction, bien plus fréquemment qu'une ligne = 512 cycles).
+        let mut guard = 0u64;
+        while self.last_absolute_line < absolute_line_now && guard < lines_per_frame {
+            self.last_absolute_line += 1;
+            let row = self.shifter.render_scanline(&self.ram);
+            let idx = (self.last_absolute_line % lines_per_frame) as usize;
+            if idx >= self.framebuffer.len() {
+                self.framebuffer.resize(idx + 1, Vec::new());
+            }
+            self.framebuffer[idx] = row;
+            guard += 1;
+        }
     }
 
     fn mfp_offset(addr: u32) -> Option<u8> {
@@ -143,6 +196,18 @@ impl AtariSt {
 
     fn in_rom(&self, addr: u32) -> bool {
         addr >= self.rom_base && addr - self.rom_base < self.rom.len() as u32
+    }
+
+    fn is_shifter_addr(addr: u32) -> bool {
+        matches!(
+            addr,
+            shifter::addr::VIDEO_BASE_HIGH
+                | shifter::addr::VIDEO_BASE_MID
+                | shifter::addr::VIDEO_COUNTER_HIGH
+                | shifter::addr::VIDEO_COUNTER_MID
+                | shifter::addr::VIDEO_COUNTER_LOW
+                | shifter::addr::RESOLUTION
+        ) || (shifter::addr::PALETTE_BASE..shifter::addr::PALETTE_BASE + 32).contains(&addr)
     }
 }
 
@@ -162,6 +227,7 @@ impl Bus for AtariSt {
             ACIA_MIDI_DATA => return self.acia_midi.read(acia::reg::DATA),
             YM2149_SELECT => return self.ym2149.read(ym2149::bus_offset::SELECT),
             YM2149_DATA => return self.ym2149.read(ym2149::bus_offset::DATA),
+            _ if Self::is_shifter_addr(addr) => return self.shifter.read(addr),
             _ => {}
         }
         if self.in_rom(addr) {
@@ -209,6 +275,10 @@ impl Bus for AtariSt {
                 self.ym2149.write(ym2149::bus_offset::DATA, value);
                 return;
             }
+            _ if Self::is_shifter_addr(addr) => {
+                self.shifter.write(addr, value);
+                return;
+            }
             _ => {}
         }
         if self.in_rom(addr) {
@@ -229,6 +299,13 @@ impl Bus for AtariSt {
         self.acia_keyboard = Acia::new();
         self.acia_midi = Acia::new();
         self.ym2149 = Ym2149::new();
+        self.shifter = Shifter::new();
+        // Le GLUE n'est pas réinitialisé (voir ci-dessus) : resynchroniser
+        // juste le suivi de ligne/trame sur sa position courante pour ne
+        // pas déclencher un rattrapage massif au prochain tick().
+        self.last_frame = self.glue.frame_count();
+        self.last_absolute_line =
+            self.last_frame * self.glue.lines_per_frame() as u64 + self.glue.current_line() as u64;
     }
 
     fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
