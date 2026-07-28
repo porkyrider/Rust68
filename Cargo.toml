@@ -6,6 +6,10 @@ description = "Émulateur de la série Motorola 68000 (68k) en Rust"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+# Optionnelle : uniquement pour le binaire de démonstration `atari_st_sdl2`
+# (voir la feature `sdl2-frontend`). La bibliothèque et `cargo test` ne
+# dépendent pas de SDL2.
+sdl2 = { version = "0.38", optional = true, features = ["use-pkgconfig"] }
 
 # Dépendances uniquement nécessaires aux tests (harness ProcessorTests/TomHarte).
 # Elles ne sont pas embarquées dans la bibliothèque livrée.
@@ -19,3 +23,9 @@ serde_json = "1"
 # 68000 seul est ce qu'on obtient sans rien demander explicitement.
 # `cargo build --features atari-st` pour rapatrier/compiler l'Atari ST.
 atari-st = []
+sdl2-frontend = ["dep:sdl2", "atari-st"]
+
+[[bin]]
+name = "atari_st_sdl2"
+path = "src/bin/atari_st_sdl2.rs"
+required-features = ["sdl2-frontend"]
