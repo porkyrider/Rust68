@@ -153,6 +153,17 @@ mécanisme qu'utilisent de nombreux programmes/démos pour détecter la RAM
 installée (handler au vecteur $8 + scan d'adresses croissantes). Vérifié après
 le fetch d'opcode et après chaque exécution dans `Cpu::step`.
 
+**Double bus fault (`Cpu::halted`)** : un bus/address error survenant en
+empilant le frame d'un précédent bus/address error (ou en lisant son
+vecteur) — typiquement un pointeur de pile hors de toute zone mappée —
+est détecté et arrête définitivement le CPU (`StepError::DoubleFault`),
+comme le ferait un vrai 68000 (HALT jusqu'à un `/RESET` matériel), plutôt
+que de rebondir indéfiniment sur un vecteur avec un frame corrompu. Bug
+réel trouvé en creusant le boot froid Atari ST (voir plus bas) :
+auparavant, le flag de fault posé par la poussée de frame elle-même
+restait non consommé et contaminait le `step` suivant, provoquant une
+cascade infinie et silencieuse.
+
 ### Interruptions IPL
 `Cpu::take_interrupt` (appelé par `Cpu::step` avant le fetch de chaque
 opcode) : reconnaît une demande d'interruption externe et la prend si son
@@ -390,26 +401,46 @@ vers la RAM du board via un petit type `RamBus` interne) et exécute le
 blit en entier de façon synchrone, déclenché par l'écriture du bit
 BUSY/START du registre de contrôle.
 
-**Limitations à prendre avec prudence** (aucune suite équivalente à
-TomHarte n'existe pour ce périphérique) :
-- `skew` (décalage bit à bit du mot source, pour aligner des images non
-  alignées sur un mot) : implémenté d'après ma meilleure compréhension du
-  mécanisme documenté, **non vérifié contre une référence matérielle
-  réelle ou un émulateur existant**. `NFSR`/`FXSR` non modélisés
-  distinctement (une lecture d'amorçage est toujours faite si `skew!=0`).
-- Mode "dessin de ligne" (line number pour du tracé de polygone) non
-  implémenté : seul le blit rectangulaire standard est couvert.
+Registres `CONTROL` (`0xFF8A3C` : BUSY/HOG/SMUDGE/numéro de ligne de
+demi-teinte) et `SKEW` (`0xFF8A3D` : FXSR/NFSR/décalage) conformes à
+l'offset réel de la puce — croisés contre le datasheet `BLITTER.TXT`
+(info-coach.fr), le `BLIT_FAQ.TXT` (dépôt `ggnkua/Atari_ST_Sources`) et
+le code source de Hatari (`src/blitter.c`), qui se recoupent tous les
+trois. Une première version avait ces deux offsets inversés (bug
+corrigé) et prenait `HOP=0` pour "tout à zéro" au lieu de "tout à un"
+(table du datasheet, également corrigé).
+
+- `FXSR`/`NFSR` (bits du registre `SKEW`) honorés explicitement plutôt
+  que déduits de `skew != 0` : `FXSR` déclenche la lecture d'amorçage en
+  début de ligne, `NFSR` supprime la dernière lecture source de la ligne.
+- `SMUDGE` (bit du registre `CONTROL`) implémenté : le mot de demi-teinte
+  utilisé pour chaque mot vient des 4 bits bas du mot source décalé,
+  potentiellement différent à chaque mot d'une même ligne (au lieu du
+  numéro de ligne courant en mode normal).
+- Le numéro de ligne de demi-teinte (bits 0-3 de `CONTROL`) est
+  directement lisible/inscriptible par le logiciel (pas un compteur
+  interne caché), et avance ou recule en fin de ligne selon le signe de
+  `DST_Y_INC`, conformément au datasheet.
+- Pas de mode "dessin de ligne" pour tracé de polygone (contrairement au
+  Blitter Amiga) : ce n'est pas une limitation de cette implémentation,
+  la puce Atari STE n'a simplement pas cette fonctionnalité — le champ
+  "numéro de ligne" du registre CONTROL sert uniquement à la sélection
+  de demi-teinte ci-dessus.
+
+**Limitations restantes, à prendre avec prudence** (aucune suite
+équivalente à TomHarte n'existe pour ce périphérique) :
+- `skew` : la formule de combinaison du mot précédent/courant suppose un
+  parcours X croissant ; Hatari inverse l'ordre de combinaison quand
+  `SRC_X_INC` est négatif (blit "miroir"), non modélisé ici.
 - Pas de vol de cycles bus au CPU modélisé (bit HOG/STEAL) : le blit
   s'exécute intégralement de façon synchrone, `BUSY` jamais observable
   par polling.
-- Halftone : le mot utilisé par ligne cycle `halftone[line % 16]`,
-  `line` incrémentant à chaque ligne Y — comportement usuel documenté,
-  non vérifié indépendamment.
 
-Testé dans `tests/blitter.rs` (8 tests : table de vérité OP, HOP, endmask,
-parcours X/Y, cycle halftone, skew=0) et `tests/atari_st.rs` (3 tests
-supplémentaires, dont un blit bout-en-bout déclenché via le registre de
-contrôle).
+Testé dans `tests/blitter.rs` (13 tests : table de vérité OP, HOP y
+compris HOP=0, endmask, parcours X/Y, cycle et registre de numéro de
+ligne de demi-teinte, FXSR, NFSR, SMUDGE, skew=0) et `tests/atari_st.rs`
+(3 tests supplémentaires, dont un blit bout-en-bout déclenché via le
+registre de contrôle).
 
 ---
 
@@ -427,9 +458,18 @@ reliant toutes les puces ci-dessus :
   (`0xFF8604`+, champs `wd1772`/`floppy_a`). Blitter (`0xFF8A00`+, champ
   `blitter`, déclenché par l'écriture du bit BUSY/START de son registre
   de contrôle).
-- Le "trou" physique entre le haut de la RAM installée et `0xFF8000`
-  déclenche un bus error via `take_bus_fault` — mécanisme utilisé par de
-  nombreux programmes/démos pour détecter la RAM installée.
+- Au-delà de la RAM installée mais dans l'espace d'adressage "RAM ST" fixe
+  de 4 Mo (deux banques MMU de 2 Mo sur ST/STE réel), l'accès ne
+  déclenche **jamais** de bus error : le MMU y répond toujours /DTACK sur
+  silicium réel, même sans RAM physique à l'adresse précise (confirmé par
+  la communauté Atari). Modélisé par une valeur fixe non stockée (une
+  lecture ne renvoie jamais ce qui vient d'être écrit) plutôt que la
+  valeur réelle (résidu de capacité du bus, non déterministe). C'est
+  cette absence de persistance, pas un bus error, que le TOS observe pour
+  sa détection de RAM au tout début du boot froid. Le vrai "trou"
+  (bus error via `take_bus_fault`, mécanisme qu'utilisent de nombreux
+  programmes/démos une fois le TOS démarré) commence seulement à 4 Mo,
+  jusqu'à `0xFF8000`.
 - Reste de la zone d'E/S non mappée : chip select réel mais périphérique
   pas encore émulé → lecture neutre `0xFF`, écriture ignorée (pas de bus
   error, pour ne pas casser le polling de statut du logiciel).
@@ -518,7 +558,14 @@ Un vrai TOS 1.62 non modifié démarre jusqu'au bureau GEM interactif
 (vidéo couleur basse résolution, clavier, souris, icônes disquette) via le
 binaire de démonstration `atari_st_sdl2` (`cargo run --release --features
 sdl2-frontend --bin atari_st_sdl2 -- <rom.img> [disque.stx|.st]`) — voir
-la section Architecture pour le détail des features Cargo.
+la section Architecture pour le détail des features Cargo. Le
+raccourci "redémarrage à chaud" (cookies `memvalid`/`memval2`/`memval3`/
+`phystop` pré-remplis, voir le code de `main`) reste le chemin par défaut
+recommandé (rapide, fiable) ; `RUST68_COLD_BOOT=1` force un vrai boot
+froid (détection de RAM réelle par le TOS, plus lente) — fonctionnel
+depuis les correctifs double bus fault + modèle "RAM ST flottante"
+ci-dessus (`phystop` correctement déduit à la taille réelle installée),
+mais moins testé au quotidien que le chemin par défaut.
 
 Pistes pour aller plus loin (aucune n'est un blocage, ce sont des
 approfondissements) :
@@ -531,3 +578,14 @@ approfondissements) :
 - `.stx` : métadonnées de protection par secteur (fuzzy bits, timing)
   volontairement ignorées par le lecteur minimal — de vraies protections
   de jeux resteraient bloquées.
+- **Bug ouvert, reproduit et non résolu** : le curseur souris affiche des
+  couleurs erratiques, et la barre de menu GEM (survolée pour ouvrir un
+  menu) affiche un bandeau de bruit/blocs de couleur au lieu d'un texte
+  lisible — reproduit à l'identique en boot chaud ET en boot froid (donc
+  indépendant des correctifs RAM ci-dessus). Palette matérielle du
+  Shifter vérifiée correcte (valeurs standard GEM) au moment du bug. Pas
+  encore de cause identifiée ; pistes non explorées : timing du Blitter
+  pour les motifs de remplissage GEM, décodage des plans de bits
+  spécifique à une zone d'écran, ou état VDI non initialisé. Pour
+  reproduire : `atari_st_sdl2` avec `tos162.img`, survoler un titre de la
+  barre de menu.
