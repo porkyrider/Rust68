@@ -1,14 +1,15 @@
 //! Tests du board Atari ST (`rust68::systems::atari_st::AtariSt`).
 
 use rust68::peripherals::acia;
+use rust68::peripherals::blitter::reg as blitter_reg;
 use rust68::peripherals::mfp::{channel, reg};
 use rust68::peripherals::shifter::addr as shifter_addr;
 use rust68::peripherals::wd1772::{self, FloppyDisk, RawDiskImage, SECTOR_SIZE};
 use rust68::peripherals::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
-    DEFAULT_ROM_BASE, DMA_ADDR_HIGH, DMA_ADDR_LOW, DMA_ADDR_MID, DMA_MODE, FDC_DATA, IO_BASE,
-    MFP_BASE, YM2149_DATA, YM2149_SELECT,
+    BLITTER_BASE, DEFAULT_ROM_BASE, DMA_ADDR_HIGH, DMA_ADDR_LOW, DMA_ADDR_MID, DMA_MODE, FDC_DATA,
+    IO_BASE, MFP_BASE, YM2149_DATA, YM2149_SELECT,
 };
 use rust68::{Bus, Cpu};
 
@@ -435,4 +436,57 @@ fn reset_bus_reinitialise_le_wd1772() {
     st.reset_bus();
 
     assert!(!st.wd1772.interrupt_requested(), "reset_bus doit réinitialiser le WD1772");
+}
+
+fn write_blitter_word(st: &mut AtariSt, offset: u32, value: u16) {
+    st.write8(BLITTER_BASE + offset, (value >> 8) as u8);
+    st.write8(BLITTER_BASE + offset + 1, value as u8);
+}
+
+fn write_blitter_long(st: &mut AtariSt, offset: u32, value: u32) {
+    st.write8(BLITTER_BASE + offset, (value >> 24) as u8);
+    st.write8(BLITTER_BASE + offset + 1, (value >> 16) as u8);
+    st.write8(BLITTER_BASE + offset + 2, (value >> 8) as u8);
+    st.write8(BLITTER_BASE + offset + 3, value as u8);
+}
+
+#[test]
+fn blitter_registres_mappes_a_ff8a00() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(BLITTER_BASE + blitter_reg::HOP, 0b10);
+    assert_eq!(st.read8(BLITTER_BASE + blitter_reg::HOP), 0b10);
+    assert_eq!(st.blitter.read(blitter_reg::HOP), 0b10);
+}
+
+/// Test d'intégration bout-en-bout : déclenche un blit (copie pure) via
+/// l'écriture du bit BUSY du registre de contrôle, et vérifie que la RAM
+/// du board a bien été modifiée.
+#[test]
+fn ecrire_control_declenche_le_blit_bout_en_bout() {
+    let mut st = AtariSt::new(0x4000, vec![]);
+    st.write8(BLITTER_BASE + blitter_reg::HOP, 2); // source seule
+    st.write8(BLITTER_BASE + blitter_reg::OP, 0xC); // copie
+    write_blitter_word(&mut st, blitter_reg::SRC_X_INC, 2);
+    write_blitter_word(&mut st, blitter_reg::DST_X_INC, 2);
+    write_blitter_word(&mut st, blitter_reg::X_COUNT, 1);
+    write_blitter_word(&mut st, blitter_reg::Y_COUNT, 1);
+    write_blitter_word(&mut st, blitter_reg::ENDMASK_1, 0xFFFF);
+    write_blitter_word(&mut st, blitter_reg::ENDMASK_2, 0xFFFF);
+    write_blitter_word(&mut st, blitter_reg::ENDMASK_3, 0xFFFF);
+    write_blitter_long(&mut st, blitter_reg::SRC_ADDR, 0x1000);
+    write_blitter_long(&mut st, blitter_reg::DST_ADDR, 0x2000);
+    st.write16(0x1000, 0x1234);
+
+    st.write8(BLITTER_BASE + blitter_reg::CONTROL, 0x80); // BUSY/START
+
+    assert_eq!(st.read16(0x2000), 0x1234, "le blit doit avoir copié la source en RAM");
+    assert!(!st.blitter.busy(), "BUSY doit être effacé après exécution");
+}
+
+#[test]
+fn reset_bus_reinitialise_le_blitter() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(BLITTER_BASE + blitter_reg::OP, 0xC);
+    st.reset_bus();
+    assert_eq!(st.blitter.read(blitter_reg::OP), 0, "reset_bus doit réinitialiser le Blitter");
 }

@@ -5,6 +5,7 @@
 //! implémentation de [`crate::Bus`] (mapping mémoire, génération d'IPL…).
 
 pub mod acia;
+pub mod blitter;
 pub mod glue;
 pub mod mfp;
 pub mod shifter;

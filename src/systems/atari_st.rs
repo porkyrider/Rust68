@@ -43,6 +43,7 @@
 //!   fonctionnellement (voir `peripherals::wd1772` pour le détail).
 
 use crate::peripherals::acia::{self, Acia};
+use crate::peripherals::blitter::{self, Blitter};
 use crate::peripherals::glue::{Glue, VideoMode};
 use crate::peripherals::mfp::Mfp;
 use crate::peripherals::shifter::{self, Shifter};
@@ -84,6 +85,9 @@ pub const DMA_ADDR_HIGH: u32 = 0xFF8609;
 pub const DMA_ADDR_MID: u32 = 0xFF860B;
 /// Compteur d'adresse DMA, octet bas.
 pub const DMA_ADDR_LOW: u32 = 0xFF860D;
+
+/// Base des registres du Blitter, sur STE réel.
+pub const BLITTER_BASE: u32 = 0xFF8A00;
 
 /// Début de la zone d'E/S général (ACIA, PSG, FDC, Shifter…) sur ST/STE.
 pub const IO_BASE: u32 = 0xFF8000;
@@ -141,6 +145,11 @@ pub struct AtariSt {
     pub floppy_a: Option<RawDiskImage>,
     dma_register_select: u8,
     dma_address: u32,
+    /// Blitter (STE). Champ public surtout pour la lecture directe des
+    /// registres ; le déclenchement se fait en écrivant le bit BUSY/START
+    /// du registre de contrôle (voir `Bus::write8` sur `BLITTER_BASE +
+    /// blitter::reg::CONTROL`).
+    pub blitter: Blitter,
     bus_fault: Option<(u32, bool)>,
 }
 
@@ -150,6 +159,25 @@ pub struct AtariSt {
 struct RamDmaChannel<'a> {
     ram: &'a mut [u8],
     address: &'a mut u32,
+}
+
+/// Vue `Bus` d'une tranche de RAM, pour donner au Blitter (qui prend un
+/// `Bus` générique) accès à la RAM du board sans emprunt réflexif de
+/// `AtariSt` tout entier.
+struct RamBus<'a> {
+    ram: &'a mut [u8],
+}
+
+impl<'a> Bus for RamBus<'a> {
+    fn read8(&mut self, addr: u32) -> u8 {
+        self.ram.get(addr as usize).copied().unwrap_or(0xFF)
+    }
+
+    fn write8(&mut self, addr: u32, value: u8) {
+        if let Some(slot) = self.ram.get_mut(addr as usize) {
+            *slot = value;
+        }
+    }
 }
 
 impl<'a> DmaChannel for RamDmaChannel<'a> {
@@ -190,6 +218,7 @@ impl AtariSt {
             floppy_a: None,
             dma_register_select: 0,
             dma_address: 0,
+            blitter: Blitter::new(),
             bus_fault: None,
         }
     }
@@ -266,6 +295,10 @@ impl AtariSt {
                 | shifter::addr::RESOLUTION
         ) || (shifter::addr::PALETTE_BASE..shifter::addr::PALETTE_BASE + 32).contains(&addr)
     }
+
+    fn is_blitter_addr(addr: u32) -> bool {
+        (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&addr)
+    }
 }
 
 impl Bus for AtariSt {
@@ -290,6 +323,7 @@ impl Bus for AtariSt {
             DMA_ADDR_HIGH => return (self.dma_address >> 16) as u8,
             DMA_ADDR_MID => return (self.dma_address >> 8) as u8,
             DMA_ADDR_LOW => return self.dma_address as u8,
+            _ if Self::is_blitter_addr(addr) => return self.blitter.read(addr - BLITTER_BASE),
             _ => {}
         }
         if self.in_rom(addr) {
@@ -370,6 +404,20 @@ impl Bus for AtariSt {
                 self.dma_address = (self.dma_address & 0xFFFF00) | value as u32;
                 return;
             }
+            _ if addr == BLITTER_BASE + blitter::reg::CONTROL => {
+                self.blitter.write(blitter::reg::CONTROL, value);
+                // Bit BUSY/START (bit 7) posé : déclenche le blit dans son
+                // intégralité (modèle synchrone, voir peripherals::blitter).
+                if value & 0x80 != 0 {
+                    let mut ram_bus = RamBus { ram: &mut self.ram };
+                    self.blitter.execute(&mut ram_bus);
+                }
+                return;
+            }
+            _ if Self::is_blitter_addr(addr) => {
+                self.blitter.write(addr - BLITTER_BASE, value);
+                return;
+            }
             _ => {}
         }
         if self.in_rom(addr) {
@@ -394,6 +442,7 @@ impl Bus for AtariSt {
         self.wd1772 = Wd1772::new();
         self.dma_register_select = 0;
         self.dma_address = 0;
+        self.blitter = Blitter::new();
         // Le disque inséré (floppy_a), lui, n'est pas éjecté par /RESET :
         // c'est un support physique, pas un état de la puce.
         // Le GLUE n'est pas réinitialisé (voir ci-dessus) : resynchroniser
