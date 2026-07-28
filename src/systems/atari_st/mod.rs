@@ -47,6 +47,8 @@
 //!   modèle de transfert "instantané par secteur" n'en a pas besoin
 //!   fonctionnellement (voir `peripherals::atari_st::wd1772` pour le détail).
 
+pub mod model;
+
 use crate::peripherals::atari_st::acia::{self, Acia};
 use crate::peripherals::atari_st::blitter::{self, Blitter};
 use crate::peripherals::atari_st::glue::{Glue, VideoMode};
@@ -228,6 +230,15 @@ pub struct AtariSt {
     /// (une variable système censée persister à travers un redémarrage à
     /// chaud ne peut pas être en lecture seule dans la ROM).
     overlay: bool,
+    /// Vrai si le Blitter est physiquement présent sur cette machine. De
+    /// série sur STE/Mega STE ; absent sur 520ST/1040ST (le Mega ST avait
+    /// juste un support de puce, pas toujours peuplé — voir
+    /// [`crate::systems::atari_st::model`]). Quand faux, la zone
+    /// `BLITTER_BASE` retombe dans le stub d'E/S générique (`0xFF` en
+    /// lecture, écritures ignorées) au lieu de répondre — un vrai
+    /// programme qui sonde la présence du Blitter avant de s'en servir
+    /// doit voir la même chose que sur un ST sans Blitter.
+    blitter_present: bool,
     bus_fault: Option<(u32, bool)>,
 }
 
@@ -314,8 +325,23 @@ impl AtariSt {
             dma_address: 0,
             blitter: Blitter::new(),
             overlay: true,
+            blitter_present: true,
             bus_fault: None,
         }
+    }
+
+    /// Construit un board à partir d'un modèle connu de la gamme ST/STE
+    /// (voir [`model`]) : RAM et présence du Blitter réglées d'après le
+    /// modèle, `rom` fourni séparément (la version de TOS installée n'est
+    /// pas une propriété du modèle — n'importe quel TOS compatible peut
+    /// être flashé dans une machine réelle). La base ROM (`0xFC0000` vs
+    /// `0xE00000`) reste à régler séparément via [`Self::set_rom_base`]
+    /// une fois la version de TOS connue (voir `os_version` dans l'en-tête
+    /// TOS, indépendant du modèle de machine).
+    pub fn from_model(profile: model::MachineProfile, rom: Vec<u8>) -> Self {
+        let mut st = Self::new(profile.ram_size, rom);
+        st.blitter_present = profile.has_blitter;
+        st
     }
 
     /// Change l'adresse de base de la ROM après construction. Utile pour
@@ -423,8 +449,8 @@ impl AtariSt {
         ) || (shifter::addr::PALETTE_BASE..shifter::addr::PALETTE_BASE + 32).contains(&addr)
     }
 
-    fn is_blitter_addr(addr: u32) -> bool {
-        (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&addr)
+    fn is_blitter_addr(&self, addr: u32) -> bool {
+        self.blitter_present && (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&addr)
     }
 }
 
@@ -453,7 +479,7 @@ impl Bus for AtariSt {
             DMA_ADDR_HIGH => return (self.dma_address >> 16) as u8,
             DMA_ADDR_MID => return (self.dma_address >> 8) as u8,
             DMA_ADDR_LOW => return self.dma_address as u8,
-            _ if Self::is_blitter_addr(addr) => return self.blitter.read(addr - BLITTER_BASE),
+            _ if self.is_blitter_addr(addr) => return self.blitter.read(addr - BLITTER_BASE),
             _ if (STE_DMA_SOUND_BASE..=STE_DMA_SOUND_END).contains(&addr) => return 0x00,
             _ => {}
         }
@@ -539,7 +565,7 @@ impl Bus for AtariSt {
                 self.dma_address = (self.dma_address & 0xFFFF00) | value as u32;
                 return;
             }
-            _ if addr == BLITTER_BASE + blitter::reg::CONTROL => {
+            _ if self.blitter_present && addr == BLITTER_BASE + blitter::reg::CONTROL => {
                 self.blitter.write(blitter::reg::CONTROL, value);
                 // Bit BUSY/START (bit 7) posé : déclenche le blit dans son
                 // intégralité (modèle synchrone, voir peripherals::atari_st::blitter).
@@ -549,7 +575,7 @@ impl Bus for AtariSt {
                 }
                 return;
             }
-            _ if Self::is_blitter_addr(addr) => {
+            _ if self.is_blitter_addr(addr) => {
                 self.blitter.write(addr - BLITTER_BASE, value);
                 return;
             }

@@ -6,7 +6,13 @@
 //! ST), pas à être un émulateur ST "complet" (pas de configuration GUI, pas
 //! de sauvegarde d'état, pas de support disquette en écriture persistante).
 //!
-//! Usage : `atari_st_sdl2 <rom.img> [disque.stx|disque.st]`
+//! Usage : `atari_st_sdl2 [--model <nom>] <rom.img> [disque.stx|disque.st]`
+//!
+//! `--model` sélectionne un profil de machine du lexique
+//! `systems::atari_st::model` (RAM, présence du Blitter — voir sa doc pour
+//! la liste et ce qui est réellement pris en compte). Le TOS chargé est
+//! indépendant du modèle : sa version est auto-détectée depuis son en-tête
+//! (`os_version`) pour choisir la bonne base ROM, pas depuis `--model`.
 //!
 //! ## Choix d'architecture
 //! - Pas de minuteur temps réel dédié : ce crate n'en fournit aucun (voir
@@ -44,23 +50,58 @@ use sdl2::keyboard::Scancode;
 use sdl2::pixels::PixelFormatEnum;
 use std::time::Duration;
 
-/// Horloge CPU de l'Atari ST (8 MHz), pour dériver le rythme d'échantillonnage audio.
-const CPU_HZ: f64 = 8_000_000.0;
 const AUDIO_SAMPLE_RATE: i32 = 44_100;
 /// Seuil de remplissage de la file audio (en octets, mono i16 = 2 octets/échantillon)
 /// au-delà duquel on ralentit l'émulation pour rester au rythme temps réel.
 const AUDIO_QUEUE_HIGH_WATERMARK: u32 = (AUDIO_SAMPLE_RATE as u32) * 2 / 4; // ~250 ms
-/// RAM installée (1 Mo, configuration ST courante).
-const RAM_SIZE: u32 = 1024 * 1024;
+/// Modèle par défaut si `--model` n'est pas précisé.
+const DEFAULT_MODEL: &str = "1040ste";
+
+fn usage(program: &str) -> ! {
+    eprintln!(
+        "Usage : {program} [--model <nom>] <rom.img> [disque.stx|disque.st]\n\n\
+         Modèles disponibles (--model, casse indifférente) : 520st, 1040st, megast, \
+         520ste, 1040ste (défaut), megaste — voir `systems::atari_st::model` pour le \
+         détail de chaque profil (RAM, Blitter…)."
+    );
+    std::process::exit(1);
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage : {} <rom.img> [disque.stx|disque.st]", args[0]);
-        std::process::exit(1);
+    let program = args[0].clone();
+
+    let mut model_name = DEFAULT_MODEL.to_string();
+    let mut positional: Vec<&String> = Vec::new();
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--model" {
+            match iter.next() {
+                Some(v) => model_name = v.clone(),
+                None => usage(&program),
+            }
+        } else {
+            positional.push(arg);
+        }
     }
-    let rom_path = &args[1];
-    let disk_path = args.get(2);
+    if positional.is_empty() {
+        usage(&program);
+    }
+    let rom_path = positional[0];
+    let disk_path = positional.get(1);
+
+    let model = rust68::systems::atari_st::model::AtariModel::parse(&model_name)
+        .unwrap_or_else(|| {
+            eprintln!("Modèle inconnu : {model_name}");
+            usage(&program);
+        });
+    let profile = model.profile();
+    eprintln!(
+        "Modèle : {} (RAM {} Ko, Blitter {})",
+        profile.name,
+        profile.ram_size / 1024,
+        if profile.has_blitter { "présent" } else { "absent" }
+    );
 
     let rom = std::fs::read(rom_path).unwrap_or_else(|e| {
         eprintln!("Impossible de lire la ROM {rom_path} : {e}");
@@ -74,6 +115,8 @@ fn main() {
     // `os_version` (BCD) est au décalage 2 du header TOS, documenté
     // publiquement (ex: 0x0162 pour TOS 1.62) : TOS >= 1.06 est mappé à
     // 0xE00000 sur ST/STE réel, TOS <= 1.04 à 0xFC0000 (voir `set_rom_base`).
+    // Indépendant du modèle de machine (--model) : n'importe quel TOS
+    // compatible peut être flashé dans une machine réelle donnée.
     let os_version = u16::from_be_bytes(rom[2..4].try_into().unwrap());
     let rom_base = if os_version >= 0x0106 {
         0x00E0_0000
@@ -81,7 +124,8 @@ fn main() {
         rust68::systems::atari_st::DEFAULT_ROM_BASE
     };
 
-    let mut st = AtariSt::new(RAM_SIZE as usize, rom);
+    let ram_size = profile.ram_size;
+    let mut st = AtariSt::from_model(profile, rom);
     st.set_rom_base(rom_base);
     if let Some(path) = disk_path {
         match load_floppy(path) {
@@ -103,7 +147,7 @@ fn main() {
     st.write32(0x420, 0x752019F3); // memvalid
     st.write32(0x43A, 0x237698AA); // memval2
     st.write32(0x51A, 0x5555AAAA); // memval3
-    st.write32(0x42E, RAM_SIZE); // phystop
+    st.write32(0x42E, ram_size as u32); // phystop
 
     let mut cpu = Cpu::new();
     cpu.reset(&mut st);
@@ -171,7 +215,11 @@ fn main() {
     // par troncature répétée.
     let mut mouse_scale_carry = (0.0f64, 0.0f64);
 
-    let cycles_per_sample = CPU_HZ / AUDIO_SAMPLE_RATE as f64;
+    // `profile.cpu_hz` : voir sa doc dans `model.rs` — informatif seulement
+    // pour l'instant (tous les profils renvoient 8 MHz), mais c'est déjà la
+    // seule source de vérité pour ce calcul plutôt qu'une constante séparée
+    // qui pourrait diverger le jour où un mode CPU accéléré sera modélisé.
+    let cycles_per_sample = profile.cpu_hz as f64 / AUDIO_SAMPLE_RATE as f64;
     let mut audio_cycle_acc = 0.0f64;
     let mut audio_buffer: Vec<i16> = Vec::with_capacity(2048);
 

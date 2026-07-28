@@ -5,7 +5,7 @@ use rust68::peripherals::atari_st::acia;
 use rust68::peripherals::atari_st::blitter::reg as blitter_reg;
 use rust68::peripherals::atari_st::mfp::{channel, reg};
 use rust68::peripherals::atari_st::shifter::addr as shifter_addr;
-use rust68::peripherals::atari_st::wd1772::{self, FloppyDisk, RawDiskImage, SECTOR_SIZE};
+use rust68::peripherals::atari_st::wd1772::{self, RawDiskImage, SECTOR_SIZE};
 use rust68::peripherals::atari_st::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
@@ -47,6 +47,28 @@ fn rom_lecture_seule() {
     assert_eq!(st.read8(DEFAULT_ROM_BASE), 0xAB);
     st.write8(DEFAULT_ROM_BASE, 0xFF); // doit être ignoré
     assert_eq!(st.read8(DEFAULT_ROM_BASE), 0xAB);
+}
+
+#[test]
+fn from_model_regle_ram_et_presence_du_blitter() {
+    use rust68::systems::atari_st::model::AtariModel;
+
+    // 1040STE : Blitter de série, 1 Mo de RAM (l'exemple donné pour ce lexique).
+    let mut ste = AtariSt::from_model(AtariModel::Ste1040.profile(), vec![]);
+    ste.write8(BLITTER_BASE + blitter_reg::HALFTONE_BASE, 0x42);
+    assert_eq!(
+        ste.read8(BLITTER_BASE + blitter_reg::HALFTONE_BASE),
+        0x42,
+        "Blitter de série sur 1040STE : registre réellement lu/écrit"
+    );
+    assert_eq!(ste.take_bus_fault(), None);
+
+    // 520ST : pas de Blitter de série — la zone retombe dans le stub d'E/S
+    // générique (0xFF, écritures ignorées), comme un périphérique absent.
+    let mut st = AtariSt::from_model(AtariModel::St520.profile(), vec![]);
+    assert_eq!(st.read8(BLITTER_BASE), 0xFF, "pas de Blitter : stub d'E/S générique");
+    assert_eq!(st.take_bus_fault(), None, "chip select réel : pas de bus error");
+    st.write8(BLITTER_BASE + blitter_reg::CONTROL, 0x80); // ne doit pas déclencher de blit
 }
 
 #[test]
