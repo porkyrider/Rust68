@@ -33,14 +33,16 @@ src/
                                 (wait-states DRAM/vidéo) + take_bus_fault() + irq_level/irq_ack
   peripherals/
     mfp.rs        (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
+    glue.rs       (~125 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
   systems/
-    atari_st.rs   (~140 l.)  — board ST minimal (RAM/ROM/MFP, cf. section dédiée)
+    atari_st.rs   (~190 l.)  — board ST minimal (RAM/ROM/MFP/GLUE, cf. section dédiée)
   lib.rs                     — exports publics
 tests/
   instructions.rs            — tests unitaires ciblés (CPU)
   interrupts.rs               — tests du mécanisme IPL (Cpu::take_interrupt)
   mfp.rs                      — tests du MFP 68901
-  atari_st.rs                 — tests du board Atari ST (dont 1 test bout-en-bout)
+  glue.rs                      — tests du GLUE (HBL/VBL)
+  atari_st.rs                 — tests du board Atari ST (dont 2 tests bout-en-bout)
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
 ```
 
@@ -299,32 +301,62 @@ reliant tout ce qui précède :
   Shifter…) : chip select réel mais périphérique pas encore émulé →
   lecture neutre `0xFF`, écriture ignorée (pas de bus error, pour ne pas
   casser le polling de statut du logiciel).
-- `irq_level`/`irq_ack` câblent `Mfp::interrupt_requested`/`iack` sur
-  IPL6 (câblage matériel réel ST/STE).
-- `reset_bus` réinitialise le MFP (RESET CPU → `/RESET` périphériques).
+- `irq_level`/`irq_ack` câblent MFP (IPL6), VBL (IPL4) et HBL (IPL2) par
+  priorité décroissante — voir section GLUE ci-dessous.
+- `reset_bus` réinitialise le MFP (RESET CPU → `/RESET` périphériques) ;
+  le GLUE, lui, n'est **pas** réinitialisé (le timing vidéo continue
+  indépendamment d'un `/RESET` CPU sur silicium réel).
+- `AtariSt::tick(cpu_cycles)` fait progresser MFP + GLUE ensemble ; à
+  appeler explicitement par l'appelant après chaque `Cpu::step` (ce crate
+  ne fait pas progresser les périphériques tout seul).
 
 Limitations connues : pas de miroir ROM `0xE00000` (130ST), pas de
 contention DRAM/vidéo (`is_contended` reste `false`, nécessite le
 Shifter), décodage UDS/LDS des adresses paires adjacentes au MFP non
 modélisé précisément.
 
-Testé dans `tests/atari_st.rs` (8 tests), dont un test d'intégration
+Testé dans `tests/atari_st.rs` (11 tests), dont un test d'intégration
 bout-en-bout : un `Cpu` réel prend une interruption GPIP du MFP à travers
 toute la chaîne `Cpu::step` → `Bus::irq_level` → `Bus::irq_ack` →
-`Mfp::iack`, saute au bon handler et relève le masque IPL à 6.
+`Mfp::iack`, saute au bon handler et relève le masque IPL à 6 ; et un
+test de priorité MFP > VBL > HBL acquittés dans l'ordre.
+
+---
+
+## GLUE (nouveau module `src/peripherals/glue.rs`)
+
+`peripherals::glue::Glue` modélise le générateur de timing HBL/VBL de la
+puce GLUE (rôle mémoire/bus de GLUE non couvert — cf. limitations) :
+
+- `tick(cpu_cycles)` avance un compteur de ligne ; à chaque fin de ligne,
+  arme HBL (IPL2) ; à chaque fin de trame (313 lignes en PAL 50 Hz, 263
+  en NTSC 60 Hz — `VideoMode`), arme VBL (IPL4) et incrémente
+  `frame_count()`.
+- `ack_hbl`/`ack_vbl` acquittent (à appeler depuis `Bus::irq_ack`, voir
+  le câblage dans `AtariSt`).
+- `current_line()`/`frame_count()` exposés en lecture pour synchroniser
+  un futur rendu vidéo (Shifter) sur la position de balayage.
+
+Limitations documentées dans le module : uniquement le timing (pas le
+rôle mémoire/bus de GLUE) ; constantes 512 cycles/ligne (PAL) et 508
+(NTSC) usuelles Hatari/WinSTon, non vérifiées contre une référence
+matérielle formelle (aucune suite équivalente à TomHarte n'existe pour
+ce composant, même limitation que pour le MFP).
+
+Testé dans `tests/glue.rs` (5 tests : HBL par ligne, VBL + bouclage de
+ligne en fin de trame, PAL vs NTSC, plusieurs lignes en un seul `tick`).
 
 ---
 
 ## Ce qui reste pour l'émulation Atari ST
 
 Le CPU MC68000 est complet et 100 % conforme en état (cycles en cours de
-finalisation). L'interruption IPL, le MFP 68901 et un board minimal
-(RAM/ROM/MFP) sont en place. Pour émuler un Atari ST complet il faut
-encore :
+finalisation). L'interruption IPL, le MFP 68901, le GLUE (HBL/VBL) et un
+board minimal (RAM/ROM/MFP/GLUE) sont en place. Pour émuler un Atari ST
+complet il faut encore :
 
 | Composant | Priorité |
 |-----------|----------|
-| GLUE (HBL/VBL) | Haute |
 | ACIA 6850 × 2 (clavier/MIDI) | Haute |
 | YM2149 (son + I/O joysticks) | Moyenne |
 | WD1772 (floppy) | Moyenne |
