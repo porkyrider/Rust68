@@ -4,5 +4,6 @@
 //! puces d'un système particulier, que l'appelant câble dans son
 //! implémentation de [`crate::Bus`] (mapping mémoire, génération d'IPL…).
 
+pub mod acia;
 pub mod glue;
 pub mod mfp;

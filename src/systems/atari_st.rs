@@ -8,12 +8,14 @@
 //! nombreux programmes/démos utilisent pour détecter la RAM installée.
 //!
 //! Câblage d'interruption réel ST/STE, par priorité décroissante :
-//! MFP → IPL6, VBL (GLUE) → IPL4, HBL (GLUE) → IPL2.
+//! MFP → IPL6, VBL (GLUE) → IPL4, HBL (GLUE) → IPL2. Les deux ACIA
+//! (clavier + MIDI) ne génèrent pas d'IPL directement : leurs sorties IRQ
+//! sont OR câblées sur `GPIP4` du MFP (câblage réel ST/STE).
 //!
 //! ## Limitations connues (v1)
-//! - Seuls RAM/ROM/MFP sont réellement mappés. Le reste de la zone d'E/S
-//!   (`0xFF8000`-`0xFFFFFF` : ACIA, PSG/YM2149, FDC/DMA, Shifter…) répond
-//!   `0xFF` en lecture et ignore les écritures — chip select réel mais
+//! - RAM/ROM/MFP/ACIA×2 sont réellement mappés. Le reste de la zone d'E/S
+//!   (`0xFF8000`-`0xFFFFFF` : PSG/YM2149, FDC/DMA, Shifter…) répond `0xFF`
+//!   en lecture et ignore les écritures — chip select réel mais
 //!   périphérique pas encore émulé, plutôt qu'un bus error qui casserait
 //!   tout polling de statut par le logiciel.
 //! - Pas de miroir ROM à `0xE00000` (modèles 130ST très anciens).
@@ -27,6 +29,7 @@
 //!   chaque `Cpu::step` (ce crate ne fait pas progresser les
 //!   périphériques tout seul) — voir l'exemple sur `tick`.
 
+use crate::peripherals::acia::{self, Acia};
 use crate::peripherals::glue::{Glue, VideoMode};
 use crate::peripherals::mfp::Mfp;
 use crate::{ADDR_MASK, Bus};
@@ -37,6 +40,15 @@ pub const MFP_BASE: u32 = 0xFFFA01;
 const MFP_REG_COUNT: u32 = 24;
 /// Adresse du dernier registre MFP (`UDR`).
 pub const MFP_END: u32 = MFP_BASE + (MFP_REG_COUNT - 1) * 2;
+
+/// ACIA clavier : registre de contrôle/statut, sur ST/STE réel.
+pub const ACIA_KEYBOARD_CONTROL: u32 = 0xFFFC00;
+/// ACIA clavier : registre de données.
+pub const ACIA_KEYBOARD_DATA: u32 = 0xFFFC02;
+/// ACIA MIDI : registre de contrôle/statut.
+pub const ACIA_MIDI_CONTROL: u32 = 0xFFFC04;
+/// ACIA MIDI : registre de données.
+pub const ACIA_MIDI_DATA: u32 = 0xFFFC06;
 
 /// Début de la zone d'E/S général (ACIA, PSG, FDC, Shifter…) sur ST/STE.
 pub const IO_BASE: u32 = 0xFF8000;
@@ -60,6 +72,12 @@ pub struct AtariSt {
     /// utile en lecture pour synchroniser un rendu vidéo externe sur
     /// `current_line()`/`frame_count()`.
     pub glue: Glue,
+    /// ACIA clavier. Champ public : injecter les octets reçus du
+    /// contrôleur clavier via `push_rx_byte`, lire les commandes envoyées
+    /// par le programme via `take_tx_byte`.
+    pub acia_keyboard: Acia,
+    /// ACIA MIDI (in/out).
+    pub acia_midi: Acia,
     bus_fault: Option<(u32, bool)>,
 }
 
@@ -75,12 +93,16 @@ impl AtariSt {
             rom_base: DEFAULT_ROM_BASE,
             mfp: Mfp::new(),
             glue: Glue::new(VideoMode::Pal50),
+            acia_keyboard: Acia::new(),
+            acia_midi: Acia::new(),
             bus_fault: None,
         }
     }
 
     /// Fait progresser les périphériques (MFP + GLUE) de `cpu_cycles`
-    /// cycles CPU. À appeler par l'appelant après chaque `Cpu::step` :
+    /// cycles CPU, et relaie l'IRQ combinée des deux ACIA sur `GPIP4` du
+    /// MFP (OR câblé, câblage réel ST/STE). À appeler par l'appelant après
+    /// chaque `Cpu::step` :
     ///
     /// ```
     /// use rust68::{Cpu, systems::atari_st::AtariSt};
@@ -94,6 +116,8 @@ impl AtariSt {
     pub fn tick(&mut self, cpu_cycles: u32) {
         self.mfp.tick(cpu_cycles);
         self.glue.tick(cpu_cycles);
+        let acia_irq = self.acia_keyboard.irq_requested() || self.acia_midi.irq_requested();
+        self.mfp.set_gpip_input(4, acia_irq);
     }
 
     fn mfp_offset(addr: u32) -> Option<u8> {
@@ -118,6 +142,13 @@ impl Bus for AtariSt {
         if let Some(off) = Self::mfp_offset(addr) {
             return self.mfp.read(off);
         }
+        match addr {
+            ACIA_KEYBOARD_CONTROL => return self.acia_keyboard.read(acia::reg::CONTROL_STATUS),
+            ACIA_KEYBOARD_DATA => return self.acia_keyboard.read(acia::reg::DATA),
+            ACIA_MIDI_CONTROL => return self.acia_midi.read(acia::reg::CONTROL_STATUS),
+            ACIA_MIDI_DATA => return self.acia_midi.read(acia::reg::DATA),
+            _ => {}
+        }
         if self.in_rom(addr) {
             return self.rom[(addr - self.rom_base) as usize];
         }
@@ -138,6 +169,25 @@ impl Bus for AtariSt {
             self.mfp.write(off, value);
             return;
         }
+        match addr {
+            ACIA_KEYBOARD_CONTROL => {
+                self.acia_keyboard.write(acia::reg::CONTROL_STATUS, value);
+                return;
+            }
+            ACIA_KEYBOARD_DATA => {
+                self.acia_keyboard.write(acia::reg::DATA, value);
+                return;
+            }
+            ACIA_MIDI_CONTROL => {
+                self.acia_midi.write(acia::reg::CONTROL_STATUS, value);
+                return;
+            }
+            ACIA_MIDI_DATA => {
+                self.acia_midi.write(acia::reg::DATA, value);
+                return;
+            }
+            _ => {}
+        }
         if self.in_rom(addr) {
             return; // ROM : écriture ignorée (lecture seule sur silicium réel)
         }
@@ -153,6 +203,8 @@ impl Bus for AtariSt {
         // vidéo continue de tourner indépendamment d'un /RESET CPU (le
         // moniteur reste synchronisé).
         self.mfp = Mfp::new();
+        self.acia_keyboard = Acia::new();
+        self.acia_midi = Acia::new();
     }
 
     fn take_bus_fault(&mut self) -> Option<(u32, bool)> {

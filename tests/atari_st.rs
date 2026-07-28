@@ -1,7 +1,11 @@
 //! Tests du board Atari ST (`rust68::systems::atari_st::AtariSt`).
 
+use rust68::peripherals::acia;
 use rust68::peripherals::mfp::{channel, reg};
-use rust68::systems::atari_st::{AtariSt, DEFAULT_ROM_BASE, IO_BASE, MFP_BASE};
+use rust68::systems::atari_st::{
+    ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
+    DEFAULT_ROM_BASE, IO_BASE, MFP_BASE,
+};
 use rust68::{Bus, Cpu};
 
 #[test]
@@ -173,4 +177,56 @@ fn cpu_prend_une_interruption_mfp_bout_en_bout() {
         pc_avant,
         "le PC de retour empilé doit être celui d'avant l'interruption"
     );
+}
+
+#[test]
+fn acia_mappees_aux_bonnes_adresses() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(ACIA_KEYBOARD_DATA, 0x99); // devrait aller à l'ACIA clavier, pas MIDI
+    assert_eq!(st.acia_keyboard.take_tx_byte(), Some(0x99));
+    assert_eq!(st.acia_midi.take_tx_byte(), None);
+
+    st.write8(ACIA_MIDI_DATA, 0x77);
+    assert_eq!(st.acia_midi.take_tx_byte(), Some(0x77));
+    assert_eq!(st.acia_keyboard.take_tx_byte(), None);
+
+    assert_eq!(
+        st.read8(ACIA_KEYBOARD_CONTROL),
+        st.acia_keyboard.read(acia::reg::CONTROL_STATUS)
+    );
+    assert_eq!(
+        st.read8(ACIA_MIDI_CONTROL),
+        st.acia_midi.read(acia::reg::CONTROL_STATUS)
+    );
+}
+
+#[test]
+fn irq_acia_relayee_via_gpip4_du_mfp() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.mfp.write(reg::DDR, 0x00); // GPIP4 en entrée
+    st.mfp.write(reg::AER, 1 << 4); // front montant
+    st.mfp.write(reg::IERB, 1 << channel::GPIP4);
+    st.mfp.write(reg::IMRB, 1 << channel::GPIP4);
+
+    assert_eq!(st.irq_level(), 0);
+
+    // Activer RIE sur l'ACIA clavier puis recevoir un octet : IRQ demandée.
+    st.acia_keyboard.write(acia::reg::CONTROL_STATUS, 0x80);
+    st.acia_keyboard.push_rx_byte(0x41);
+    assert!(st.acia_keyboard.irq_requested());
+
+    st.tick(4); // fait progresser le câblage GPIP4 (voir AtariSt::tick)
+    assert_eq!(st.irq_level(), 6, "l'IRQ ACIA doit remonter jusqu'au MFP (IPL6)");
+}
+
+#[test]
+fn reset_bus_reinitialise_les_acia() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.acia_keyboard.write(acia::reg::CONTROL_STATUS, 0x80);
+    st.acia_keyboard.push_rx_byte(0x41);
+    assert!(st.acia_keyboard.irq_requested());
+
+    st.reset_bus();
+
+    assert!(!st.acia_keyboard.irq_requested(), "reset_bus doit réinitialiser les ACIA");
 }
