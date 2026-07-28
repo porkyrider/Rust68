@@ -65,8 +65,11 @@ src/
       stx.rs                 — lecteur minimal de disquettes `.stx` (Pasti)
   systems/
     mod.rs                   — `#[cfg(feature = "atari-st")] pub mod atari_st;`
-    atari_st.rs   (~570 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
+    atari_st/
+      mod.rs      (~570 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
                                 Blitter, cf. section dédiée)
+      model.rs               — lexique des modèles ST/STE/Mega ST/Mega STE (RAM, Blitter, TOS
+                                d'origine — cf. section dédiée)
   bin/
     atari_st_sdl2.rs         — frontend SDL2 (vidéo/clavier/souris/son), feature `sdl2-frontend`
   lib.rs                     — exports publics
@@ -410,7 +413,7 @@ contrôle).
 
 ---
 
-## Board Atari ST (`src/systems/atari_st.rs`)
+## Board Atari ST (`src/systems/atari_st/mod.rs`)
 
 `systems::atari_st::AtariSt` implémente `Bus` pour un ST/STE minimal, en
 reliant toutes les puces ci-dessus :
@@ -453,6 +456,53 @@ interruption GPIP→MFP→IPL, priorité MFP/VBL/HBL, ACIA→GPIP4→MFP,
 WD1772→GPIP5→MFP, rendu vidéo, lecture/écriture disquette via DMA, blit
 déclenché via le registre de contrôle, moniteur couleur persistant après
 `/RESET`).
+
+---
+
+## Lexique des modèles (`src/systems/atari_st/model.rs`)
+
+Principe général, valable pour n'importe quelle machine qu'on émule (pas
+seulement celle-ci) : émuler une machine réelle précise, ce n'est pas
+choisir une taille de RAM au hasard puis espérer que ça marche — c'est un
+ensemble de caractéristiques qui vont ensemble (vitesse CPU, RAM
+d'origine, ROM/BIOS attendue, options matérielles). `model::AtariModel`
+rassemble ces caractéristiques pour la gamme ST/STE sous forme
+consultable (`AtariModel::profile() -> MachineProfile`) plutôt que de les
+laisser éparpillées en constantes magiques dans le binaire de
+démonstration.
+
+- 6 modèles couverts : `St520`, `St1040`, `MegaSt`, `Ste520`, `Ste1040`,
+  `MegaSte` — caractéristiques (RAM, Blitter de série, TOS d'origine,
+  fréquence CPU) croisées depuis plusieurs références publiques
+  (Wikipedia, old-computers.com, atari-wiki.com, atari-forum.com).
+- `AtariModel::parse(nom)` : reconnaissance insensible à la casse et aux
+  séparateurs (`"1040ste"`, `"1040STE"`, `"Mega-STE"`…).
+- `AtariSt::from_model(profile, rom)` : construit le board avec la RAM et
+  la présence du Blitter du modèle choisi (`AtariSt::blitter_present`,
+  vérifié par `is_blitter_addr`) ; le ROM est fourni séparément (la
+  version de TOS installée n'est **pas** une propriété du modèle — un ST
+  réel peut très bien tourner avec un TOS plus récent que celui
+  d'origine, mise à jour EPROM courante). La base ROM (`0xFC0000` vs
+  `0xE00000`) reste réglée indépendamment via `set_rom_base`, déjà
+  auto-détectée depuis `os_version` dans l'en-tête TOS.
+- Binaire de démonstration : `--model <nom>` (défaut `1040ste`), voir
+  `atari_st_sdl2 --help` pour la liste. Exemple :
+  `cargo run --release --features sdl2-frontend --bin atari_st_sdl2 --
+  --model 520ste tos162.img disque.stx`.
+
+Ce qui n'est **pas** (encore) modélisé par ce lexique :
+- `cpu_hz` est informatif seulement : le rythme MFP (ratio horloge fixe
+  192/625) et le pacing audio du binaire `atari_st_sdl2` supposent tous
+  les deux un CPU à 8 MHz. Choisir un modèle Mega STE ne fait donc pas
+  tourner l'émulation à 16 MHz.
+- Le Mega ST est modélisé Blitter présent par défaut (support PLCC
+  existant sur toutes les cartes mères mais pas systématiquement peuplé
+  en usine sur les premières séries) — à ajuster manuellement via
+  `MachineProfile.has_blitter` si besoin d'un Mega ST sans Blitter précis.
+
+Testé dans `src/systems/atari_st/model.rs` (3 tests unitaires) et
+`tests/atari_st.rs` (1 test bout-en-bout : RAM/Blitter réglés d'après le
+modèle).
 
 ---
 
