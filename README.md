@@ -74,3 +74,9 @@ Modes d'adressage : tous les modes du 68000 (`Dn`, `An`, `(An)`, `(An)+`,
 
 Le squelette de décodage est conçu pour accueillir le reste du jeu
 d'instructions sans refonte.
+
+## Licence
+
+[GNU General Public License v3.0 ou ultérieure](LICENSE) (GPL-3.0-or-later).
+Toute redistribution, y compris dans un projet fermé ou commercial, doit
+republier le code source de ses modifications sous les mêmes termes.
