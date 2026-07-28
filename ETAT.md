@@ -38,31 +38,36 @@ régressions et de visualiser les progrès instruction par instruction.
 
 ```
 src/
-  cpu.rs          (~490 l.)  — registres, SR, USP/SSP, fetch_word, take_exception,
-                                take_bus_error_full, take_interrupt, exception_log
+  cpu.rs          (~520 l.)  — registres, SR, USP/SSP, fetch_word, take_exception,
+                                take_bus_error_full, take_interrupt, take_trace_exception,
+                                exception_log
   addressing.rs   (~380 l.)  — Operand, Size, resolve_ea (tous les modes 68000)
-  execute.rs     (~2790 l.)  — décodage et exécution de toutes les instructions
+  execute.rs     (~2810 l.)  — décodage et exécution de toutes les instructions
   bus.rs          (~195 l.)  — trait Bus + FlatBus (16 Mo RAM plate) + TimedBus
                                 (wait-states DRAM/vidéo) + take_bus_fault() + irq_level/irq_ack
   peripherals/
     mfp.rs        (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
-    glue.rs       (~125 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
+    glue.rs       (~130 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
     acia.rs       (~150 l.)  — MC6850 ACIA (chip seul, cf. section dédiée)
     ym2149.rs     (~375 l.)  — PSG YM2149 (chip seul, cf. section dédiée)
     shifter.rs    (~265 l.)  — vidéo Shifter (chip seul, cf. section dédiée)
     wd1772.rs     (~370 l.)  — contrôleur disquette WD1772 (chip seul, cf. section dédiée)
+    blitter.rs    (~340 l.)  — coprocesseur BitBlt Blitter (chip seul, cf. section dédiée)
   systems/
-    atari_st.rs   (~440 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772, cf. section dédiée)
+    atari_st.rs   (~490 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
+                                Blitter, cf. section dédiée)
   lib.rs                     — exports publics
 tests/
   instructions.rs            — tests unitaires ciblés (CPU)
   interrupts.rs               — tests du mécanisme IPL (Cpu::take_interrupt)
+  trace.rs                     — tests du mode trace (Cpu::take_trace_exception)
   mfp.rs                      — tests du MFP 68901
   glue.rs                      — tests du GLUE (HBL/VBL)
   acia.rs                      — tests du MC6850 ACIA
   ym2149.rs                    — tests du PSG YM2149
   shifter.rs                   — tests de la vidéo Shifter
   wd1772.rs                    — tests du contrôleur disquette WD1772
+  blitter.rs                   — tests du Blitter
   atari_st.rs                 — tests du board Atari ST (dont plusieurs tests bout-en-bout)
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
 ```
@@ -140,6 +145,24 @@ niveau accepté, cycle d'acquittement via deux méthodes du trait `Bus` :
 Coût approximatif de 44 cycles (aucune suite TomHarte ne couvre les
 interruptions). Testé dans `tests/interrupts.rs`. Pas géré : réveil sur
 STOP, edge-detect propre du niveau 7.
+
+### Trace (bit T du SR)
+Le 68000 déclenche l'exception vecteur 9 après chaque instruction si le
+bit T du SR est actif à la fin de celle-ci (relu après l'instruction, pas
+avant : une instruction qui pose T elle-même — MOVE/ANDI/ORI to SR, RTE
+qui dépile un SR avec T=1 — se trace donc dès sa propre fin). TomHarte
+capture volontairement l'effet d'une seule instruction sans enchaîner sur
+la trace même quand T=1 en entrée (le `final.sr`/`final.pc` d'un NOP avec
+T=1 est identique à T=0, aucun frame poussé) : `Cpu::step` ne prend donc
+**pas** l'exception lui-même, il pose `Cpu::trace_pending` à vrai — à
+l'appelant (une vraie boucle d'émulation, pas le harnais de conformité)
+d'appeler `Cpu::take_trace_exception` après chaque `step` s'il veut
+l'effet réel, avant le `step` suivant (préserve la priorité
+trace-avant-interruption du silicium). Frame standard 6 octets, coût de
+34 cycles. Aucune exception logicielle interne à l'instruction (TRAP,
+CHK, division par zéro, ILLEGAL, Line-A/F, violation de privilège) ne
+déclenche de trace supplémentaire : leur propre `take_exception` efface
+déjà T en entrant dans leur frame. Testé dans `tests/trace.rs` (7 tests).
 
 ### Journal diagnostique
 `Cpu::exception_log` : buffer circulaire (`EXCEPTION_LOG_CAP` = 4096) des
@@ -326,6 +349,43 @@ via DMA).
 
 ---
 
+## Blitter (`src/peripherals/blitter.rs`)
+
+`peripherals::blitter::Blitter` modélise le coprocesseur de transfert de
+blocs (BitBlt) de l'Atari STE seul : combine un mot source (optionnellement
+décalé bit à bit via `skew`), un motif de demi-teinte, et le contenu
+destination, via une fonction booléenne programmable (`OP`, une des 16
+fonctions à 2 entrées, convention de table de vérité standard partagée par
+de nombreuses puces "raster op"), avec masquage de bord de ligne
+(`ENDMASK1/2/3`) et parcours par incréments X/Y. Mappé dans `AtariSt` à
+`0xFF8A00` (champ public `blitter`) ; `execute()` prend un `Bus` (adapté
+vers la RAM du board via un petit type `RamBus` interne) et exécute le
+blit en entier de façon synchrone, déclenché par l'écriture du bit
+BUSY/START du registre de contrôle.
+
+**Limitations à prendre avec prudence** (aucune suite équivalente à
+TomHarte n'existe pour ce périphérique) :
+- `skew` (décalage bit à bit du mot source, pour aligner des images non
+  alignées sur un mot) : implémenté d'après ma meilleure compréhension du
+  mécanisme documenté, **non vérifié contre une référence matérielle
+  réelle ou un émulateur existant**. `NFSR`/`FXSR` non modélisés
+  distinctement (une lecture d'amorçage est toujours faite si `skew!=0`).
+- Mode "dessin de ligne" (line number pour du tracé de polygone) non
+  implémenté : seul le blit rectangulaire standard est couvert.
+- Pas de vol de cycles bus au CPU modélisé (bit HOG/STEAL) : le blit
+  s'exécute intégralement de façon synchrone, `BUSY` jamais observable
+  par polling.
+- Halftone : le mot utilisé par ligne cycle `halftone[line % 16]`,
+  `line` incrémentant à chaque ligne Y — comportement usuel documenté,
+  non vérifié indépendamment.
+
+Testé dans `tests/blitter.rs` (8 tests : table de vérité OP, HOP, endmask,
+parcours X/Y, cycle halftone, skew=0) et `tests/atari_st.rs` (3 tests
+supplémentaires, dont un blit bout-en-bout déclenché via le registre de
+contrôle).
+
+---
+
 ## Board Atari ST (`src/systems/atari_st.rs`)
 
 `systems::atari_st::AtariSt` implémente `Bus` pour un ST/STE minimal, en
@@ -337,7 +397,9 @@ reliant toutes les puces ci-dessus :
   `mfp`). ACIA clavier (`0xFFFC00`/`02`) et MIDI (`0xFFFC04`/`06`), champs
   publics `acia_keyboard`/`acia_midi`. YM2149 (`0xFF8800`/`02`, champ
   `ym2149`). Shifter (`0xFF8201`+, champ `shifter`). WD1772/DMA
-  (`0xFF8604`+, champs `wd1772`/`floppy_a`).
+  (`0xFF8604`+, champs `wd1772`/`floppy_a`). Blitter (`0xFF8A00`+, champ
+  `blitter`, déclenché par l'écriture du bit BUSY/START de son registre
+  de contrôle).
 - Le "trou" physique entre le haut de la RAM installée et `0xFF8000`
   déclenche un bus error via `take_bus_fault` — mécanisme utilisé par de
   nombreux programmes/démos pour détecter la RAM installée.
@@ -362,20 +424,30 @@ contention DRAM/vidéo (`is_contended` reste `false`) ; décodage UDS/LDS
 des adresses paires adjacentes au MFP non modélisé précisément ;
 registres DMA/WD1772 simplifiés (voir section WD1772).
 
-Testé dans `tests/atari_st.rs` (27 tests, dont plusieurs bout-en-bout :
+Testé dans `tests/atari_st.rs` (30 tests, dont plusieurs bout-en-bout :
 interruption GPIP→MFP→IPL, priorité MFP/VBL/HBL, ACIA→GPIP4→MFP,
-WD1772→GPIP5→MFP, rendu vidéo, lecture/écriture disquette via DMA).
+WD1772→GPIP5→MFP, rendu vidéo, lecture/écriture disquette via DMA, blit
+déclenché via le registre de contrôle).
 
 ---
 
 ## Ce qui reste pour l'émulation Atari ST
 
-Le CPU MC68000 est complet, 100 % conforme en état ET 100 % cycle-exact.
-L'interruption IPL, le MFP 68901, le GLUE, les deux ACIA 6850, le YM2149,
-le Shifter, le WD1772 et un board minimal sont en place. Pour émuler un
-Atari ST complet il reste :
+Le CPU MC68000 est complet, 100 % conforme en état ET 100 % cycle-exact,
+trace mode compris. L'interruption IPL, le MFP 68901, le GLUE, les deux
+ACIA 6850, le YM2149, le Shifter, le WD1772, le Blitter et un board
+minimal reliant tout ça sont en place — tous les composants de la feuille
+de route initiale sont couverts.
 
-| Composant | Priorité |
-|-----------|----------|
-| Blitter | Basse |
-| Trace mode (bit T SR) | Basse |
+Pistes pour aller plus loin (aucune n'est un blocage, ce sont des
+approfondissements) :
+- Support `.stx` pour le WD1772 (protections par secteur).
+- Pipeline de sortie audio (PCM) pour le YM2149 et vidéo (fenêtre/
+  framebuffer réel) pour le Shifter — actuellement exposés comme données
+  brutes (niveaux de canal, RGB par ligne) à charge d'un binaire hôte.
+- Vérification des points documentés comme non confirmés contre une
+  référence matérielle réelle (timing MFP/GLUE, skew du Blitter,
+  polarité haute résolution du Shifter).
+- Contention DRAM/vidéo pour les accès Shifter/Blitter (mécanisme déjà
+  générique via `Bus::is_contended`, pas encore branché sur ces deux
+  puces).
