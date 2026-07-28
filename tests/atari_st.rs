@@ -2,9 +2,10 @@
 
 use rust68::peripherals::acia;
 use rust68::peripherals::mfp::{channel, reg};
+use rust68::peripherals::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
-    DEFAULT_ROM_BASE, IO_BASE, MFP_BASE,
+    DEFAULT_ROM_BASE, IO_BASE, MFP_BASE, YM2149_DATA, YM2149_SELECT,
 };
 use rust68::{Bus, Cpu};
 
@@ -49,7 +50,7 @@ fn trou_physique_declenche_bus_fault() {
 #[test]
 fn peripherique_non_emule_repond_neutre_sans_fault() {
     let mut st = AtariSt::new(0x1000, vec![]);
-    let addr = IO_BASE + 0x800; // ex: zone PSG, pas modélisée
+    let addr = IO_BASE + 0x604; // ex: zone FDC/DMA, pas encore modélisée
     assert_eq!(st.read8(addr), 0xFF);
     assert_eq!(st.take_bus_fault(), None, "chip select réel : pas de bus error");
     st.write8(addr, 0x12); // ne doit pas paniquer, simplement ignoré
@@ -229,4 +230,40 @@ fn reset_bus_reinitialise_les_acia() {
     st.reset_bus();
 
     assert!(!st.acia_keyboard.irq_requested(), "reset_bus doit réinitialiser les ACIA");
+}
+
+#[test]
+fn ym2149_mappe_a_ff8800_ff8802() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(YM2149_SELECT, ym2149::reg::AMPLITUDE_A);
+    st.write8(YM2149_DATA, 0x0F);
+    assert_eq!(st.read8(YM2149_SELECT), ym2149::reg::AMPLITUDE_A);
+    assert_eq!(st.read8(YM2149_DATA), 0x0F);
+    assert_eq!(
+        st.ym2149.channel_level(0),
+        0,
+        "sans activer de porte tonalité/bruit dans MIXER, le canal reste coupé"
+    );
+}
+
+#[test]
+fn tick_fait_progresser_le_ym2149() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(YM2149_SELECT, ym2149::reg::MIXER);
+    st.write8(YM2149_DATA, 0b0000_1001); // portes tonalité+bruit A ouvertes
+    st.write8(YM2149_SELECT, ym2149::reg::AMPLITUDE_A);
+    st.write8(YM2149_DATA, 0x0F);
+
+    st.tick(4);
+    assert_eq!(st.ym2149.channel_level(0), 30, "le YM2149 doit avoir été cadencé par tick()");
+}
+
+#[test]
+fn reset_bus_reinitialise_le_ym2149() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(YM2149_SELECT, ym2149::reg::AMPLITUDE_A);
+    st.write8(YM2149_DATA, 0x0F);
+    st.reset_bus();
+    st.write8(YM2149_SELECT, ym2149::reg::AMPLITUDE_A);
+    assert_eq!(st.read8(YM2149_DATA), 0, "reset_bus doit réinitialiser le YM2149");
 }

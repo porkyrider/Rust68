@@ -7,3 +7,4 @@
 pub mod acia;
 pub mod glue;
 pub mod mfp;
+pub mod ym2149;

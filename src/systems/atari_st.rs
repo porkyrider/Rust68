@@ -13,11 +13,11 @@
 //! sont OR câblées sur `GPIP4` du MFP (câblage réel ST/STE).
 //!
 //! ## Limitations connues (v1)
-//! - RAM/ROM/MFP/ACIA×2 sont réellement mappés. Le reste de la zone d'E/S
-//!   (`0xFF8000`-`0xFFFFFF` : PSG/YM2149, FDC/DMA, Shifter…) répond `0xFF`
-//!   en lecture et ignore les écritures — chip select réel mais
-//!   périphérique pas encore émulé, plutôt qu'un bus error qui casserait
-//!   tout polling de statut par le logiciel.
+//! - RAM/ROM/MFP/ACIA×2/YM2149 sont réellement mappés. Le reste de la zone
+//!   d'E/S (`0xFF8000`-`0xFFFFFF` : FDC/DMA, Shifter…) répond `0xFF` en
+//!   lecture et ignore les écritures — chip select réel mais périphérique
+//!   pas encore émulé, plutôt qu'un bus error qui casserait tout polling
+//!   de statut par le logiciel.
 //! - Pas de miroir ROM à `0xE00000` (modèles 130ST très anciens).
 //! - Pas de modèle de contention DRAM/vidéo (`is_contended` reste à
 //!   `false` : nécessite le Shifter, pas encore implémenté).
@@ -32,6 +32,7 @@
 use crate::peripherals::acia::{self, Acia};
 use crate::peripherals::glue::{Glue, VideoMode};
 use crate::peripherals::mfp::Mfp;
+use crate::peripherals::ym2149::{self, Ym2149};
 use crate::{ADDR_MASK, Bus};
 
 /// Adresse du premier registre MFP (`GPIP`), sur ST/STE réel.
@@ -49,6 +50,12 @@ pub const ACIA_KEYBOARD_DATA: u32 = 0xFFFC02;
 pub const ACIA_MIDI_CONTROL: u32 = 0xFFFC04;
 /// ACIA MIDI : registre de données.
 pub const ACIA_MIDI_DATA: u32 = 0xFFFC06;
+
+/// YM2149 : registre sélecteur (écriture = choix du registre, lecture =
+/// registre actuellement sélectionné), sur ST/STE réel.
+pub const YM2149_SELECT: u32 = 0xFF8800;
+/// YM2149 : registre de données du registre actuellement sélectionné.
+pub const YM2149_DATA: u32 = 0xFF8802;
 
 /// Début de la zone d'E/S général (ACIA, PSG, FDC, Shifter…) sur ST/STE.
 pub const IO_BASE: u32 = 0xFF8000;
@@ -78,6 +85,10 @@ pub struct AtariSt {
     pub acia_keyboard: Acia,
     /// ACIA MIDI (in/out).
     pub acia_midi: Acia,
+    /// PSG YM2149 (son + ports d'E/S). Champ public : lire les niveaux de
+    /// sortie audio via `channel_level`, injecter les entrées des ports
+    /// A/B (joystick/souris/lecteur, câblage non interprété par ce board).
+    pub ym2149: Ym2149,
     bus_fault: Option<(u32, bool)>,
 }
 
@@ -95,14 +106,15 @@ impl AtariSt {
             glue: Glue::new(VideoMode::Pal50),
             acia_keyboard: Acia::new(),
             acia_midi: Acia::new(),
+            ym2149: Ym2149::new(),
             bus_fault: None,
         }
     }
 
-    /// Fait progresser les périphériques (MFP + GLUE) de `cpu_cycles`
-    /// cycles CPU, et relaie l'IRQ combinée des deux ACIA sur `GPIP4` du
-    /// MFP (OR câblé, câblage réel ST/STE). À appeler par l'appelant après
-    /// chaque `Cpu::step` :
+    /// Fait progresser les périphériques (MFP + GLUE + YM2149) de
+    /// `cpu_cycles` cycles CPU, et relaie l'IRQ combinée des deux ACIA sur
+    /// `GPIP4` du MFP (OR câblé, câblage réel ST/STE). À appeler par
+    /// l'appelant après chaque `Cpu::step` :
     ///
     /// ```
     /// use rust68::{Cpu, systems::atari_st::AtariSt};
@@ -116,6 +128,7 @@ impl AtariSt {
     pub fn tick(&mut self, cpu_cycles: u32) {
         self.mfp.tick(cpu_cycles);
         self.glue.tick(cpu_cycles);
+        self.ym2149.tick(cpu_cycles);
         let acia_irq = self.acia_keyboard.irq_requested() || self.acia_midi.irq_requested();
         self.mfp.set_gpip_input(4, acia_irq);
     }
@@ -147,6 +160,8 @@ impl Bus for AtariSt {
             ACIA_KEYBOARD_DATA => return self.acia_keyboard.read(acia::reg::DATA),
             ACIA_MIDI_CONTROL => return self.acia_midi.read(acia::reg::CONTROL_STATUS),
             ACIA_MIDI_DATA => return self.acia_midi.read(acia::reg::DATA),
+            YM2149_SELECT => return self.ym2149.read(ym2149::bus_offset::SELECT),
+            YM2149_DATA => return self.ym2149.read(ym2149::bus_offset::DATA),
             _ => {}
         }
         if self.in_rom(addr) {
@@ -186,6 +201,14 @@ impl Bus for AtariSt {
                 self.acia_midi.write(acia::reg::DATA, value);
                 return;
             }
+            YM2149_SELECT => {
+                self.ym2149.write(ym2149::bus_offset::SELECT, value);
+                return;
+            }
+            YM2149_DATA => {
+                self.ym2149.write(ym2149::bus_offset::DATA, value);
+                return;
+            }
             _ => {}
         }
         if self.in_rom(addr) {
@@ -205,6 +228,7 @@ impl Bus for AtariSt {
         self.mfp = Mfp::new();
         self.acia_keyboard = Acia::new();
         self.acia_midi = Acia::new();
+        self.ym2149 = Ym2149::new();
     }
 
     fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
