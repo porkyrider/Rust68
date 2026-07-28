@@ -19,15 +19,16 @@ projet fermé/commercial sans republication des modifications.
 
 | Catégorie | Nombre |
 |-----------|--------|
-| **Réussis (état registres/RAM)** | **317 099** |
-| Échecs (état registres/RAM) | **0** |
-| dont corrects en état mais avec un nombre de cycles erroné | 401 |
-| **Total tests** | **317 099** |
+| **Réussis (état registres/RAM ET cycles)** | **317 500** |
+| Échecs | **0** |
+| **Total tests** | **317 500** |
 
-**Conformité état (registres/RAM) : 100 %.**
-**Conformité cycle-exacte : 99.87 %** (401 cas sur 317 099 ont le bon
-résultat mais un coût en cycles encore faux — chantier en cours, non
-bloquant, cf. section Timing ci-dessous).
+**Conformité état (registres/RAM) : 100 %. Conformité cycle-exacte : 100 %.**
+Les deux derniers foyers de résidus (CHK, 388 cas ; `MOVE` avec dst
+`(xxx).L` en address error, 13 cas) — précédemment documentés comme un
+« plancher matériel data-dépendant » supposé non résoluble — ont en fait
+été résolus le 2026-07-28 : voir section Timing ci-dessous pour les deux
+règles cachées trouvées par recherche exhaustive contre TomHarte.
 
 Les 12 échecs `SBCD` documentés dans le commit initial (nibbles BCD
 invalides, ">9") sont **résolus** : voir « Bug SBCD » ci-dessous.
@@ -48,8 +49,9 @@ src/
     mfp.rs        (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
     glue.rs       (~125 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
     acia.rs       (~150 l.)  — MC6850 ACIA (chip seul, cf. section dédiée)
+    ym2149.rs     (~375 l.)  — PSG YM2149 (chip seul, cf. section dédiée)
   systems/
-    atari_st.rs   (~240 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA, cf. section dédiée)
+    atari_st.rs   (~265 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149, cf. section dédiée)
   lib.rs                     — exports publics
 tests/
   instructions.rs            — tests unitaires ciblés (CPU)
@@ -57,6 +59,7 @@ tests/
   mfp.rs                      — tests du MFP 68901
   glue.rs                      — tests du GLUE (HBL/VBL)
   acia.rs                      — tests du MC6850 ACIA
+  ym2149.rs                    — tests du PSG YM2149
   atari_st.rs                 — tests du board Atari ST (dont 3 tests bout-en-bout)
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
 ```
@@ -147,7 +150,7 @@ au calcul du résultat ni régresser `ABCD`/`NBCD`.
 
 ---
 
-## Timing cycle-exact (chantier en cours)
+## Timing cycle-exact (résolu — 100 %)
 
 Plusieurs passes de mise en conformité des coûts en cycles (au-delà de
 l'état registres/RAM, déjà correct à 100 %) :
@@ -183,28 +186,35 @@ l'état registres/RAM, déjà correct à 100 %) :
      matériel supplémentaire avant le write cycle). Dérivé et vérifié par
      analyse exhaustive des ~90 combinaisons mode-source × mode-dest ×
      taille dans les jeux de test TomHarte (1253 cas sur 1266 résolus).
+4. **Les deux derniers foyers de résidus** (2026-07-28), longtemps
+   documentés ici comme un « plancher matériel data-dépendant » supposé
+   non résoluble — l'hypothèse était fausse : il manquait juste la bonne
+   corrélation, trouvée par recherche exhaustive bit-à-bit contre TomHarte
+   (même méthode que la redérivation DIVU/DIVS ci-dessus) :
+   - **CHK** (388 cas) : le coût du trap `Dn<0` (38 ou 40 cycles) ne
+     dépend pas de la comparaison mathématique vraie entre `Dn` et la
+     borne, mais du résultat de la soustraction interne `Dn - borne`
+     **telle qu'un CMP la calculerait**, tronquée 16 bits signés : quand
+     `Dn` est très négatif et la borne très positive, cette soustraction
+     déborde et son bit de signe peut différer du signe "réel" de
+     `Dn - borne`. Règle : 40 cycles si `(Dn - borne)` signé 16 bits est
+     `<= 0`, 38 sinon. Vérifié exhaustivement sur les 181 cas TomHarte
+     `Dn<0` (0 écart) ; le cas `Dn>borne` reste un flat 38 (confirmé
+     inchangé sur 124 cas). Un essai antérieur de "toujours 38" avait
+     empiré le score (388 → 402) faute d'avoir identifié cette règle.
+   - **`MOVE.w`/`MOVE.l` avec dst `(xxx).L` en address error** (13 cas) :
+     le coût dépend de si la **source** a nécessité une lecture mémoire
+     ou non (`Dn`/`An` direct vs tout autre mode) — le recouvrement entre
+     le fetch des 2 mots d'extension d'adresse de destination et un
+     éventuel cycle de lecture source décale le timing du write raté de
+     4 cycles. Correction nulle si source registre, -4 sinon. Vérifié
+     exhaustivement sur les 27 cas TomHarte concernés (0 écart) — la
+     précédente conclusion « répartition 50/50 non corrélée » (2026-07-27)
+     n'avait simplement pas testé cette corrélation-là.
 
-Progression globale : 60 106 → **401** échecs de cycle-count (-99.3 %),
-sans jamais régresser l'état registres/RAM.
-
-Résidus documentés, non résolus, **data-dépendants** (le coût varie entre
-deux valeurs pour des opérandes structurellement identiques — comparable à
-la note MAME sur TRAPV ; une correction naïve a déjà empiré le score par le
-passé, voir commentaire dans `op_line_4`/CHK) :
-- `CHK` (388 cas) : le coût de l'exception vecteur 6 (`Dn<0` vs `Dn>bound`)
-  varie entre 38 et 40 pour des cas structurellement identiques.
-- `MOVE.w`/`MOVE.l` avec dst `(xxx).L` en address error (13 cas) : varie
-  entre deux valeurs (écart de 4) selon un facteur non identifié.
-
-Confirmation empirique (2026-07-27) : pour `MOVE (xxx).L` dst, sur
-l'ensemble des cas structurellement identiques (même src_mode/dst_mode/
-taille) qui déclenchent une address error sur l'écriture, la répartition
-est quasi 50/50 entre les deux coûts possibles (14 cas à correction 0,
-13 cas à correction -4) — changer la constante ne ferait que déplacer
-l'échec vers l'autre moitié, pas le réduire. Ce n'est donc pas une
-formule qui manque mais un vrai plancher matériel (comme documenté pour
-CHK) : ces 401 cas ne sont pas résolubles sans modéliser le pipeline
-d'instruction cycle par cycle (au-delà du modèle actuel table+bus).
+Progression globale : 60 106 → **0** échec de cycle-count. **317 500/317 500
+(100 %) sur l'ensemble de la suite TomHarte**, état ET cycles, sans
+régression à aucune étape.
 
 ---
 
@@ -400,18 +410,51 @@ transmission, IRQ soumise à RIE/TIE, master reset).
 
 ---
 
+## YM2149 (nouveau module `src/peripherals/ym2149.rs`)
+
+`peripherals::ym2149::Ym2149` modélise la puce seule (compatible registre à
+registre avec le General Instrument AY-3-8910) : 3 canaux de tonalité
+carrée, un générateur de bruit partagé, un générateur d'enveloppe, 2 ports
+d'E/S 8 bits. Mappée dans `AtariSt` (champ public `ym2149`) au sélecteur
+`0xFF8800` / données `0xFF8802`, cadencée par `AtariSt::tick` (CPU/4 = 2 MHz
+sur ST/STE). Ne génère pas d'IPL (pas d'interruption sur ST).
+
+- 16 registres avec masquage exact de leur largeur réelle (ex: tone coarse
+  4 bits, période de bruit 5 bits, forme d'enveloppe 4 bits).
+- Générateurs de tonalité (3×) et de bruit (LFSR 17 bits, polynôme
+  standard bit0 XOR bit3) pilotés par `tick()`.
+- Générateur d'enveloppe : rampe 5 bits (résolution double de l'ampli fixe
+  4 bits), table des 10 formes standard (Continue/Attack/Alternate/Hold)
+  reconstruite depuis la description technique publique du fabricant
+  d'origine (datasheet General Instrument AY-3-8910), pas empruntée à un
+  émulateur existant. Écrire le registre de forme relance toujours
+  l'enveloppe depuis le début (comportement documenté du silicium).
+- `channel_level(canal)` : niveau 0-31 combinant le portillonnage
+  tonalité/bruit (`MIXER`) et l'amplitude fixe ou l'enveloppe — pas de
+  conversion en échantillons PCM (à la charge d'un futur pipeline audio,
+  cf. limitations du module).
+- Ports A/B : registres 8 bits bruts, direction par bits 6-7 de `MIXER` ;
+  signification des bits (sélection lecteur, joystick, Centronics…) non
+  interprétée, à charge du board/de l'appelant.
+
+Testé dans `tests/ym2149.rs` (9 tests : masquage des registres, bascule de
+tonalité, portillonnage mixer, bruit, plusieurs formes d'enveloppe dont le
+figement en fin de rampe et le relancement sur écriture, direction des
+ports).
+
+---
+
 ## Ce qui reste pour l'émulation Atari ST
 
-Le CPU MC68000 est complet et 100 % conforme en état (cycles en cours de
-finalisation). L'interruption IPL, le MFP 68901, le GLUE (HBL/VBL), les
-deux ACIA 6850 et un board minimal (RAM/ROM/MFP/GLUE/ACIA) sont en place.
-Pour émuler un Atari ST complet il faut encore :
+Le CPU MC68000 est complet, 100 % conforme en état ET 100 % cycle-exact
+(voir section Timing). L'interruption IPL, le MFP 68901, le GLUE
+(HBL/VBL), les deux ACIA 6850, le YM2149 et un board minimal
+(RAM/ROM/MFP/GLUE/ACIA/YM2149) sont en place. Pour émuler un Atari ST
+complet il faut encore :
 
 | Composant | Priorité |
 |-----------|----------|
-| YM2149 (son + I/O joysticks) | Moyenne |
 | WD1772 (floppy) | Moyenne |
 | Shifter (vidéo ST low/med/high) | Moyenne |
 | Blitter | Basse |
-| Finaliser le timing cycle-exact (401 résidus, plancher matériel data-dépendant) | Basse |
 | Trace mode (bit T SR) | Basse |
