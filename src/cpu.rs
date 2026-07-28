@@ -129,6 +129,17 @@ pub struct Cpu {
     /// drapeau (le remet à faux) à chaque appel, qu'une interruption soit
     /// prise ou non.
     pub sr_write_pending_delay: bool,
+    /// Vrai si un double bus fault a été détecté : un bus/address error
+    /// est survenu alors que le CPU empilait déjà le frame d'un précédent
+    /// bus/address error (ou lisait son vecteur), typiquement parce que le
+    /// pointeur de pile actif pointe lui-même dans une zone sans chip
+    /// select. Sur silicium 68000 réel, le CPU s'arrête alors
+    /// définitivement (HALT) : seul un `/RESET` matériel externe peut
+    /// l'en sortir — il ne "rebondit" pas indéfiniment sur le vecteur.
+    /// [`Cpu::step`] renvoie [`crate::execute::StepError::DoubleFault`]
+    /// tant que ce champ reste vrai, plutôt que de continuer à exécuter
+    /// des instructions dans un état indéfini.
+    pub halted: bool,
 }
 
 /// Taille max de `Cpu::exception_log` — assez pour couvrir plusieurs frames
@@ -165,6 +176,7 @@ impl Cpu {
             exception_log: std::collections::VecDeque::new(),
             trace_pending: false,
             sr_write_pending_delay: false,
+            halted: false,
         }
     }
 
@@ -241,6 +253,7 @@ impl Cpu {
         self.a[SP] = self.ssp;
         self.pc = pc;
         self.cycles = 0;
+        self.halted = false;
     }
 
     // --- Mécanisme d'exception ----------------------------------------------
@@ -265,10 +278,20 @@ impl Cpu {
         self.a[SP] = sp;
         bus.write16(sp & ADDR_MASK, saved_sr);
         bus.write32((sp + 2) & ADDR_MASK, pc_to_push);
+        // Un bus/address error ici (pile hors de toute zone mappée) est un
+        // double bus fault — voir la doc de `Cpu::halted`.
+        if bus.take_bus_fault().is_some() {
+            self.halted = true;
+            return;
+        }
 
         // Lire l'adresse du vecteur
         let vec_addr = (vector * 4) & ADDR_MASK;
         let new_pc = bus.read32(vec_addr);
+        if bus.take_bus_fault().is_some() {
+            self.halted = true;
+            return;
+        }
         self.log_exception(vector, pc_to_push, 0, false, new_pc);
         // TomHarte convention : final.pc = m_au = new_pc + 4.
         // Notre modèle: cpu.pc + 4 = final.pc → cpu.pc = new_pc.
@@ -383,8 +406,20 @@ impl Cpu {
         bus.write16(sp.wrapping_add(6) & ADDR_MASK, ir);
         bus.write16(sp.wrapping_add(8) & ADDR_MASK, saved_sr);
         bus.write32(sp.wrapping_add(10) & ADDR_MASK, pc_at_access);
+        // Un bus/address error en empilant CE frame (pile hors de toute zone
+        // mappée) est un double bus fault — voir la doc de `Cpu::halted`.
+        // Sur silicium réel le CPU s'arrête alors définitivement au lieu de
+        // rebondir indéfiniment sur le vecteur avec un frame corrompu.
+        if bus.take_bus_fault().is_some() {
+            self.halted = true;
+            return;
+        }
 
         let new_pc = bus.read32(vector * 4);
+        if bus.take_bus_fault().is_some() {
+            self.halted = true;
+            return;
+        }
         self.log_exception(vector, pc_at_access, fault_addr, is_write, new_pc);
         self.pc = new_pc;
     }

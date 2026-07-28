@@ -14,6 +14,13 @@ pub enum StepError {
     /// Accès word/long à une adresse impaire : address error (vecteur 3).
     /// Champs : (adresse_impaire, is_write, pc_au_moment_de_l_acces)
     AddressError(u32, bool, u32),
+    /// Double bus fault : un bus/address error est survenu en empilant le
+    /// frame d'un précédent bus/address error (typiquement un pointeur de
+    /// pile hors de toute zone mappée). Sur 68000 réel, le CPU s'arrête
+    /// alors définitivement — voir [`crate::cpu::Cpu::halted`]. Renvoyé en
+    /// boucle par [`Cpu::step`] tant que ce champ reste vrai (seul un
+    /// `Cpu::reset` matériel le réinitialise).
+    DoubleFault,
 }
 
 /// Convertit une erreur d'adresse de lecture en StepError.
@@ -366,6 +373,13 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut impl Bus) -> Result<u32, StepError> {
+        // Double bus fault (voir `Cpu::halted`) : le 68000 réel reste figé
+        // jusqu'à un /RESET matériel externe, il ne reprend jamais tout
+        // seul — ne serait-ce que réévaluer les interruptions serait déjà
+        // trop en faire.
+        if self.halted {
+            return Err(StepError::DoubleFault);
+        }
         // Les interruptions sont reconnues à la frontière entre deux
         // instructions (pas en cours d'exécution) : vérifiées avant même le
         // fetch de l'opcode suivant, en dehors de tout TimedBus puisqu'un
