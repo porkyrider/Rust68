@@ -14,26 +14,27 @@
 //! [`Blitter::read`]/[`Blitter::write`] dans son `Bus` et de déclencher
 //! `execute` quand le bit START du registre de contrôle est écrit.
 //!
+//! Registres et sémantique des bits `FXSR`/`NFSR`/`SMUDGE`/HOP/numéro de
+//! ligne de demi-teinte croisés contre plusieurs sources indépendantes :
+//! le datasheet `BLITTER.TXT` (info-coach.fr), le `BLIT_FAQ.TXT`
+//! (dépôt `ggnkua/Atari_ST_Sources`) et le code source de Hatari
+//! (`src/blitter.c`), qui se recoupent — voir le détail par item
+//! ci-dessous. Contrairement à l'Amiga, le Blitter Atari STE **n'a pas**
+//! de mode "tracé de ligne" pour du dessin de polygone : le champ "numéro
+//! de ligne" du registre CONTROL ne sert qu'à sélectionner/pré-positionner
+//! le mot de demi-teinte courant (modélisé ci-dessous).
+//!
 //! ## Limitations connues (v1) — à prendre avec prudence
-//! - **`skew` (décalage bit à bit du mot source)** : implémenté d'après ma
-//!   meilleure compréhension du mécanisme documenté (combiner le mot
-//!   précédent et le mot courant, extraire une fenêtre de 16 bits décalée
-//!   de `skew` positions), mais **non vérifié contre une référence
-//!   matérielle réelle ou un émulateur existant** — aucune suite de test
-//!   équivalente à TomHarte n'existe pour le Blitter. À valider avant de
-//!   s'appuyer dessus pour un défilement fin précis.
-//! - `NFSR`/`FXSR` (contrôle fin de quand faire une lecture source
-//!   supplémentaire d'amorçage) non modélisés distinctement : une lecture
-//!   d'amorçage est toujours effectuée en début de ligne si `skew != 0`.
-//! - Mode "dessin de ligne" (line number utilisé pour du tracé de
-//!   polygone plutôt que du blit rectangulaire) non implémenté : seul le
-//!   mode blit rectangulaire standard est couvert.
+//! - **`skew` (décalage bit à bit du mot source)** : la formule de
+//!   combinaison (mot précédent + mot courant, fenêtre de 16 bits décalée
+//!   de `skew` positions) suppose un parcours X croissant ; Hatari inverse
+//!   l'ordre de combinaison quand `SRC_X_INC` est négatif (blit
+//!   "miroir"/décroissant), ce qui n'est **pas** modélisé ici — non
+//!   vérifié indépendamment, aucune suite de test équivalente à TomHarte
+//!   n'existe pour le Blitter.
 //! - Pas de vol de cycles bus au CPU modélisé (mode "hog"/"steal" du bit
 //!   de contrôle) : le blit s'exécute intégralement de façon synchrone,
 //!   indépendamment de ce bit.
-//! - Halftone : le mot utilisé pour chaque ligne est `halftone[line % 16]`,
-//!   `line` incrémentant à chaque ligne Y traitée — comportement usuel
-//!   documenté pour un remplissage à motif, non vérifié indépendamment.
 
 /// Offsets des registres dans l'espace propre de la puce (à additionner à
 /// l'adresse de base du board, `0xFF8A00` sur STE réel).
@@ -70,10 +71,15 @@ pub mod reg {
     pub const Y_COUNT1: u32 = 0x39;
     pub const HOP: u32 = 0x3A;
     pub const OP: u32 = 0x3B;
-    /// Bits 0-3 = décalage (skew), bit 6 = FXSR, bit 7 = NFSR.
-    pub const SKEW: u32 = 0x3C;
-    /// Bit 7 = BUSY, bit 6 = HOG, bit 4 = SMUDGE.
-    pub const CONTROL: u32 = 0x3D;
+    /// Bit 7 = BUSY (écriture : start/stop du blit ; lecture : busy/idle),
+    /// bit 6 = HOG, bit 5 = SMUDGE, bits 3-0 = numéro de ligne de
+    /// demi-teinte courant — lisible/inscriptible directement (pas un
+    /// compteur interne caché : le logiciel peut le pré-positionner).
+    pub const CONTROL: u32 = 0x3C;
+    /// Bit 7 = FXSR (Force eXtra Source Read), bit 6 = NFSR (No Final
+    /// Source Read), bits 3-0 = décalage (skew, nombre de bits de
+    /// décalage à droite).
+    pub const SKEW: u32 = 0x3D;
     /// Fin de l'espace registre (exclusif).
     pub const END: u32 = 0x3E;
 }
@@ -95,10 +101,9 @@ pub struct Blitter {
     hop: u8,
     op: u8,
     skew: u8,
+    /// Bit 7 = BUSY, bit 6 = HOG, bit 5 = SMUDGE, bits 3-0 = numéro de
+    /// ligne de demi-teinte courant (voir [`reg::CONTROL`]).
     control: u8,
-    /// Compteur de ligne pour la sélection du mot de demi-teinte (voir
-    /// limitations : cycle 0..16 à chaque ligne Y traitée).
-    halftone_line: u8,
 }
 
 impl Default for Blitter {
@@ -124,7 +129,6 @@ impl Blitter {
             op: 0,
             skew: 0,
             control: 0,
-            halftone_line: 0,
         }
     }
 
@@ -241,11 +245,12 @@ impl Blitter {
     }
 
     /// Applique la fonction de demi-teinte (`HOP`, 2 bits) : combine le mot
-    /// source et le mot de demi-teinte courant selon la table standard
-    /// (0=zéro, 1=demi-teinte seule, 2=source seule, 3=source ET demi-teinte).
+    /// source et le mot de demi-teinte courant selon la table standard du
+    /// datasheet (0=tous à 1, 1=demi-teinte seule, 2=source seule,
+    /// 3=source ET demi-teinte).
     fn apply_hop(&self, source: u16, halftone: u16) -> u16 {
         match self.hop & 0x3 {
-            0 => 0,
+            0 => 0xFFFF,
             1 => halftone,
             2 => source,
             3 => source & halftone,
@@ -286,26 +291,49 @@ impl Blitter {
     /// aux adresses source/destination courantes. Met à jour les
     /// registres d'adresse source/destination et le compteur Y à zéro en
     /// fin d'exécution ; efface le bit BUSY.
+    ///
+    /// `FXSR` (lecture d'amorçage en début de ligne) et `NFSR` (dernière
+    /// lecture source de la ligne omise) sont honorés d'après le bit du
+    /// registre [`reg::SKEW`] plutôt que déduits de `skew != 0`. En mode
+    /// `SMUDGE`, le mot de demi-teinte utilisé pour chaque mot vient des 4
+    /// bits bas du mot source décalé (`skewed_source`) plutôt que du
+    /// numéro de ligne courant ; sinon, le numéro de ligne (bits 0-3 de
+    /// [`reg::CONTROL`]) avance ou recule à la fin de chaque ligne selon
+    /// le signe de `DST_Y_INC`.
     pub fn execute(&mut self, bus: &mut impl crate::Bus) {
         self.control |= CONTROL_BUSY;
 
         let x_count = self.x_count.max(1);
         let y_count = self.y_count;
+        let smudge = self.control & 0x20 != 0;
+        let fxsr = self.skew & 0x80 != 0;
+        let nfsr = self.skew & 0x40 != 0;
 
         for _ in 0..y_count {
-            let halftone_word = self.halftone[(self.halftone_line % 16) as usize];
+            let halftone_line = self.control & 0x0F;
             let mut src = self.src_addr;
             let mut dst = self.dst_addr;
-            let mut previous_source = if self.skew & 0x0F != 0 {
+            let mut previous_source = if fxsr {
                 bus.read16(src.wrapping_sub(self.src_x_inc as u32) & crate::ADDR_MASK)
             } else {
                 0
             };
 
             for word_index in 0..x_count {
-                let current_source = bus.read16(src & crate::ADDR_MASK);
+                let is_last_word = word_index == x_count - 1;
+                let current_source = if is_last_word && nfsr {
+                    0
+                } else {
+                    bus.read16(src & crate::ADDR_MASK)
+                };
                 let source = self.skewed_source(previous_source, current_source);
                 previous_source = current_source;
+
+                let halftone_word = if smudge {
+                    self.halftone[(source & 0x0F) as usize]
+                } else {
+                    self.halftone[halftone_line as usize]
+                };
 
                 let hop_result = self.apply_hop(source, halftone_word);
                 let dest_current = bus.read16(dst & crate::ADDR_MASK);
@@ -313,7 +341,7 @@ impl Blitter {
 
                 let mask = if word_index == 0 {
                     self.endmask[0]
-                } else if word_index == x_count - 1 {
+                } else if is_last_word {
                     self.endmask[2]
                 } else {
                     self.endmask[1]
@@ -328,7 +356,13 @@ impl Blitter {
 
             self.src_addr = self.src_addr.wrapping_add(self.src_y_inc as i32 as u32);
             self.dst_addr = self.dst_addr.wrapping_add(self.dst_y_inc as i32 as u32);
-            self.halftone_line = self.halftone_line.wrapping_add(1);
+
+            let next_line = if self.dst_y_inc < 0 {
+                halftone_line.wrapping_sub(1) & 0x0F
+            } else {
+                (halftone_line + 1) & 0x0F
+            };
+            self.control = (self.control & 0xF0) | next_line;
         }
 
         self.y_count = 0;
