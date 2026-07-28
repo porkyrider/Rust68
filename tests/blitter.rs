@@ -1,4 +1,5 @@
-//! Tests unitaires du Blitter (`rust68::peripherals::blitter`).
+#![cfg(feature = "atari-st")]
+//! Tests unitaires du Blitter (`rust68::peripherals::atari_st::blitter`).
 //!
 //! Aucune suite équivalente à TomHarte n'existe pour ce périphérique :
 //! ces tests valident la logique interne implémentée (table de vérité OP,
@@ -6,7 +7,7 @@
 //! comportement *tel qu'implémenté* plutôt qu'une référence matérielle
 //! vérifiée (voir les limitations documentées dans le module).
 
-use rust68::peripherals::blitter::{Blitter, reg};
+use rust68::peripherals::atari_st::blitter::{Blitter, reg};
 use rust68::{Bus, FlatBus};
 
 fn write_word(bl: &mut Blitter, offset: u32, value: u16) {

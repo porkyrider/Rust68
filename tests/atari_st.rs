@@ -1,11 +1,12 @@
+#![cfg(feature = "atari-st")]
 //! Tests du board Atari ST (`rust68::systems::atari_st::AtariSt`).
 
-use rust68::peripherals::acia;
-use rust68::peripherals::blitter::reg as blitter_reg;
-use rust68::peripherals::mfp::{channel, reg};
-use rust68::peripherals::shifter::addr as shifter_addr;
-use rust68::peripherals::wd1772::{self, FloppyDisk, RawDiskImage, SECTOR_SIZE};
-use rust68::peripherals::ym2149;
+use rust68::peripherals::atari_st::acia;
+use rust68::peripherals::atari_st::blitter::reg as blitter_reg;
+use rust68::peripherals::atari_st::mfp::{channel, reg};
+use rust68::peripherals::atari_st::shifter::addr as shifter_addr;
+use rust68::peripherals::atari_st::wd1772::{self, FloppyDisk, RawDiskImage, SECTOR_SIZE};
+use rust68::peripherals::atari_st::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
     BLITTER_BASE, DEFAULT_ROM_BASE, DMA_ADDR_HIGH, DMA_ADDR_LOW, DMA_ADDR_MID, DMA_MODE, FDC_DATA,
@@ -279,7 +280,7 @@ fn shifter_registres_mappes_correctement() {
     st.write8(shifter_addr::VIDEO_BASE_MID, 0x10); // base vidéo = 0x001000
     st.write8(shifter_addr::RESOLUTION, 0b00);
     assert_eq!(st.read8(shifter_addr::VIDEO_BASE_MID), 0x10);
-    assert_eq!(st.shifter.resolution(), rust68::peripherals::shifter::Resolution::Low);
+    assert_eq!(st.shifter.resolution(), rust68::peripherals::atari_st::shifter::Resolution::Low);
 }
 
 /// Test d'intégration bout-en-bout : écrit un motif connu en RAM vidéo,
@@ -327,7 +328,7 @@ fn reset_bus_reinitialise_le_shifter_et_resynchronise_le_suivi() {
     st.reset_bus();
     assert_eq!(
         st.shifter.resolution(),
-        rust68::peripherals::shifter::Resolution::Low,
+        rust68::peripherals::atari_st::shifter::Resolution::Low,
         "reset_bus doit réinitialiser le Shifter"
     );
     // Pas de rattrapage massif au tick suivant : un seul tick court ne doit

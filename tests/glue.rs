@@ -1,6 +1,7 @@
-//! Tests unitaires du GLUE (`rust68::peripherals::glue`).
+#![cfg(feature = "atari-st")]
+//! Tests unitaires du GLUE (`rust68::peripherals::atari_st::glue`).
 
-use rust68::peripherals::glue::{Glue, VideoMode};
+use rust68::peripherals::atari_st::glue::{Glue, VideoMode};
 
 #[test]
 fn pas_de_hbl_avant_la_fin_de_ligne() {

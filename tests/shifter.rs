@@ -1,6 +1,7 @@
-//! Tests unitaires du Shifter (`rust68::peripherals::shifter`).
+#![cfg(feature = "atari-st")]
+//! Tests unitaires du Shifter (`rust68::peripherals::atari_st::shifter`).
 
-use rust68::peripherals::shifter::{Resolution, Shifter, addr};
+use rust68::peripherals::atari_st::shifter::{Resolution, Shifter, addr};
 
 #[test]
 fn adresse_de_base_video_haut_milieu() {

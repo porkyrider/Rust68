@@ -1,6 +1,7 @@
-//! Tests unitaires du YM2149 (`rust68::peripherals::ym2149`).
+#![cfg(feature = "atari-st")]
+//! Tests unitaires du YM2149 (`rust68::peripherals::atari_st::ym2149`).
 
-use rust68::peripherals::ym2149::{Ym2149, bus_offset, reg};
+use rust68::peripherals::atari_st::ym2149::{Ym2149, bus_offset, reg};
 
 fn select(chip: &mut Ym2149, r: u8) {
     chip.write(bus_offset::SELECT, r);

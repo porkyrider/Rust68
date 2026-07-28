@@ -1,10 +1,11 @@
-//! Tests unitaires du MC68901 MFP (`rust68::peripherals::mfp`).
+#![cfg(feature = "atari-st")]
+//! Tests unitaires du MC68901 MFP (`rust68::peripherals::atari_st::mfp`).
 //!
 //! Aucune suite TomHarte n'existe pour ce périphérique (spécifique Atari
 //! ST, pas partie de la famille 68k elle-même) : ce fichier est le seul
 //! filet de sécurité, sur le même principe que `tests/instructions.rs`.
 
-use rust68::peripherals::mfp::{Mfp, channel, reg};
+use rust68::peripherals::atari_st::mfp::{Mfp, channel, reg};
 
 #[test]
 fn gpip_lecture_reflete_ddr() {

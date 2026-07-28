@@ -1,6 +1,7 @@
-//! Tests unitaires du WD1772 (`rust68::peripherals::wd1772`).
+#![cfg(feature = "atari-st")]
+//! Tests unitaires du WD1772 (`rust68::peripherals::atari_st::wd1772`).
 
-use rust68::peripherals::wd1772::{DmaChannel, FloppyDisk, RawDiskImage, SECTOR_SIZE, Wd1772, reg, status};
+use rust68::peripherals::atari_st::wd1772::{DmaChannel, FloppyDisk, RawDiskImage, SECTOR_SIZE, Wd1772, reg, status};
 
 /// Canal DMA de test : deux buffers, un pour la lecture (RAM -> disque),
 /// un pour l'écriture (disque -> RAM), chacun avec son propre curseur.
@@ -48,7 +49,7 @@ fn restore_ramene_en_piste_zero_et_leve_intrq() {
     assert!(fdc.interrupt_requested());
     let status = fdc.read(reg::COMMAND_STATUS);
     assert_eq!(status & status::TRACK00_OR_LOST_DATA, status::TRACK00_OR_LOST_DATA);
-    assert_eq!(status & rust68::peripherals::wd1772::status::BUSY, 0, "plus BUSY une fois la commande terminée");
+    assert_eq!(status & rust68::peripherals::atari_st::wd1772::status::BUSY, 0, "plus BUSY une fois la commande terminée");
 }
 
 #[test]

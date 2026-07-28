@@ -1,13 +1,8 @@
-//! Périphériques des systèmes hôtes (Atari ST, …) bâtis sur le cœur 68000.
-//!
-//! Ce module ne fait pas partie du CPU MC68000 lui-même : il rassemble les
-//! puces d'un système particulier, que l'appelant câble dans son
-//! implémentation de [`crate::Bus`] (mapping mémoire, génération d'IPL…).
+//! Périphériques des systèmes hôtes bâtis sur le cœur 68000, un
+//! sous-module par système (voir [`atari_st`]) — chacun compilé uniquement
+//! si la feature Cargo correspondante est activée, pour que le cœur 68000
+//! seul reste utilisable sans rapatrier ni compiler de code spécifique à
+//! un système particulier.
 
-pub mod acia;
-pub mod blitter;
-pub mod glue;
-pub mod mfp;
-pub mod shifter;
-pub mod wd1772;
-pub mod ym2149;
+#[cfg(feature = "atari-st")]
+pub mod atari_st;

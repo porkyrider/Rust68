@@ -1,6 +1,7 @@
-//! Tests unitaires du MC6850 ACIA (`rust68::peripherals::acia`).
+#![cfg(feature = "atari-st")]
+//! Tests unitaires du MC6850 ACIA (`rust68::peripherals::atari_st::acia`).
 
-use rust68::peripherals::acia::{Acia, reg};
+use rust68::peripherals::atari_st::acia::{Acia, reg};
 
 #[test]
 fn etat_initial_emetteur_pret_recepteur_vide() {

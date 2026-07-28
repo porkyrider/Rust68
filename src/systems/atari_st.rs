@@ -40,20 +40,20 @@
 //!   (`DMA_MODE`, bits 0-1) modélisé, mais pas le registre de nombre de
 //!   secteurs ni la sélection FDC/HDC réels du contrôleur DMA ST — notre
 //!   modèle de transfert "instantané par secteur" n'en a pas besoin
-//!   fonctionnellement (voir `peripherals::wd1772` pour le détail).
+//!   fonctionnellement (voir `peripherals::atari_st::wd1772` pour le détail).
 
-use crate::peripherals::acia::{self, Acia};
-use crate::peripherals::blitter::{self, Blitter};
-use crate::peripherals::glue::{Glue, VideoMode};
-use crate::peripherals::mfp::Mfp;
-use crate::peripherals::shifter::{self, Shifter};
-use crate::peripherals::wd1772::{self, DmaChannel, RawDiskImage, Wd1772};
-use crate::peripherals::ym2149::{self, Ym2149};
+use crate::peripherals::atari_st::acia::{self, Acia};
+use crate::peripherals::atari_st::blitter::{self, Blitter};
+use crate::peripherals::atari_st::glue::{Glue, VideoMode};
+use crate::peripherals::atari_st::mfp::Mfp;
+use crate::peripherals::atari_st::shifter::{self, Shifter};
+use crate::peripherals::atari_st::wd1772::{self, DmaChannel, RawDiskImage, Wd1772};
+use crate::peripherals::atari_st::ym2149::{self, Ym2149};
 use crate::{ADDR_MASK, Bus};
 
 /// Adresse du premier registre MFP (`GPIP`), sur ST/STE réel.
 pub const MFP_BASE: u32 = 0xFFFA01;
-/// Nombre de registres logiques du MFP (voir `peripherals::mfp::reg`).
+/// Nombre de registres logiques du MFP (voir `peripherals::atari_st::mfp::reg`).
 const MFP_REG_COUNT: u32 = 24;
 /// Adresse du dernier registre MFP (`UDR`).
 pub const MFP_END: u32 = MFP_BASE + (MFP_REG_COUNT - 1) * 2;
@@ -154,7 +154,7 @@ pub struct AtariSt {
 }
 
 /// Canal DMA reliant le WD1772 à la RAM du board à l'adresse DMA courante
-/// (voir `peripherals::wd1772::DmaChannel`) : le WD1772 ne connaît pas la
+/// (voir `peripherals::atari_st::wd1772::DmaChannel`) : le WD1772 ne connaît pas la
 /// RAM, seulement ce canal.
 struct RamDmaChannel<'a> {
     ram: &'a mut [u8],
@@ -407,7 +407,7 @@ impl Bus for AtariSt {
             _ if addr == BLITTER_BASE + blitter::reg::CONTROL => {
                 self.blitter.write(blitter::reg::CONTROL, value);
                 // Bit BUSY/START (bit 7) posé : déclenche le blit dans son
-                // intégralité (modèle synchrone, voir peripherals::blitter).
+                // intégralité (modèle synchrone, voir peripherals::atari_st::blitter).
                 if value & 0x80 != 0 {
                     let mut ram_bus = RamBus { ram: &mut self.ram };
                     self.blitter.execute(&mut ram_bus);
