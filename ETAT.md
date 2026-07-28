@@ -36,6 +36,13 @@ régressions et de visualiser les progrès instruction par instruction.
 
 ## Architecture du code
 
+Le cœur 68000 (`cpu.rs`/`addressing.rs`/`execute.rs`/`bus.rs`) ne dépend
+d'aucun système particulier. Les périphériques et boards sont rangés **un
+sous-module par système émulé** sous `peripherals/`/`systems/`, chacun
+derrière sa propre feature Cargo — aucune activée par défaut : `cargo
+build`/`cargo test` sans option ne compilent/rapatrient que le cœur, il
+faut explicitement `--features atari-st` pour l'Atari ST :
+
 ```
 src/
   cpu.rs          (~520 l.)  — registres, SR, USP/SSP, fetch_word, take_exception,
@@ -46,31 +53,44 @@ src/
   bus.rs          (~195 l.)  — trait Bus + FlatBus (16 Mo RAM plate) + TimedBus
                                 (wait-states DRAM/vidéo) + take_bus_fault() + irq_level/irq_ack
   peripherals/
-    mfp.rs        (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
-    glue.rs       (~130 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
-    acia.rs       (~150 l.)  — MC6850 ACIA (chip seul, cf. section dédiée)
-    ym2149.rs     (~375 l.)  — PSG YM2149 (chip seul, cf. section dédiée)
-    shifter.rs    (~265 l.)  — vidéo Shifter (chip seul, cf. section dédiée)
-    wd1772.rs     (~370 l.)  — contrôleur disquette WD1772 (chip seul, cf. section dédiée)
-    blitter.rs    (~340 l.)  — coprocesseur BitBlt Blitter (chip seul, cf. section dédiée)
+    mod.rs                   — `#[cfg(feature = "atari-st")] pub mod atari_st;`
+    atari_st/
+      mfp.rs      (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
+      glue.rs     (~130 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
+      acia.rs     (~150 l.)  — MC6850 ACIA (chip seul, cf. section dédiée)
+      ym2149.rs   (~375 l.)  — PSG YM2149 (chip seul, cf. section dédiée)
+      shifter.rs  (~265 l.)  — vidéo Shifter (chip seul, cf. section dédiée)
+      wd1772.rs   (~370 l.)  — contrôleur disquette WD1772 (chip seul, cf. section dédiée)
+      blitter.rs  (~340 l.)  — coprocesseur BitBlt Blitter (chip seul, cf. section dédiée)
+      stx.rs                 — lecteur minimal de disquettes `.stx` (Pasti)
   systems/
-    atari_st.rs   (~490 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
+    mod.rs                   — `#[cfg(feature = "atari-st")] pub mod atari_st;`
+    atari_st.rs   (~570 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
                                 Blitter, cf. section dédiée)
+  bin/
+    atari_st_sdl2.rs         — frontend SDL2 (vidéo/clavier/souris/son), feature `sdl2-frontend`
   lib.rs                     — exports publics
 tests/
   instructions.rs            — tests unitaires ciblés (CPU)
   interrupts.rs               — tests du mécanisme IPL (Cpu::take_interrupt)
   trace.rs                     — tests du mode trace (Cpu::take_trace_exception)
-  mfp.rs                      — tests du MFP 68901
-  glue.rs                      — tests du GLUE (HBL/VBL)
-  acia.rs                      — tests du MC6850 ACIA
-  ym2149.rs                    — tests du PSG YM2149
-  shifter.rs                   — tests de la vidéo Shifter
-  wd1772.rs                    — tests du contrôleur disquette WD1772
-  blitter.rs                   — tests du Blitter
-  atari_st.rs                 — tests du board Atari ST (dont plusieurs tests bout-en-bout)
+  mfp.rs                      — tests du MFP 68901 (feature `atari-st`)
+  glue.rs                      — tests du GLUE (HBL/VBL) (feature `atari-st`)
+  acia.rs                      — tests du MC6850 ACIA (feature `atari-st`)
+  ym2149.rs                    — tests du PSG YM2149 (feature `atari-st`)
+  shifter.rs                   — tests de la vidéo Shifter (feature `atari-st`)
+  wd1772.rs                    — tests du contrôleur disquette WD1772 (feature `atari-st`)
+  blitter.rs                   — tests du Blitter (feature `atari-st`)
+  atari_st.rs                 — tests du board Atari ST, bout-en-bout (feature `atari-st`)
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
 ```
+
+### Features Cargo
+
+| Feature | Défaut | Effet |
+|---|---|---|
+| `atari-st` | désactivée | Compile `peripherals::atari_st` et `systems::atari_st`. Sans elle (défaut), on n'a que le cœur 68000. |
+| `sdl2-frontend` | désactivée | Compile le binaire `atari_st_sdl2` (dépend de `atari-st`, active `sdl2` en dépendance). |
 
 ---
 
@@ -172,9 +192,9 @@ diagnostic externes.
 
 ---
 
-## MFP 68901 (`src/peripherals/mfp.rs`)
+## MFP 68901 (`src/peripherals/atari_st/mfp.rs`)
 
-`peripherals::mfp::Mfp` modélise la puce **seule**, indépendamment de tout
+`peripherals::atari_st::mfp::Mfp` modélise la puce **seule**, indépendamment de tout
 câblage système : c'est au board de mapper `Mfp::read`/`write` dans son
 `Bus`, de brancher `Mfp::iack` sur `Bus::irq_ack`, et de relier
 `Mfp::interrupt_requested()` à `Bus::irq_level` (câblé sur IPL6 sur
@@ -212,9 +232,9 @@ Testé dans `tests/mfp.rs` (11 tests).
 
 ---
 
-## GLUE (`src/peripherals/glue.rs`)
+## GLUE (`src/peripherals/atari_st/glue.rs`)
 
-`peripherals::glue::Glue` modélise le générateur de timing HBL/VBL de la
+`peripherals::atari_st::glue::Glue` modélise le générateur de timing HBL/VBL de la
 puce GLUE (rôle mémoire/bus de GLUE non couvert) :
 
 - `tick(cpu_cycles)` avance un compteur de ligne ; à chaque fin de ligne,
@@ -233,9 +253,9 @@ Testé dans `tests/glue.rs` (5 tests).
 
 ---
 
-## ACIA 6850 (`src/peripherals/acia.rs`)
+## ACIA 6850 (`src/peripherals/atari_st/acia.rs`)
 
-`peripherals::acia::Acia` modélise une puce MC6850 seule ; l'Atari ST en
+`peripherals::atari_st::acia::Acia` modélise une puce MC6850 seule ; l'Atari ST en
 embarque **deux** (clavier, MIDI), chacune une instance séparée dans
 `AtariSt` (`acia_keyboard`/`acia_midi`), dont les IRQ sont OR câblées sur
 `GPIP4` du MFP.
@@ -255,9 +275,9 @@ Testé dans `tests/acia.rs` (7 tests).
 
 ---
 
-## YM2149 (`src/peripherals/ym2149.rs`)
+## YM2149 (`src/peripherals/atari_st/ym2149.rs`)
 
-`peripherals::ym2149::Ym2149` modélise la puce seule (compatible registre à
+`peripherals::atari_st::ym2149::Ym2149` modélise la puce seule (compatible registre à
 registre avec le General Instrument AY-3-8910) : 3 canaux de tonalité
 carrée, un générateur de bruit partagé, un générateur d'enveloppe, 2 ports
 d'E/S 8 bits. Mappée dans `AtariSt` (champ public `ym2149`) au sélecteur
@@ -283,9 +303,9 @@ Testé dans `tests/ym2149.rs` (9 tests).
 
 ---
 
-## Shifter (`src/peripherals/shifter.rs`)
+## Shifter (`src/peripherals/atari_st/shifter.rs`)
 
-`peripherals::shifter::Shifter` modélise la puce vidéo seule : lit la RAM
+`peripherals::atari_st::shifter::Shifter` modélise la puce vidéo seule : lit la RAM
 vidéo ligne par ligne et la convertit en pixels RGB 24 bits selon la
 résolution programmée (basse 320×200/4 plans, moyenne 640×200/2 plans,
 haute 640×400/1 plan monochrome). Mappé dans `AtariSt` (champ public
@@ -315,18 +335,22 @@ supplémentaires, dont un rendu de trame PAL complète de 313 lignes).
 
 ---
 
-## WD1772 (`src/peripherals/wd1772.rs`)
+## WD1772 (`src/peripherals/atari_st/wd1772.rs`)
 
-`peripherals::wd1772::Wd1772` modélise le contrôleur de disquette seul :
+`peripherals::atari_st::wd1772::Wd1772` modélise le contrôleur de disquette seul :
 4 registres (Commande/Statut, Piste, Secteur, Donnée) multiplexés par les
 lignes A1-A0, jeu de commandes Type I (Restore/Seek/Step/Step-In/
 Step-Out), Type II (Read/Write Sector, mono et multi-secteur) et Type IV
 (Force Interrupt).
 
 - Le disque est abstrait via le trait `FloppyDisk` (adressage piste/face/
-  secteur, pas octet) — `RawDiskImage` fournit le format `.st` brut
-  (secteurs linéaires). Pas de support `.stx` (métadonnées de protection
-  par secteur, hors de portée).
+  secteur, pas octet), objet (`Box<dyn FloppyDisk>` côté `AtariSt`) pour
+  accepter plusieurs formats sans coupler le board à l'un d'eux :
+  `RawDiskImage` pour le `.st` brut (secteurs linéaires), `stx::StxImage`
+  pour un lecteur `.stx` (Pasti) minimal — reverse-engineé par inspection
+  directe de fichiers réels (aucune spec officielle consultée), ignore
+  volontairement toute la métadonnée de protection (fuzzy bits, timing),
+  extrait juste le contenu brut des secteurs.
 - Transfert Type II via le trait `DmaChannel` (`pull`/`push` un octet à la
   fois) : le WD1772 ne connaît pas la RAM, seulement le disque et ce
   canal — c'est au board de l'implémenter avec accès à sa RAM.
@@ -349,9 +373,9 @@ via DMA).
 
 ---
 
-## Blitter (`src/peripherals/blitter.rs`)
+## Blitter (`src/peripherals/atari_st/blitter.rs`)
 
-`peripherals::blitter::Blitter` modélise le coprocesseur de transfert de
+`peripherals::atari_st::blitter::Blitter` modélise le coprocesseur de transfert de
 blocs (BitBlt) de l'Atari STE seul : combine un mot source (optionnellement
 décalé bit à bit via `skew`), un motif de demi-teinte, et le contenu
 destination, via une fonction booléenne programmable (`OP`, une des 16
@@ -424,10 +448,11 @@ contention DRAM/vidéo (`is_contended` reste `false`) ; décodage UDS/LDS
 des adresses paires adjacentes au MFP non modélisé précisément ;
 registres DMA/WD1772 simplifiés (voir section WD1772).
 
-Testé dans `tests/atari_st.rs` (30 tests, dont plusieurs bout-en-bout :
+Testé dans `tests/atari_st.rs` (32 tests, dont plusieurs bout-en-bout :
 interruption GPIP→MFP→IPL, priorité MFP/VBL/HBL, ACIA→GPIP4→MFP,
 WD1772→GPIP5→MFP, rendu vidéo, lecture/écriture disquette via DMA, blit
-déclenché via le registre de contrôle).
+déclenché via le registre de contrôle, moniteur couleur persistant après
+`/RESET`).
 
 ---
 
@@ -439,15 +464,20 @@ ACIA 6850, le YM2149, le Shifter, le WD1772, le Blitter et un board
 minimal reliant tout ça sont en place — tous les composants de la feuille
 de route initiale sont couverts.
 
+Un vrai TOS 1.62 non modifié démarre jusqu'au bureau GEM interactif
+(vidéo couleur basse résolution, clavier, souris, icônes disquette) via le
+binaire de démonstration `atari_st_sdl2` (`cargo run --release --features
+sdl2-frontend --bin atari_st_sdl2 -- <rom.img> [disque.stx|.st]`) — voir
+la section Architecture pour le détail des features Cargo.
+
 Pistes pour aller plus loin (aucune n'est un blocage, ce sont des
 approfondissements) :
-- Support `.stx` pour le WD1772 (protections par secteur).
-- Pipeline de sortie audio (PCM) pour le YM2149 et vidéo (fenêtre/
-  framebuffer réel) pour le Shifter — actuellement exposés comme données
-  brutes (niveaux de canal, RGB par ligne) à charge d'un binaire hôte.
 - Vérification des points documentés comme non confirmés contre une
   référence matérielle réelle (timing MFP/GLUE, skew du Blitter,
   polarité haute résolution du Shifter).
 - Contention DRAM/vidéo pour les accès Shifter/Blitter (mécanisme déjà
   générique via `Bus::is_contended`, pas encore branché sur ces deux
   puces).
+- `.stx` : métadonnées de protection par secteur (fuzzy bits, timing)
+  volontairement ignorées par le lecteur minimal — de vraies protections
+  de jeux resteraient bloquées.
