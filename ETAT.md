@@ -289,6 +289,59 @@ Testé dans `tests/acia.rs` (7 tests).
 
 ---
 
+## IKBD (`src/peripherals/atari_st/ikbd.rs`)
+
+`peripherals::atari_st::ikbd::Ikbd` modélise le contrôleur HD6301
+(clavier/souris/joystick), câblé sur `acia_keyboard` — auparavant absent :
+les commandes envoyées par le TOS pour configurer l'IKBD (reset,
+modes souris…) étaient écrites dans l'ACIA mais jamais lues/interprétées
+(`take_tx_byte` n'était appelé nulle part), et le binaire de démonstration
+gérait lui-même, à la main, une file de sortie ad hoc (`ikbd_tx_queue`).
+Port très largement inspiré du projet compagnon Stay (mêmes constats,
+mêmes correctifs, adaptés à l'absence de joystick ici) :
+
+- Réponse d'autotest `0xF1` **différée** (`IKBD_RESET_CYCLES`, 5 000 000
+  cycles) plutôt qu'immédiate au reset : la livrer trop tôt fait arriver
+  l'octet avant que le TOS ait fini de configurer IERB/IMRB du MFP,
+  l'interruption ACIA correspondante (en attente mais encore masquée)
+  étant alors silencieusement effacée par l'écriture ultérieure normale du
+  TOS dans IERB — l'octet n'est ensuite jamais lu, RDRF reste plein en
+  permanence, bloquant tout octet suivant (clavier ET souris) pour
+  toujours.
+- `receive_cmd`/`execute_cmd` : reset (`0x80 0x01`), mode souris relatif
+  (`0x08`), axe Y (`0x0F`/`0x10`), interrogation de position absolue
+  (`0x0D`) réellement implémentés ; les commandes joystick (non modélisé,
+  pas de frontend manette) consomment quand même le bon nombre d'octets de
+  paramètres pour ne pas désynchroniser le flux de commandes suivant.
+- `mouse_move(dx, dy, buttons)` : position absolue interne suivie et
+  bornée (0..639/0..399), paquet relatif standard `0xF8|boutons, dx, dy`
+  émis seulement si quelque chose a changé.
+- `AtariSt::tick` relie l'ensemble : drainage de `take_tx_byte` vers
+  `Ikbd::receive_cmd`, livraison d'un octet de `Ikbd::pop_tx` par tick
+  (gardée par RDRF), et **force explicitement un relâchement GPIP4** avant
+  de réarmer RDRF pour l'octet suivant dans le même tick — sur silicium
+  réel, `/IRQ` de l'ACIA remonte réellement le temps de l'intervalle série
+  entre deux octets ; sans ce relâchement forcé, le 2e/3e octet de chaque
+  trame (ex. une trame souris) ne produit jamais de front pour
+  `Mfp::set_gpip_input`, qui est à juste titre edge-triggered — bug exact
+  déjà isolé et corrigé dans Stay.
+- Le binaire de démonstration (`atari_st_sdl2`) échantillonne le
+  mouvement souris une seule fois par trame vidéo plutôt qu'à chaque
+  évènement SDL brut (potentiellement bien plus fréquent que le ~50 Hz
+  réel), et plafonne chaque paquet à ±15 unités (limite réelle du
+  firmware IKBD, pas seulement ±127 du champ signé sur un octet),
+  découpant un déplacement plus grand en plusieurs paquets — même
+  approche que `Machine::flush_input_vbl`/`mouse_move` de Stay.
+- Pré-remplissage RAM supplémentaire au boot "redémarrage à chaud" (voir
+  section suivante) : `$0EE4`/`$0EE5` = `0x11`/`0x11` (porte Timer-C de
+  l'IKBD, normalement posée par le TOS lui-même pendant sa mise en place —
+  sans elle, `ASL.W #3,($0EE4).L; BPL` du gestionnaire Timer C prendrait
+  la mauvaise branche et n'écoulerait jamais les octets IKBD en attente).
+
+Testé dans `src/peripherals/atari_st/ikbd.rs` (7 tests unitaires).
+
+---
+
 ## YM2149 (`src/peripherals/atari_st/ym2149.rs`)
 
 `peripherals::atari_st::ym2149::Ym2149` modélise la puce seule (compatible registre à
@@ -453,11 +506,12 @@ reliant toutes les puces ci-dessus :
   (`DEFAULT_ROM_BASE`, lecture seule).
 - MFP 68901 aux adresses impaires `0xFFFA01`-`0xFFFA2F` (champ public
   `mfp`). ACIA clavier (`0xFFFC00`/`02`) et MIDI (`0xFFFC04`/`06`), champs
-  publics `acia_keyboard`/`acia_midi`. YM2149 (`0xFF8800`/`02`, champ
-  `ym2149`). Shifter (`0xFF8201`+, champ `shifter`). WD1772/DMA
-  (`0xFF8604`+, champs `wd1772`/`floppy_a`). Blitter (`0xFF8A00`+, champ
-  `blitter`, déclenché par l'écriture du bit BUSY/START de son registre
-  de contrôle).
+  publics `acia_keyboard`/`acia_midi`, la première câblée sur un
+  contrôleur IKBD (champ `ikbd`, voir section dédiée). YM2149
+  (`0xFF8800`/`02`, champ `ym2149`). Shifter (`0xFF8201`+, champ
+  `shifter`). WD1772/DMA (`0xFF8604`+, champs `wd1772`/`floppy_a`).
+  Blitter (`0xFF8A00`+, champ `blitter`, déclenché par l'écriture du bit
+  BUSY/START de son registre de contrôle).
 - Au-delà de la RAM installée mais dans l'espace d'adressage "RAM ST" fixe
   de 4 Mo (deux banques MMU de 2 Mo sur ST/STE réel), l'accès ne
   déclenche **jamais** de bus error : le MMU y répond toujours /DTACK sur
@@ -578,14 +632,78 @@ approfondissements) :
 - `.stx` : métadonnées de protection par secteur (fuzzy bits, timing)
   volontairement ignorées par le lecteur minimal — de vraies protections
   de jeux resteraient bloquées.
-- **Bug ouvert, reproduit et non résolu** : le curseur souris affiche des
-  couleurs erratiques, et la barre de menu GEM (survolée pour ouvrir un
-  menu) affiche un bandeau de bruit/blocs de couleur au lieu d'un texte
-  lisible — reproduit à l'identique en boot chaud ET en boot froid (donc
-  indépendant des correctifs RAM ci-dessus). Palette matérielle du
-  Shifter vérifiée correcte (valeurs standard GEM) au moment du bug. Pas
-  encore de cause identifiée ; pistes non explorées : timing du Blitter
-  pour les motifs de remplissage GEM, décodage des plans de bits
-  spécifique à une zone d'écran, ou état VDI non initialisé. Pour
-  reproduire : `atari_st_sdl2` avec `tos162.img`, survoler un titre de la
-  barre de menu.
+- **Résolu** : les clics souris (icônes, items de menu) ne sélectionnaient
+  rien. Cause réelle, en plusieurs couches — le contrôleur IKBD n'existait
+  pas du tout (voir section IKBD ci-dessus : commandes TOS jamais
+  interprétées, front GPIP4 starvé entre octets d'une même trame,
+  `$0EE4` non pré-rempli) ; une fois ces couches corrigées, un dernier bug
+  subsistait, plus simple : les bits gauche/droit du paquet souris étaient
+  **inversés** par rapport à la convention attendue par le TOS (constaté
+  empiriquement par l'utilisateur, corrigé dans `queue_mouse_move` —
+  `atari_st_sdl2.rs`). Confirmé résolu : les clics fonctionnent
+  normalement. Le mode souris "exclusif" (curseur hôte caché + confiné à
+  la fenêtre tant qu'elle a le focus, `Cmd+Shift+F10` pour basculer
+  manuellement sans perdre le focus) a aussi été ajouté à cette occasion.
+
+- **Bug ouvert, reproduit et non résolu** : la barre de menu GEM (et
+  parfois les icônes du bureau) affiche un bandeau de bruit/blocs de
+  couleur au lieu d'un texte lisible quand un menu est réellement ouvert
+  (pas juste survolé sans clic). Pour reproduire : `atari_st_sdl2` avec
+  `tos162.img`, cliquer-glisser sur un titre de la barre de menu pour
+  ouvrir son menu déroulant.
+
+  **Définitivement écarté** cette session (donc *indépendant* du
+  correctif clic souris ci-dessus, malgré le lien de cause initialement
+  soupçonné) :
+  - Tout le pipeline souris/IKBD : reset, générations/livraison de
+    paquets, front GPIP4, `$0EE4` — tous vérifiés/corrigés, sans effet
+    sur cette corruption.
+  - Boot chaud vs boot froid réel (`RUST68_COLD_BOOT=1`) : reproduit à
+    l'identique dans les deux cas (un premier test donnant l'illusion du
+    contraire s'est révélé être un faux négatif — le clic-glisser
+    n'avait pas réellement ouvert de menu). Écarte l'hypothèse d'une
+    variable système que le raccourci "redémarrage à chaud" oublierait
+    d'initialiser (contrairement à `$0EE4`, qui lui était bien la cause
+    du problème de clic).
+  - Le Blitter (0 blit tracé), le format/la méthode de texture SDL2, la
+    cadence des paquets souris (tout testé et écarté lors de sessions
+    précédentes).
+
+  Désassemblage complet (via `capstone`) de la routine logicielle de
+  remplissage rectangulaire appelée pendant l'ouverture du menu, ROM TOS
+  1.62, `$E12C1C`-`$E12C9A` : lit un motif dans une table ROM (`A0`),
+  applique un merge masqué `((X XOR D3) AND masque) XOR D3` sur les mots
+  de bord et une écriture directe sur les mots du milieu, bouclé sur les
+  4 plans. Dispatché depuis un dispositif à plusieurs niveaux de tables
+  de fonctions façon VDI (`$E12B1E` → table PC-relative en `$E12B4C` →
+  `$E12C18`/`$E12C7E` selon le nombre de plans). Toutes les valeurs de
+  registres capturées à l'entrée sont individuellement plausibles et
+  cohérentes avec `shifter.video_base()` — aucune valeur "manifestement
+  fausse" trouvée à ce niveau, ni de bug identifié dans les instructions
+  CPU impliquées (`ADDA.W`, `EOR.W`/`AND.W` registre↔mémoire, `DBRA`,
+  `TST.W (An)+`).
+
+  **Piste ouverte pour une reprise future** : le projet compagnon Stay
+  (`/Users/yannmichon/STAY`) dépend de **ce dépôt Rust68 en path
+  dependency** pour son cœur CPU (`crates/core/cpu/src/wrapper.rs` —
+  `rust68::Cpu` utilisé directement, donc strictement le même code que
+  celui testé ici) mais a son **propre** board/périphériques (ACIA/MFP/
+  Shifter/Blitter séparés, `crates/core/memory`). Reproduire l'interaction
+  exacte (ouvrir un menu) sous `stay` (config déjà prête : `stay.toml`
+  pointe sur `assets/tos162.img`, `cargo build --release --bin stay`)
+  permettrait un test différentiel fiable : si Stay ne montre PAS la
+  corruption avec le même TOS et le même CPU partagé, le bug est
+  définitivement dans le board/périphériques ST-spécifiques de Rust68
+  (`systems/atari_st/mod.rs`, `shifter.rs`…), pas dans le cœur CPU. Cette
+  piste a été commencée mais pas menée à terme cette session (Stay a
+  nécessité un petit correctif de compilation pour suivre l'ajout récent
+  de `StepError::DoubleFault`, déjà fait dans
+  `STAY/crates/core/cpu/src/wrapper.rs`) — reprendre en lançant `stay`,
+  en reproduisant la même ouverture de menu, et en comparant visuellement.
+
+  Instrumentation de debug conservée dans `atari_st_sdl2.rs`/
+  `systems/atari_st/mod.rs` (variables d'environnement, coût nul si non
+  activées) : `RUST68_WATCH_VIDEO`, `RUST68_DUMP_VIDEO`,
+  `RUST68_TRACE_FILL`, `RUST68_TRACE_BLITDET`, `RUST68_TRACE_DISPATCH`,
+  `RUST68_TRACE_SIM`, `RUST68_TRACE_IKBD`, `RUST68_TRACE_IKBD_READER`,
+  `RUST68_TRACE_IKBD_DISPATCH`.

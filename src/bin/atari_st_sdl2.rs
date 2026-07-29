@@ -45,8 +45,8 @@ use rust68::systems::atari_st::AtariSt;
 use rust68::{Bus, Cpu};
 
 use sdl2::audio::{AudioQueue, AudioSpecDesired};
-use sdl2::event::Event;
-use sdl2::keyboard::Scancode;
+use sdl2::event::{Event, WindowEvent};
+use sdl2::keyboard::{Mod, Scancode};
 use sdl2::pixels::PixelFormatEnum;
 use std::time::Duration;
 
@@ -155,6 +155,21 @@ fn main() {
         st.write32(0x43A, 0x237698AA); // memval2
         st.write32(0x51A, 0x5555AAAA); // memval3
         st.write32(0x42E, ram_size as u32); // phystop
+        // Porte Timer-C de l'IKBD ($0EE4, RAM) : le TOS l'initialise
+        // normalement à 0x1111 pendant sa propre mise en place de l'IKBD
+        // (A5=0). Le gestionnaire de Timer C (200 Hz) fait `ASL.W
+        // #3,($0EE4).L` puis saute le traitement des octets IKBD en attente
+        // si le résultat est positif ou nul (BPL pris) — avec 0x1111,
+        // ASL.W #3 = 0x8888 (bit 15 = 1, N posé, BPL non pris, octets bien
+        // traités). Le raccourci "redémarrage à chaud" ci-dessus saute
+        // exactement le code TOS qui pose normalement cette valeur, et la
+        // RAM démarre à zéro (`AtariSt::new`) — sans ce pré-remplissage,
+        // 0x0000 donnerait ASL.W #3 = 0x0000 (N=0, BPL pris), ce chemin de
+        // traitement IKBD restant inactif jusqu'à ce que le TOS repasse par
+        // là de lui-même. Identifié via le projet compagnon Stay (même
+        // pré-remplissage, mêmes octets).
+        st.write8(0x0EE4, 0x11);
+        st.write8(0x0EE5, 0x11);
     }
 
     let mut cpu = Cpu::new();
@@ -174,6 +189,16 @@ fn main() {
     let mut texture = texture_creator
         .create_texture_streaming(PixelFormatEnum::RGB24, 640, 400)
         .expect("création texture");
+
+    // Souris exclusive à la fenêtre tant qu'elle a le focus : confinée à la
+    // fenêtre (`set_grab`) et curseur hôte caché (le GEM dessine le sien).
+    // Volontairement PAS le mode "relatif" SDL2 (`set_relative_mouse_mode`)
+    // — voir le commentaire sur `last_mouse_pos` ci-dessous : son recentrage
+    // interne par warp a déjà causé une dérive diagonale sur ce backend: le
+    // calcul de delta par position absolue existant reste inchangé,
+    // seulement le confinement/l'affichage du curseur changent ici.
+    canvas.window_mut().set_grab(true);
+    sdl_context.mouse().show_cursor(false);
 
     let desired_spec = AudioSpecDesired {
         freq: Some(AUDIO_SAMPLE_RATE),
@@ -198,19 +223,6 @@ fn main() {
     // la souris. `None` tant qu'aucune position n'a encore été vue, pour ne
     // pas envoyer un premier delta énorme depuis une origine arbitraire.
     let mut last_mouse_pos: Option<(i32, i32)> = None;
-    // L'ACIA (MC6850) est un registre de réception unique, sans FIFO,
-    // fidèle au silicium réel (voir `peripherals::acia`) : un octet non
-    // encore lu par le programme quand un nouveau arrive est perdu (OVRN).
-    // Sur ST réel, l'IKBD envoie les octets un par un à un débit série fixe
-    // (~7812 bauds), laissant largement le temps à l'interruption RDRF
-    // d'être traitée entre deux — ce timing n'existe pas ici (une trame
-    // souris = 3 octets), donc on les met en attente dans cette file et on
-    // n'en pousse qu'un seul dans l'ACIA par pas CPU, une fois le
-    // précédent effectivement consommé (RDRF retombé) : sans ça, les 2e/3e
-    // octets de chaque trame souris (dX/dY) étaient perdus par overrun, et
-    // le TOS interprétait à tort les octets d'en-tête suivants (`0xF8` =
-    // -8 en signé) comme des deltas — d'où une dérive constante en diagonale.
-    let mut ikbd_tx_queue: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     // La fenêtre affiche toujours 640x400 (voir `render_frame`), mais la
     // résolution ST logique peut être plus petite (320x200 en basse
     // résolution) : un mouvement en pixels de FENÊTRE doit être mis à
@@ -222,6 +234,16 @@ fn main() {
     // évènement à l'autre pour ne pas perdre les petits mouvements lents
     // par troncature répétée.
     let mut mouse_scale_carry = (0.0f64, 0.0f64);
+    // Mouvement souris accumulé (en pixels ST logiques, après mise à
+    // l'échelle) depuis le dernier échantillonnage — injecté dans l'IKBD
+    // une seule fois par trame plutôt qu'immédiatement à chaque évènement
+    // SDL brut, comme le fait le firmware IKBD réel (échantillonnage au
+    // rythme VBL, voir `Machine::flush_input_vbl`/`IKBD_VBL()` de Steem
+    // SSE dans le projet compagnon Stay). Envoyer un paquet par évènement
+    // SDL — potentiellement bien plus fréquent que le ~50 Hz réel — a pu
+    // désynchroniser le suivi du curseur GEM par rapport au vrai matériel.
+    let mut mouse_dx_acc = 0i32;
+    let mut mouse_dy_acc = 0i32;
 
     // `profile.cpu_hz` : voir sa doc dans `model.rs` — informatif seulement
     // pour l'instant (tous les profils renvoient 8 MHz), mais c'est déjà la
@@ -236,6 +258,13 @@ fn main() {
     // l'émulation progresse sans être bloquée, sans instrumenter chaque
     // instruction en usage normal.
     let debug = std::env::var("RUST68_DEBUG").is_ok();
+    // `RUST68_DUMP_VIDEO=1` (avec `RUST68_DEBUG=1`) : dump hexadécimal des
+    // 14 premières lignes de RAM vidéo à partir de `video_base`, une fois
+    // par seconde — pour inspecter le contenu réel pendant une corruption
+    // d'affichage observée visuellement (indépendant du clavier : se
+    // déclenche automatiquement, pas besoin d'envoyer une touche à la
+    // fenêtre SDL2 au bon moment).
+    let dump_video = std::env::var("RUST68_DUMP_VIDEO").is_ok();
     // `RUST68_TRACE_STEPS=N` : trace pc/sr/opcode des N premiers pas CPU
     // (diagnostic ponctuel, ex. pour observer la détection RAM au boot
     // froid instruction par instruction).
@@ -247,30 +276,124 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
+    // `RUST68_WATCH_VIDEO=1` : surveille la zone RAM vidéo lignes 11-66
+    // (celle où la corruption d'affichage a été observée) et logue le PC
+    // de l'instruction qui vient de la modifier, la première fois où son
+    // contenu change — pour identifier l'instruction TOS responsable sans
+    // avoir à comparer manuellement des dumps avant/après.
+    let watch_video = std::env::var("RUST68_WATCH_VIDEO").is_ok();
+    let mut watch_video_hash: Option<u64> = None;
+    let mut watch_video_hits: u32 = 0;
     let mut step_count: u64 = 0;
     let mut last_report = std::time::Instant::now();
+
+    // `RUST68_TRACE_FILL=1` : à chaque entrée dans la routine de
+    // remplissage rectangulaire logicielle ($E12C40, identifiée via
+    // RUST68_WATCH_VIDEO comme responsable de la corruption du menu),
+    // dump l'état complet des registres + les 2 mots au sommet de la
+    // pile (adresse de retour probable si entrée par JSR/BSR) — pour
+    // comparer avec un run de référence (Hatari) au même point d'entrée.
+    let trace_fill = std::env::var("RUST68_TRACE_FILL").is_ok();
+    const TRACE_FILL_PCS: [u32; 4] = [0xE12C40, 0xE12C4E, 0xE12C56, 0xE12C62];
+    let mut trace_fill_hits: [u32; TRACE_FILL_PCS.len()] = [0; TRACE_FILL_PCS.len()];
+    const TRACE_FILL_MAX_HITS_EACH: u32 = 6;
+
+    // `RUST68_TRACE_BLITDET=1` : trace la routine de détection matérielle du
+    // Blitter ($E01062, identifiée en désassemblant le ROM TOS) — probe
+    // volontaire d'un bus-error sur TST.W $FFFF8A00 (registre demi-teinte 0
+    // du Blitter). Logue l'entrée (a0=0 attendu) et la sortie (D0=2 si
+    // Blitter détecté, D0=0 sinon) pour vérifier si Rust68 déclenche par
+    // erreur un vrai bus-error là où le silicium réel ne le ferait pas.
+    let trace_blitdet = std::env::var("RUST68_TRACE_BLITDET").is_ok();
+    let mut blitdet_hits: u32 = 0;
+
+    // `RUST68_TRACE_DISPATCH=1` : trace le `jmp (a5)` en $E0B4AA qui choisit,
+    // via un pointeur de fonction lu à $9A(A4), entre la routine Blitter
+    // matérielle ($E0B4AC) et le repli logiciel ($E12C1C) — logue A4, le
+    // pointeur lu à $9A(A4) (donc A5 juste avant le jmp) et D4/D6/A0 pour
+    // voir si le pointeur lui-même ou les paramètres amont sont corrompus.
+    let trace_dispatch = std::env::var("RUST68_TRACE_DISPATCH").is_ok();
+    let mut dispatch_hits: u32 = 0;
+
+    // `RUST68_TRACE_SIM=1` : capture l'état complet à l'entrée d'un appel
+    // ($E12C1C, avant toute mutation de registre par la routine) puis, à sa
+    // sortie (RTS en $E12C4C/$E12C7C/$E12C92), dump les octets réellement
+    // écrits en RAM vidéo à partir de l'A1 d'origine — pour rejouer
+    // l'algorithme à la main (Python) et comparer au résultat réel, sans
+    // dépendre d'une référence Hatari.
+    let trace_sim = std::env::var("RUST68_TRACE_SIM").is_ok();
+    // `RUST68_TRACE_IKBD_READER=1` : logue le PC + SR de l'instruction qui
+    // vient de lire ACIA_KEYBOARD_DATA (RDRF retombé pendant ce pas) —
+    // contrairement à `RUST68_TRACE_IKBD` (côté bus, sait QUOI a été lu
+    // mais pas QUI l'a lu), ceci permet de vérifier que c'est bien le
+    // gestionnaire d'interruption clavier/souris du TOS qui consomme les
+    // octets IKBD, et pas une boucle d'attente sans rapport (SR indique le
+    // niveau IPL courant et le bit S : à l'intérieur d'un vrai handler
+    // d'interruption MFP, IPL doit valoir 6 et S=1).
+    let trace_ikbd_reader = std::env::var("RUST68_TRACE_IKBD_READER").is_ok();
+    let mut ikbd_reader_hits: u32 = 0;
+    // `RUST68_TRACE_IKBD_DISPATCH=1` : logue la cible du `jsr (a2)` en
+    // $E03DC4 (fin d'assemblage d'un paquet IKBD, TOS 1.62) — le
+    // gestionnaire spécifique au type de paquet (souris/joystick/clavier)
+    // qui reçoit le paquet assemblé en `a0` — pour savoir où continue le
+    // traitement d'un paquet souris complet.
+    let trace_ikbd_dispatch = std::env::var("RUST68_TRACE_IKBD_DISPATCH").is_ok();
+    let mut ikbd_dispatch_hits: u32 = 0;
+    let mut sim_entry: Option<([u32; 8], [u32; 8])> = None;
+    let mut sim_hits: u32 = 0;
 
     'running: loop {
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
+                // Cmd+Shift+F10 : bascule manuelle de l'exclusivité souris
+                // sans perdre le focus de la fenêtre (récupérer le curseur
+                // réel temporairement, par ex. pour changer d'application).
+                // Interceptée avant la remontée générale des touches vers
+                // l'IKBD ci-dessous : ne doit jamais atteindre le clavier ST.
+                Event::KeyDown {
+                    scancode: Some(Scancode::F10),
+                    keymod,
+                    repeat: false,
+                    ..
+                } if keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD)
+                    && keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD) =>
+                {
+                    let now_grabbed = !canvas.window().grab();
+                    canvas.window_mut().set_grab(now_grabbed);
+                    sdl_context.mouse().show_cursor(!now_grabbed);
+                    if debug {
+                        eprintln!("[souris] exclusivité basculée -> {now_grabbed}");
+                    }
+                }
+                Event::Window { win_event: WindowEvent::FocusGained, .. } => {
+                    canvas.window_mut().set_grab(true);
+                    sdl_context.mouse().show_cursor(false);
+                }
+                Event::Window { win_event: WindowEvent::FocusLost, .. } => {
+                    canvas.window_mut().set_grab(false);
+                    sdl_context.mouse().show_cursor(true);
+                }
                 Event::KeyDown {
                     scancode: Some(sc),
                     repeat: false,
                     ..
                 } => {
                     if let Some(code) = st_scancode(sc) {
-                        ikbd_tx_queue.push_back(code);
+                        st.ikbd.key_make(code);
                     }
                 }
                 Event::KeyUp {
                     scancode: Some(sc), ..
                 } => {
                     if let Some(code) = st_scancode(sc) {
-                        ikbd_tx_queue.push_back(code | 0x80);
+                        st.ikbd.key_break(code);
                     }
                 }
                 Event::MouseMotion { x, y, .. } => {
+                    if debug {
+                        eprintln!("[mouse] motion event reçu x={x} y={y} last_mouse_pos={last_mouse_pos:?}");
+                    }
                     if let Some((last_x, last_y)) = last_mouse_pos {
                         use rust68::peripherals::atari_st::shifter::Resolution;
                         let (logical_w, logical_h) = match st.shifter.resolution() {
@@ -283,7 +406,8 @@ fn main() {
                         let dx = raw_dx.trunc();
                         let dy = raw_dy.trunc();
                         mouse_scale_carry = (raw_dx - dx, raw_dy - dy);
-                        queue_mouse_packet(&mut ikbd_tx_queue, dx as i32, dy as i32, mouse_left, mouse_right);
+                        mouse_dx_acc += dx as i32;
+                        mouse_dy_acc += dy as i32;
                     }
                     last_mouse_pos = Some((x, y));
                 }
@@ -296,7 +420,6 @@ fn main() {
                     if debug {
                         eprintln!("[mouse] down {mouse_btn:?} -> left={mouse_left} right={mouse_right}");
                     }
-                    queue_mouse_packet(&mut ikbd_tx_queue, 0, 0, mouse_left, mouse_right);
                 }
                 Event::MouseButtonUp { mouse_btn, .. } => {
                     match mouse_btn {
@@ -307,11 +430,18 @@ fn main() {
                     if debug {
                         eprintln!("[mouse] up {mouse_btn:?} -> left={mouse_left} right={mouse_right}");
                     }
-                    queue_mouse_packet(&mut ikbd_tx_queue, 0, 0, mouse_left, mouse_right);
                 }
                 _ => {}
             }
         }
+
+        // Un seul échantillonnage souris par trame (voir la doc de
+        // `mouse_dx_acc`) : injecte le mouvement accumulé depuis la
+        // dernière trame, quel que soit le nombre d'évènements SDL bruts
+        // reçus entre-temps.
+        queue_mouse_move(&mut st.ikbd, mouse_dx_acc, mouse_dy_acc, mouse_left, mouse_right);
+        mouse_dx_acc = 0;
+        mouse_dy_acc = 0;
 
         // Fait tourner le CPU jusqu'à ce qu'une trame vidéo complète se soit
         // écoulée (détecté via le compteur de trame du GLUE), en échantillonnant
@@ -328,6 +458,95 @@ fn main() {
                     cpu.ssp
                 );
             }
+            let pc_before = cpu.pc;
+
+            if trace_blitdet && blitdet_hits < 4 && pc_before == 0xE0108A {
+                blitdet_hits += 1;
+                eprintln!(
+                    "[blitdet] hit #{blitdet_hits} pc={pc_before:#08x} d0={:#010x} (2=blitter détecté, 0=absent/bus-error) sr={:#06x}",
+                    cpu.d[0], cpu.sr
+                );
+            }
+
+            if trace_dispatch && dispatch_hits < 20 && pc_before == 0xE0B4AA {
+                dispatch_hits += 1;
+                eprintln!(
+                    "[dispatch] hit #{dispatch_hits} pc={pc_before:#08x} a4={:#010x} a5(cible du jmp)={:#010x} d4={:#010x} d6={:#010x} a0={:#010x} d0={:#010x}",
+                    cpu.a[4], cpu.a[5], cpu.d[4], cpu.d[6], cpu.a[0], cpu.d[0]
+                );
+            }
+
+            if trace_sim && sim_hits < 200 {
+                if pc_before == 0xE12C1C && sim_entry.is_none() {
+                    sim_entry = Some((cpu.d, cpu.a));
+                } else if sim_entry.is_some()
+                    && (pc_before == 0xE12C4C || pc_before == 0xE12C7C || pc_before == 0xE12C92)
+                {
+                    let (entry_d, entry_a) = sim_entry.take().unwrap();
+                    sim_hits += 1;
+                    let a1_orig = entry_a[1];
+                    let bytes: Vec<u8> = (0..64u32)
+                        .map(|o| st.read8(a1_orig.wrapping_add(o)))
+                        .collect();
+                    if bytes.iter().any(|&b| b != 0) {
+                        eprintln!(
+                            "[sim] #{sim_hits} entree_d={:x?} entree_a={:x?} sortie_pc={pc_before:#08x} a1_origine={a1_orig:#010x} octets={}",
+                            entry_d, entry_a,
+                            bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+                        );
+                    }
+                }
+            }
+
+            if trace_fill {
+                if let Some(idx) = TRACE_FILL_PCS.iter().position(|&p| p == pc_before) {
+                    if trace_fill_hits[idx] < TRACE_FILL_MAX_HITS_EACH {
+                        trace_fill_hits[idx] += 1;
+                        let sp = cpu.a[7];
+                        let ret_word0 = st.read16(sp);
+                        let ret_word1 = st.read16(sp.wrapping_add(2));
+                        let video_base = st.shifter.video_base();
+                        eprintln!(
+                            "[fill] hit #{} pc={pc_before:#08x} video_base={video_base:#010x} d0={:#010x} d1={:#010x} d2={:#010x} d3={:#010x} d4={:#010x} d5={:#010x} d6={:#010x} d7={:#010x} a0={:#010x} a1={:#010x} a2={:#010x} a3={:#010x} a4={:#010x} a5={:#010x} a6={:#010x} a7={sp:#010x} sr={:#06x} pile[a7..a7+4]={ret_word0:#06x}{ret_word1:04x}",
+                            trace_fill_hits[idx],
+                            cpu.d[0], cpu.d[1], cpu.d[2], cpu.d[3], cpu.d[4], cpu.d[5], cpu.d[6], cpu.d[7],
+                            cpu.a[0], cpu.a[1], cpu.a[2], cpu.a[3], cpu.a[4], cpu.a[5], cpu.a[6],
+                            cpu.sr,
+                        );
+                    }
+                }
+            }
+
+            if trace_ikbd_dispatch && ikbd_dispatch_hits < 20 && pc_before == 0xE03DC4 {
+                ikbd_dispatch_hits += 1;
+                let a0 = cpu.a[0];
+                let bytes: Vec<u8> = (0..4).map(|o| st.read8(a0.wrapping_add(o))).collect();
+                eprintln!(
+                    "[ikbd-dispatch] hit #{ikbd_dispatch_hits} cible=jsr(a2)={:#010x} a0(paquet)={a0:#010x} octets={}",
+                    cpu.a[2],
+                    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+                );
+            }
+            if trace_ikbd_dispatch && ikbd_dispatch_hits < 20 && pc_before == 0xE10CAA {
+                let read32 = |st: &mut rust68::systems::atari_st::AtariSt, a: u32| {
+                    ((st.read8(a) as u32) << 24)
+                        | ((st.read8(a + 1) as u32) << 16)
+                        | ((st.read8(a + 2) as u32) << 8)
+                        | st.read8(a + 3) as u32
+                };
+                eprintln!(
+                    "[ikbd-hooks] vecteur_bouton($2AE2)={:#010x} vecteur_position($2AEA)={:#010x} vecteur_notif($2AE6)={:#010x} pos_actuelle($28C2)={:#010x}",
+                    read32(&mut st, 0x2AE2),
+                    read32(&mut st, 0x2AEA),
+                    read32(&mut st, 0x2AE6),
+                    read32(&mut st, 0x28C2),
+                );
+            }
+
+            let rdrf_before = trace_ikbd_reader
+                && ikbd_reader_hits < 40
+                && st.acia_keyboard.read(rust68::peripherals::atari_st::acia::reg::CONTROL_STATUS) & 0x01 != 0;
+
             let cycles = match cpu.step(&mut st) {
                 Ok(cycles) => cycles,
                 Err(e) => {
@@ -335,23 +554,40 @@ fn main() {
                     break 'running;
                 }
             };
+
+            if rdrf_before {
+                let rdrf_after = st.acia_keyboard.read(rust68::peripherals::atari_st::acia::reg::CONTROL_STATUS) & 0x01 != 0;
+                if !rdrf_after {
+                    ikbd_reader_hits += 1;
+                    let ipl = (cpu.sr >> 8) & 0x07;
+                    let supervisor = cpu.sr & 0x2000 != 0;
+                    eprintln!(
+                        "[ikbd-reader] hit #{ikbd_reader_hits} pc={pc_before:#08x} sr={:#06x} ipl={ipl} superviseur={supervisor}",
+                        cpu.sr
+                    );
+                }
+            }
+
             st.tick(cycles);
             step_count += 1;
 
-            // Ne pousse l'octet suivant dans l'ACIA que si le précédent a
-            // bien été consommé par le programme (RDRF retombé) — lecture
-            // du registre de contrôle/statut, sans effet de bord (voir
-            // `Acia::read`, contrairement à une lecture du registre de
-            // données qui, elle, acquitte RDRF).
-            if !ikbd_tx_queue.is_empty() {
-                let rdrf = st.acia_keyboard.read(rust68::peripherals::atari_st::acia::reg::CONTROL_STATUS) & 0x01 != 0;
-                if !rdrf {
-                    if let Some(byte) = ikbd_tx_queue.pop_front() {
-                        if debug {
-                            eprintln!("[mouse] octet remis à l'ACIA : {byte:#04x} (reste {} en attente)", ikbd_tx_queue.len());
-                        }
-                        st.acia_keyboard.push_rx_byte(byte);
+            if watch_video {
+                let base = st.shifter.video_base();
+                let start = base.wrapping_add(11 * 160);
+                let len: u32 = (67 - 11) * 160;
+                let mut hash: u64 = 0xcbf29ce484222325;
+                for o in 0..len {
+                    hash ^= st.read8(start.wrapping_add(o)) as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+                if watch_video_hash != Some(hash) {
+                    if watch_video_hash.is_some() {
+                        watch_video_hits += 1;
+                        eprintln!(
+                            "[watch] zone vidéo (lignes 11-66) modifiée par l'instruction en pc={pc_before:#08x} (changement #{watch_video_hits})"
+                        );
                     }
+                    watch_video_hash = Some(hash);
                 }
             }
 
@@ -365,6 +601,33 @@ fn main() {
                     st.read32(0x42E),
                     st.read32(0x44E)
                 );
+                if dump_video {
+                    let base = st.shifter.video_base();
+                    eprintln!("[dump] video_base={base:#08x}");
+                    for line in 0..100usize {
+                        if let Some(row) = st.framebuffer.get(line) {
+                            let distinct: std::collections::BTreeSet<(u8, u8, u8)> = row.iter().copied().collect();
+                            // N'affiche les octets bruts que pour les lignes
+                            // "intéressantes" (plus de 3 couleurs) : évite de
+                            // noyer le log pour les lignes déjà comprises
+                            // (fond blanc/texte noir/vert uni).
+                            if distinct.len() > 3 {
+                                let addr = base.wrapping_add(line as u32 * 160);
+                                let bytes: Vec<u8> = (0..160).map(|o| st.read8(addr.wrapping_add(o))).collect();
+                                eprintln!(
+                                    "[raw] ligne {line:02} +{:#06x} : {}",
+                                    line * 160,
+                                    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+                                );
+                            }
+                            eprintln!(
+                                "[fb] ligne {line:02} : {} couleur(s) distincte(s) : {}",
+                                distinct.len(),
+                                distinct.iter().take(8).map(|(r, g, b)| format!("({r:02x},{g:02x},{b:02x})")).collect::<Vec<_>>().join(" ")
+                            );
+                        }
+                    }
+                }
                 last_report = std::time::Instant::now();
             }
 
@@ -565,41 +828,25 @@ fn st_scancode(sc: Scancode) -> Option<u8> {
 /// Met en attente un (ou plusieurs) rapport(s) de position relative de
 /// souris au protocole IKBD, via le même canal série que le clavier (l'IKBD
 /// partage une seule liaison avec l'ACIA clavier — voir le commentaire de
-/// module). `dx`/`dy` sont en pixels ; un paquet IKBD ne code que -128..127
-/// par composante, donc un déplacement plus grand (arrivé en une seule fois
-/// depuis SDL2) est découpé en plusieurs paquets successifs, comme le
-/// documente le protocole pour un mouvement dépassant la plage codable.
-/// Ne pousse PAS directement dans l'ACIA (voir `ikbd_tx_queue` dans `main`)
-/// : un burst de plusieurs octets sans laisser le programme les consommer
-/// un par un écraserait les octets suivants par overrun (registre de
-/// réception unique du MC6850, sans FIFO).
-fn queue_mouse_packet(
-    queue: &mut std::collections::VecDeque<u8>,
-    mut dx: i32,
-    mut dy: i32,
-    left: bool,
-    right: bool,
-) {
-    let header = 0xF8 | (left as u8) | ((right as u8) << 1);
-    let debug = std::env::var("RUST68_DEBUG").is_ok();
-    loop {
-        let cx = dx.clamp(-128, 127);
-        let cy = dy.clamp(-128, 127);
-        queue.push_back(header);
-        queue.push_back(cx as i8 as u8);
-        queue.push_back(cy as i8 as u8);
-        if debug {
-            eprintln!(
-                "[mouse] paquet mis en attente : {header:#04x} {:#04x} {:#04x} (file={} octets)",
-                cx as i8 as u8,
-                cy as i8 as u8,
-                queue.len()
-            );
-        }
-        dx -= cx;
-        dy -= cy;
-        if dx == 0 && dy == 0 {
-            break;
-        }
+/// module). `dx`/`dy` sont en pixels ST logiques. Le firmware IKBD réel ne
+/// code que ±15 unités par paquet (pas ±127, la seule limite du champ
+/// signé sur un octet) — un déplacement plus grand est découpé en
+/// plusieurs paquets successifs, comme le fait réellement le HD6301 (voir
+/// `Machine::mouse_move`/`flush_input_vbl` du projet compagnon Stay,
+/// vérifié contre Steem SSE `ikbd_mouse_move`).
+fn queue_mouse_move(ikbd: &mut rust68::peripherals::atari_st::ikbd::Ikbd, dx: i32, dy: i32, left: bool, right: bool) {
+    const MAX_MOVE: i32 = 15;
+    // Constaté empiriquement (voir ETAT.md) : le TOS échange les deux bits
+    // de bouton par rapport à la convention documentée bit0=gauche/
+    // bit1=droit — bit0=droit/bit1=gauche redonne le bon comportement.
+    let buttons = (right as u8) | ((left as u8) << 1);
+    let (mut x1, mut y1) = (0i32, 0i32);
+    while (dx - x1).abs() > MAX_MOVE || (dy - y1).abs() > MAX_MOVE {
+        let x2 = (dx - x1).clamp(-MAX_MOVE, MAX_MOVE);
+        let y2 = (dy - y1).clamp(-MAX_MOVE, MAX_MOVE);
+        ikbd.mouse_move(x2 as i8, y2 as i8, buttons);
+        x1 += x2;
+        y1 += y2;
     }
+    ikbd.mouse_move((dx - x1) as i8, (dy - y1) as i8, buttons);
 }

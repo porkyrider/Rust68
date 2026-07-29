@@ -65,6 +65,7 @@ pub mod model;
 use crate::peripherals::atari_st::acia::{self, Acia};
 use crate::peripherals::atari_st::blitter::{self, Blitter};
 use crate::peripherals::atari_st::glue::{Glue, VideoMode};
+use crate::peripherals::atari_st::ikbd::Ikbd;
 use crate::peripherals::atari_st::mfp::Mfp;
 use crate::peripherals::atari_st::shifter::{self, Shifter};
 use crate::peripherals::atari_st::wd1772::{self, DmaChannel, FloppyDisk, Wd1772};
@@ -201,6 +202,13 @@ pub struct AtariSt {
     /// contrôleur clavier via `push_rx_byte`, lire les commandes envoyées
     /// par le programme via `take_tx_byte`.
     pub acia_keyboard: Acia,
+    /// Contrôleur IKBD (HD6301) : traduit les événements clavier/souris
+    /// venant de l'hôte en octets protocole IKBD et gère les commandes
+    /// envoyées par le programme (reset, mode souris…). Câblé sur
+    /// `acia_keyboard` par [`Self::tick`] — voir [`ikbd::Ikbd`]. Champ
+    /// public : injecter les événements hôte via `key_make`/`key_break`/
+    /// `mouse_move`.
+    pub ikbd: Ikbd,
     /// ACIA MIDI (in/out).
     pub acia_midi: Acia,
     /// PSG YM2149 (son + ports d'E/S). Champ public : lire les niveaux de
@@ -348,6 +356,7 @@ impl AtariSt {
             mfp,
             glue: Glue::new(VideoMode::Pal50),
             acia_keyboard: Acia::new(),
+            ikbd: Ikbd::new(),
             acia_midi: Acia::new(),
             ym2149: Ym2149::new(),
             shifter: Shifter::new(),
@@ -408,6 +417,37 @@ impl AtariSt {
         self.mfp.tick(cpu_cycles);
         self.glue.tick(cpu_cycles);
         self.ym2149.tick(cpu_cycles);
+        self.ikbd.tick(cpu_cycles);
+        // Commandes envoyées par le programme (reset, mode souris…) : les
+        // relayer de l'émission de l'ACIA vers l'IKBD, qui les interprète.
+        while let Some(byte) = self.acia_keyboard.take_tx_byte() {
+            self.ikbd.receive_cmd(byte);
+        }
+        // Ne pousse l'octet suivant dans l'ACIA que si le précédent a bien
+        // été consommé par le programme (RDRF retombé) — lecture du
+        // registre de statut, sans effet de bord (contrairement à une
+        // lecture du registre de données, qui acquitte RDRF).
+        //
+        // Sur silicium réel, `/IRQ` de l'ACIA remonte réellement à 1 (le
+        // temps de l'intervalle série entre deux octets) avant de retomber
+        // pour l'octet suivant — un vrai front à chaque fois. Ici, pousser
+        // l'octet suivant dans le même tick() que celui où RDRF vient de
+        // retomber masque cette remontée : GPIP4 resterait à 0 en continu
+        // entre deux octets d'une même rafale (ex. les 3 octets d'une trame
+        // souris), et `Mfp::set_gpip_input` — à juste titre edge-triggered —
+        // ne verrait alors jamais de front pour les octets suivants, les
+        // laissant bloqués jusqu'à ce qu'un évènement sans rapport (une
+        // autre écriture de registre MFP) déclenche un front incident. Bug
+        // exact déjà isolé et corrigé dans le projet compagnon Stay (voir
+        // `Bus::read_acia_ikbd_data`) : forcer explicitement le relâchement
+        // (niveau haut) avant de réarmer RDRF pour l'octet suivant, dans le
+        // même tick, pour garantir un vrai front montant-puis-descendant.
+        if self.acia_keyboard.read(acia::reg::CONTROL_STATUS) & 0x01 == 0 {
+            if let Some(byte) = self.ikbd.pop_tx() {
+                self.mfp.set_gpip_input(4, true);
+                self.acia_keyboard.push_rx_byte(byte);
+            }
+        }
         // `/IRQ` (ACIA) et `/INTRQ` (WD1772) sont des signaux matériels réels
         // actifs bas (asserted = niveau logique 0, comme leur nom l'indique)
         // câblés directement sur GPIP4/GPIP5 — sans inverseur, GPIP doit
@@ -458,6 +498,12 @@ impl AtariSt {
                 self.mfp.pulse_tb();
             }
             guard += 1;
+        }
+        if guard >= lines_per_frame && self.last_absolute_line < absolute_line_now && std::env::var("RUST68_TRACE_VECTORS").is_ok() {
+            eprintln!(
+                "[trace] tick() : rattrapage vidéo tronqué par la garde (retard restant : {} lignes)",
+                absolute_line_now - self.last_absolute_line
+            );
         }
     }
 
@@ -520,7 +566,13 @@ impl Bus for AtariSt {
         }
         match addr {
             ACIA_KEYBOARD_CONTROL => return self.acia_keyboard.read(acia::reg::CONTROL_STATUS),
-            ACIA_KEYBOARD_DATA => return self.acia_keyboard.read(acia::reg::DATA),
+            ACIA_KEYBOARD_DATA => {
+                let v = self.acia_keyboard.read(acia::reg::DATA);
+                if std::env::var("RUST68_TRACE_IKBD").is_ok() {
+                    eprintln!("[ikbd] lecture ACIA_KEYBOARD_DATA -> {v:#04x}");
+                }
+                return v;
+            }
             ACIA_MIDI_CONTROL => return self.acia_midi.read(acia::reg::CONTROL_STATUS),
             ACIA_MIDI_DATA => return self.acia_midi.read(acia::reg::DATA),
             YM2149_SELECT => return self.ym2149.read(ym2149::bus_offset::SELECT),
@@ -637,6 +689,25 @@ impl Bus for AtariSt {
                 // Bit BUSY/START (bit 7) posé : déclenche le blit dans son
                 // intégralité (modèle synchrone, voir peripherals::atari_st::blitter).
                 if value & 0x80 != 0 {
+                    if std::env::var("RUST68_TRACE_BLITTER").is_ok() {
+                        let word = |a, b| ((self.blitter.read(a) as u32) << 8) | self.blitter.read(b) as u32;
+                        let long = |a: u32| {
+                            ((self.blitter.read(a) as u32) << 24)
+                                | ((self.blitter.read(a + 1) as u32) << 16)
+                                | ((self.blitter.read(a + 2) as u32) << 8)
+                                | self.blitter.read(a + 3) as u32
+                        };
+                        eprintln!(
+                            "[trace] blit : src={:#08x} dst={:#08x} x={} y={} hop={} op={:#03x} skew={:#04x}",
+                            long(blitter::reg::SRC_ADDR),
+                            long(blitter::reg::DST_ADDR),
+                            word(blitter::reg::X_COUNT, blitter::reg::X_COUNT1),
+                            word(blitter::reg::Y_COUNT, blitter::reg::Y_COUNT1),
+                            self.blitter.read(blitter::reg::HOP),
+                            self.blitter.read(blitter::reg::OP),
+                            self.blitter.read(blitter::reg::SKEW),
+                        );
+                    }
                     let mut ram_bus = RamBus { ram: &mut self.ram };
                     self.blitter.execute(&mut ram_bus);
                 }
@@ -670,6 +741,7 @@ impl Bus for AtariSt {
         self.mfp.set_gpip_input(4, true);
         self.mfp.set_gpip_input(5, true);
         self.acia_keyboard = Acia::new();
+        self.ikbd = Ikbd::new();
         self.acia_midi = Acia::new();
         self.ym2149 = Ym2149::new();
         self.shifter = Shifter::new();

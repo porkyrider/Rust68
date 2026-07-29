@@ -13,6 +13,7 @@
 pub mod acia;
 pub mod blitter;
 pub mod glue;
+pub mod ikbd;
 pub mod mfp;
 pub mod shifter;
 pub mod stx;
