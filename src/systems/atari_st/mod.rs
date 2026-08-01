@@ -386,6 +386,7 @@ impl AtariSt {
     pub fn from_model(profile: model::MachineProfile, rom: Vec<u8>) -> Self {
         let mut st = Self::new(profile.ram_size, rom);
         st.blitter_present = profile.has_blitter;
+        st.shifter.set_ste_palette(profile.ste_palette);
         st
     }
 
@@ -600,6 +601,70 @@ impl Bus for AtariSt {
         0xFF
     }
 
+    // Registres de palette Shifter (`$FF8240`-`$FF825E`) : sur le silicium
+    // réel (confirmé par Hatari, `Video_ColorReg_WriteWord`), un accès `.W`
+    // ou `.L` du CPU écrit le mot normalement, mais un accès `.B` ISOLÉ
+    // duplique l'octet écrit dans les deux moitiés du mot avant masquage
+    // (voir la doc de [`shifter::Shifter::write`]). Le `write8` par défaut
+    // ne voit jamais qu'un octet à la fois et ne peut donc pas distinguer
+    // ces deux cas — cette surcharge de `write16` intercepte les VRAIS
+    // accès mot pour cette plage précise et les route vers
+    // `write_palette_word`, qui n'applique pas la duplication.
+    fn write16(&mut self, addr: u32, value: u16) {
+        let masked = addr & ADDR_MASK;
+        if (shifter::addr::PALETTE_BASE..shifter::addr::PALETTE_BASE + 32).contains(&masked) {
+            self.shifter.write_palette_word(masked, value);
+            return;
+        }
+        // Registres Blitter 16 bits (SRC_X_INC/SRC_Y_INC/ENDMASK1-3/
+        // DST_X_INC/DST_Y_INC/X_COUNT/Y_COUNT) : sur le silicium réel, un
+        // accès `.B` ISOLÉ à l'un de ces registres est ignoré (confirmé par
+        // Hatari, `Blitter_CheckAccess_Byte`) — seul un accès `.W`/`.L`
+        // complet est honoré. Le `write8` par défaut ne voit jamais qu'un
+        // octet à la fois et ne peut donc pas faire cette distinction :
+        // cette surcharge intercepte les VRAIS accès mot pour ces
+        // registres précis et les route vers `Blitter::write_word` (voir sa
+        // doc) plutôt que vers la composition octet par octet.
+        if self.blitter_present && (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&masked) {
+            let reg_offset = masked - BLITTER_BASE;
+            if reg_offset < 0x20
+                || matches!(
+                    reg_offset,
+                    blitter::reg::SRC_X_INC
+                        | blitter::reg::SRC_Y_INC
+                        | blitter::reg::ENDMASK_1
+                        | blitter::reg::ENDMASK_2
+                        | blitter::reg::ENDMASK_3
+                        | blitter::reg::DST_X_INC
+                        | blitter::reg::DST_Y_INC
+                        | blitter::reg::X_COUNT
+                        | blitter::reg::Y_COUNT
+                )
+            {
+                self.blitter.write_word(reg_offset, value);
+                return;
+            }
+        }
+        self.write8(addr, (value >> 8) as u8);
+        self.write8(addr.wrapping_add(1), value as u8);
+    }
+
+    fn write32(&mut self, addr: u32, value: u32) {
+        let masked = addr & ADDR_MASK;
+        // SRC_ADDR/DST_ADDR du Blitter : registres 32 bits (24 bits
+        // significatifs), même principe que `write16` ci-dessus — seul un
+        // accès `.L` complet est honoré sur le silicium réel.
+        if self.blitter_present && (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&masked) {
+            let reg_offset = masked - BLITTER_BASE;
+            if reg_offset == blitter::reg::SRC_ADDR || reg_offset == blitter::reg::DST_ADDR {
+                self.blitter.write_long(reg_offset, value);
+                return;
+            }
+        }
+        self.write16(addr, (value >> 16) as u16);
+        self.write16(addr.wrapping_add(2), value as u16);
+    }
+
     fn write8(&mut self, addr: u32, value: u8) {
         let addr = addr & ADDR_MASK;
         if addr < 16 && std::env::var("RUST68_TRACE_VECTORS").is_ok() {
@@ -697,8 +762,19 @@ impl Bus for AtariSt {
                                 | ((self.blitter.read(a + 2) as u32) << 8)
                                 | self.blitter.read(a + 3) as u32
                         };
+                        let halftone_table: Vec<String> = (0..16)
+                            .map(|i| {
+                                format!(
+                                    "{:04x}",
+                                    word(
+                                        blitter::reg::HALFTONE_BASE + i * 2,
+                                        blitter::reg::HALFTONE_BASE + i * 2 + 1
+                                    )
+                                )
+                            })
+                            .collect();
                         eprintln!(
-                            "[trace] blit : src={:#08x} dst={:#08x} x={} y={} hop={} op={:#03x} skew={:#04x}",
+                            "[trace] blit : src={:#08x} dst={:#08x} x={} y={} hop={} op={:#03x} skew={:#04x} control={:#04x} endmask1={:#06x} endmask2={:#06x} endmask3={:#06x} src_xinc={} src_yinc={} dst_xinc={} dst_yinc={} halftone=[{}]",
                             long(blitter::reg::SRC_ADDR),
                             long(blitter::reg::DST_ADDR),
                             word(blitter::reg::X_COUNT, blitter::reg::X_COUNT1),
@@ -706,10 +782,52 @@ impl Bus for AtariSt {
                             self.blitter.read(blitter::reg::HOP),
                             self.blitter.read(blitter::reg::OP),
                             self.blitter.read(blitter::reg::SKEW),
+                            value,
+                            word(blitter::reg::ENDMASK_1, blitter::reg::ENDMASK_11),
+                            word(blitter::reg::ENDMASK_2, blitter::reg::ENDMASK_21),
+                            word(blitter::reg::ENDMASK_3, blitter::reg::ENDMASK_31),
+                            word(blitter::reg::SRC_X_INC, blitter::reg::SRC_X_INC1) as i16,
+                            word(blitter::reg::SRC_Y_INC, blitter::reg::SRC_Y_INC1) as i16,
+                            word(blitter::reg::DST_X_INC, blitter::reg::DST_X_INC1) as i16,
+                            word(blitter::reg::DST_Y_INC, blitter::reg::DST_Y_INC1) as i16,
+                            halftone_table.join(","),
                         );
+                    }
+                    // `RUST68_TRACE_BLITTER_MEM=1` : dump le contenu réel de
+                    // la destination (tous les mots de la première ligne,
+                    // espacés de DST_X_INC) avant/après `execute()`, pour
+                    // vérifier directement le résultat écrit par le Blitter
+                    // plutôt que de le déduire à la main depuis les
+                    // paramètres seuls.
+                    let trace_mem = std::env::var("RUST68_TRACE_BLITTER_MEM").is_ok();
+                    let mem_dst_addr = ((self.blitter.read(blitter::reg::DST_ADDR) as u32) << 24)
+                        | ((self.blitter.read(blitter::reg::DST_ADDR1) as u32) << 16)
+                        | ((self.blitter.read(blitter::reg::DST_ADDR2) as u32) << 8)
+                        | self.blitter.read(blitter::reg::DST_ADDR3) as u32;
+                    let mem_x_count = ((self.blitter.read(blitter::reg::X_COUNT) as u32) << 8)
+                        | self.blitter.read(blitter::reg::X_COUNT1) as u32;
+                    let mem_dst_xinc = (((self.blitter.read(blitter::reg::DST_X_INC) as u16) << 8)
+                        | self.blitter.read(blitter::reg::DST_X_INC1) as u16) as i16;
+                    if trace_mem {
+                        let before: Vec<String> = (0..mem_x_count.max(1).min(20))
+                            .map(|i| {
+                                let a = mem_dst_addr.wrapping_add((i as i32 * mem_dst_xinc as i32) as u32);
+                                format!("{:04x}", self.read16(a))
+                            })
+                            .collect();
+                        eprintln!("[blitmem] AVANT dst={mem_dst_addr:#08x} : [{}]", before.join(","));
                     }
                     let mut ram_bus = RamBus { ram: &mut self.ram };
                     self.blitter.execute(&mut ram_bus);
+                    if trace_mem {
+                        let after: Vec<String> = (0..mem_x_count.max(1).min(20))
+                            .map(|i| {
+                                let a = mem_dst_addr.wrapping_add((i as i32 * mem_dst_xinc as i32) as u32);
+                                format!("{:04x}", self.read16(a))
+                            })
+                            .collect();
+                        eprintln!("[blitmem] APRES dst={mem_dst_addr:#08x} : [{}]", after.join(","));
+                    }
                 }
                 return;
             }
@@ -744,7 +862,10 @@ impl Bus for AtariSt {
         self.ikbd = Ikbd::new();
         self.acia_midi = Acia::new();
         self.ym2149 = Ym2149::new();
-        self.shifter = Shifter::new();
+        // `Shifter::reset` (pas `Shifter::new()`) : préserve `ste_palette`,
+        // une caractéristique du silicium (voir sa doc) que RESET ne doit
+        // pas effacer.
+        self.shifter.reset();
         self.wd1772 = Wd1772::new();
         self.dma_register_select = 0;
         self.dma_address = 0;

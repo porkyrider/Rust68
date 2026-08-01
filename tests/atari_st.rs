@@ -10,7 +10,7 @@ use rust68::peripherals::atari_st::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
     BLITTER_BASE, DEFAULT_ROM_BASE, DMA_ADDR_HIGH, DMA_ADDR_LOW, DMA_ADDR_MID, DMA_MODE, FDC_DATA,
-    IO_BASE, MFP_BASE, STE_DMA_SOUND_BASE, YM2149_DATA, YM2149_SELECT,
+    IO_BASE, MFP_BASE, STE_DMA_SOUND_BASE, YM2149_DATA, YM2149_SELECT, model,
 };
 use rust68::{Bus, Cpu};
 
@@ -54,8 +54,10 @@ fn from_model_regle_ram_et_presence_du_blitter() {
     use rust68::systems::atari_st::model::AtariModel;
 
     // 1040STE : Blitter de série, 1 Mo de RAM (l'exemple donné pour ce lexique).
+    // Écriture par MOT complet : un accès `.B` isolé sur ce registre est
+    // ignoré sur le silicium réel (voir `Blitter::write`).
     let mut ste = AtariSt::from_model(AtariModel::Ste1040.profile(), vec![]);
-    ste.write8(BLITTER_BASE + blitter_reg::HALFTONE_BASE, 0x42);
+    ste.write16(BLITTER_BASE + blitter_reg::HALFTONE_BASE, 0x4200);
     assert_eq!(
         ste.read8(BLITTER_BASE + blitter_reg::HALFTONE_BASE),
         0x42,
@@ -160,6 +162,28 @@ fn irq_level_cablee_sur_ipl6_via_le_mfp() {
     let vector = st.irq_ack(6);
     assert_eq!(vector & 0x07, channel::GPIP0);
     assert_eq!(st.irq_level(), 0, "IACK a effacé le pending MFP");
+}
+
+#[test]
+fn reset_bus_preserve_la_palette_etendue_ste() {
+    // `ste_palette` est une caractéristique du silicium (quel Shifter est
+    // physiquement dans la machine), pas un registre — RESET (que le TOS
+    // exécute lui-même tôt au démarrage, voir `AtariSt::reset_bus`) ne doit
+    // pas la réinitialiser. Un bug précédent remplaçait tout le Shifter par
+    // `Shifter::new()` (toujours `ste_palette=false`), ce qui repassait
+    // silencieusement toute machine STE en palette ST (9 bits) dès la
+    // première instruction RESET du TOS — reproduit ici en écrivant une
+    // valeur 12 bits ($0FFF, blanc) et en vérifiant qu'elle n'est PAS
+    // tronquée au masque ST ($0777) après reset.
+    let profile = model::AtariModel::Ste1040.profile();
+    let mut st = AtariSt::from_model(profile, vec![]);
+    st.reset_bus();
+    st.write16(shifter_addr::PALETTE_BASE, 0x0FFF);
+    assert_eq!(
+        st.shifter.palette_raw()[0],
+        0x0FFF,
+        "palette STE (12 bits) doit survivre à reset_bus, pas retomber au masque ST (9 bits)"
+    );
 }
 
 #[test]
@@ -379,10 +403,12 @@ fn tick_rend_une_ligne_video_dans_le_framebuffer() {
     let mut st = AtariSt::new(0x10000, vec![]);
     // Base vidéo = 0x000000 (par défaut), résolution basse.
     st.write8(shifter_addr::RESOLUTION, 0b00);
-    // Palette couleur 1 = blanc.
+    // Palette couleur 1 = blanc. Écriture par mot (accès `.W` normal du
+    // CPU) : deux `write8` isolés dupliqueraient chacun leur octet dans
+    // les deux moitiés du registre (comportement matériel réel, voir
+    // `Shifter::write`) et ne donneraient PAS le résultat voulu en général.
     let c1 = shifter_addr::PALETTE_BASE + 2;
-    st.write8(c1, 0x07);
-    st.write8(c1 + 1, 0x77);
+    st.write16(c1, 0x0777);
     // Plan 0, premier mot = 0x8000 (pixel 0 posé -> couleur 1).
     st.write8(0x0000, 0x80);
     st.write8(0x0001, 0x00);
@@ -530,16 +556,16 @@ fn reset_bus_reinitialise_le_wd1772() {
     assert!(!st.wd1772.interrupt_requested(), "reset_bus doit réinitialiser le WD1772");
 }
 
+// Écriture par mot/long complet (accès `.W`/`.L` réel du CPU) : sur le
+// silicium réel, la plupart des registres Blitter ignorent un accès `.B`
+// isolé (voir `Blitter::write`) — composer la valeur via des `write8`
+// séparés n'aurait donc plus aucun effet depuis ce changement.
 fn write_blitter_word(st: &mut AtariSt, offset: u32, value: u16) {
-    st.write8(BLITTER_BASE + offset, (value >> 8) as u8);
-    st.write8(BLITTER_BASE + offset + 1, value as u8);
+    st.write16(BLITTER_BASE + offset, value);
 }
 
 fn write_blitter_long(st: &mut AtariSt, offset: u32, value: u32) {
-    st.write8(BLITTER_BASE + offset, (value >> 24) as u8);
-    st.write8(BLITTER_BASE + offset + 1, (value >> 16) as u8);
-    st.write8(BLITTER_BASE + offset + 2, (value >> 8) as u8);
-    st.write8(BLITTER_BASE + offset + 3, value as u8);
+    st.write32(BLITTER_BASE + offset, value);
 }
 
 #[test]
@@ -557,7 +583,7 @@ fn blitter_registres_mappes_a_ff8a00() {
 fn ecrire_control_declenche_le_blit_bout_en_bout() {
     let mut st = AtariSt::new(0x4000, vec![]);
     st.write8(BLITTER_BASE + blitter_reg::HOP, 2); // source seule
-    st.write8(BLITTER_BASE + blitter_reg::OP, 0xC); // copie
+    st.write8(BLITTER_BASE + blitter_reg::OP, 0x3); // copie (source)
     write_blitter_word(&mut st, blitter_reg::SRC_X_INC, 2);
     write_blitter_word(&mut st, blitter_reg::DST_X_INC, 2);
     write_blitter_word(&mut st, blitter_reg::X_COUNT, 1);

@@ -197,8 +197,15 @@ fn main() {
     // interne par warp a déjà causé une dérive diagonale sur ce backend: le
     // calcul de delta par position absolue existant reste inchangé,
     // seulement le confinement/l'affichage du curseur changent ici.
-    canvas.window_mut().set_grab(true);
-    sdl_context.mouse().show_cursor(false);
+    // `RUST68_NO_MOUSE_GRAB=1` désactive tout ça (debug/automatisation) :
+    // le confinement gêne un positionnement absolu externe (ex. `cliclick`
+    // depuis un outil d'automatisation, qui ne peut plus faire sortir le
+    // curseur hôte de la fenêtre pour ensuite le repositionner ailleurs).
+    let mouse_grab_enabled = std::env::var("RUST68_NO_MOUSE_GRAB").is_err();
+    if mouse_grab_enabled {
+        canvas.window_mut().set_grab(true);
+        sdl_context.mouse().show_cursor(false);
+    }
 
     let desired_spec = AudioSpecDesired {
         freq: Some(AUDIO_SAMPLE_RATE),
@@ -284,8 +291,28 @@ fn main() {
     let watch_video = std::env::var("RUST68_WATCH_VIDEO").is_ok();
     let mut watch_video_hash: Option<u64> = None;
     let mut watch_video_hits: u32 = 0;
+    let mut watch_video_last_cycles: u64 = 0;
     let mut step_count: u64 = 0;
     let mut last_report = std::time::Instant::now();
+
+    // `RUST68_WATCH_RANGE=debut,fin` (hex, ex: "0fb900,0fc900") : surveille
+    // OCTET PAR OCTET (pas juste un hash global) une zone précise de RAM
+    // vidéo, et logue pc/adresse/avant/après pour CHAQUE octet modifié —
+    // pour repérer exactement quelle instruction écrit quoi, et quand,
+    // dans le contenu déjà en place avant qu'un blit de "teinte" (hop=1)
+    // ne s'applique dessus (diagnostic du menu déroulant "Visualisation").
+    let watch_range: Option<(u32, u32)> = std::env::var("RUST68_WATCH_RANGE").ok().and_then(|s| {
+        let (a, b) = s.split_once(',')?;
+        Some((
+            u32::from_str_radix(a.trim(), 16).ok()?,
+            u32::from_str_radix(b.trim(), 16).ok()?,
+        ))
+    });
+    let mut watch_range_snapshot: Vec<u8> = Vec::new();
+    if let Some((start, end)) = watch_range {
+        watch_range_snapshot = (start..end).map(|a| st.read8(a)).collect();
+    }
+    let mut watch_range_hits: u64 = 0;
 
     // `RUST68_TRACE_FILL=1` : à chaque entrée dans la routine de
     // remplissage rectangulaire logicielle ($E12C40, identifiée via
@@ -322,6 +349,19 @@ fn main() {
     // l'algorithme à la main (Python) et comparer au résultat réel, sans
     // dépendre d'une référence Hatari.
     let trace_sim = std::env::var("RUST68_TRACE_SIM").is_ok();
+    // `RUST68_TRACE_CURSOR=1` : dump l'état complet à chaque exécution de
+    // $E1366C (écriture d'un mot du sprite curseur — voir désassemblage
+    // dans ETAT.md), pour comparer registre par registre entre une
+    // position "propre" (loin du menu) et une position "corrompue" (près
+    // du menu / clic sur icône).
+    let trace_cursor = std::env::var("RUST68_TRACE_CURSOR").is_ok();
+    // `RUST68_TRACE_BLIT_CALLER=1` : à l'entrée de la routine de
+    // déclenchement du blit curseur ($E0B160, TOS 1.62), logue l'adresse
+    // de retour (sommet de pile) et D7 (futur Y_COUNT, avant le calcul
+    // conditionnel) pour remonter à l'appelant qui fournit ce paramètre.
+    let trace_blit_caller = std::env::var("RUST68_TRACE_BLIT_CALLER").is_ok();
+    let mut blit_caller_hits: u32 = 0;
+    let mut cursor_hits: u32 = 0;
     // `RUST68_TRACE_IKBD_READER=1` : logue le PC + SR de l'instruction qui
     // vient de lire ACIA_KEYBOARD_DATA (RDRF retombé pendant ce pas) —
     // contrairement à `RUST68_TRACE_IKBD` (côté bus, sait QUOI a été lu
@@ -338,6 +378,9 @@ fn main() {
     // qui reçoit le paquet assemblé en `a0` — pour savoir où continue le
     // traitement d'un paquet souris complet.
     let trace_ikbd_dispatch = std::env::var("RUST68_TRACE_IKBD_DISPATCH").is_ok();
+    // `RUST68_MUTE=1` : coupe la sortie audio (débogage vidéo sans le bruit
+    // parasite du son STE/DMA — bug distinct, pas encore investigué).
+    let mute = std::env::var("RUST68_MUTE").is_ok();
     let mut ikbd_dispatch_hits: u32 = 0;
     let mut sim_entry: Option<([u32; 8], [u32; 8])> = None;
     let mut sim_hits: u32 = 0;
@@ -356,7 +399,8 @@ fn main() {
                     keymod,
                     repeat: false,
                     ..
-                } if keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD)
+                } if mouse_grab_enabled
+                    && keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD)
                     && keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD) =>
                 {
                     let now_grabbed = !canvas.window().grab();
@@ -366,11 +410,11 @@ fn main() {
                         eprintln!("[souris] exclusivité basculée -> {now_grabbed}");
                     }
                 }
-                Event::Window { win_event: WindowEvent::FocusGained, .. } => {
+                Event::Window { win_event: WindowEvent::FocusGained, .. } if mouse_grab_enabled => {
                     canvas.window_mut().set_grab(true);
                     sdl_context.mouse().show_cursor(false);
                 }
-                Event::Window { win_event: WindowEvent::FocusLost, .. } => {
+                Event::Window { win_event: WindowEvent::FocusLost, .. } if mouse_grab_enabled => {
                     canvas.window_mut().set_grab(false);
                     sdl_context.mouse().show_cursor(true);
                 }
@@ -543,6 +587,51 @@ fn main() {
                 );
             }
 
+            if trace_blit_caller
+                && blit_caller_hits < 300
+                && matches!(pc_before, 0xE0B1B2 | 0xE0B518 | 0xE10C02)
+            {
+                blit_caller_hits += 1;
+                let sp = cpu.a[7];
+                let ret_addr = st.read32(sp);
+                use rust68::peripherals::atari_st::blitter::reg as blitreg;
+                let y_count = ((st.blitter.read(blitreg::Y_COUNT) as u16) << 8)
+                    | st.blitter.read(blitreg::Y_COUNT1) as u16;
+                let x_count = ((st.blitter.read(blitreg::X_COUNT) as u16) << 8)
+                    | st.blitter.read(blitreg::X_COUNT1) as u16;
+                eprintln!(
+                    "[blit-caller] hit #{blit_caller_hits} pc={pc_before:#08x} retour={ret_addr:#010x} X_COUNT={x_count} Y_COUNT={y_count} d0={:#010x} d1={:#010x} d2={:#010x} d3={:#010x} d4={:#010x} d6={:#010x} d7={:#010x} a4={:#010x}",
+                    cpu.d[0], cpu.d[1], cpu.d[2], cpu.d[3], cpu.d[4], cpu.d[6], cpu.d[7], cpu.a[4],
+                );
+            }
+
+            if trace_cursor && cursor_hits < 200_000 && pc_before == 0xE1366C {
+                let a5 = cpu.a[5];
+                let read16 = |st: &mut rust68::systems::atari_st::AtariSt, a: u32| st.read16(a);
+                let video_base = st.shifter.video_base();
+                let a1 = cpu.a[1];
+                let row = if a1 >= video_base { (a1 - video_base) / 160 } else { u32::MAX };
+                // Ne logue que les écritures proches ou dans la barre de
+                // menu (lignes 0-14) — les milliers d'autres (curseur
+                // ailleurs sur le bureau) noieraient le signal.
+                if row <= 14 {
+                cursor_hits += 1;
+                eprintln!(
+                    "[cursor] hit #{cursor_hits} a1(dest)={a1:#010x} ligne_fb={row} d0={:#010x} d1={:#010x} d2={:#010x} d3={:#010x} a0={:#010x} shift(-24,a5)={:#06x} d2src(-20,a5)={:#06x} nmots(-12,a5)={:#06x} stride_src(-c,a5)={:#06x} stride_dst(-e,a5)={:#06x} op1(-26,a5)={:#06x} op2(-2a,a5)={:#06x} op3(-28,a5)={:#06x} op4(-2c,a5)={:#06x}",
+                    cpu.d[0], cpu.d[1], cpu.d[2], cpu.d[3], cpu.a[0],
+                    read16(&mut st, a5.wrapping_sub(0x24)),
+                    read16(&mut st, a5.wrapping_sub(0x20)),
+                    read16(&mut st, a5.wrapping_sub(0x12)),
+                    read16(&mut st, a5.wrapping_sub(0x0c)),
+                    read16(&mut st, a5.wrapping_sub(0x0e)),
+                    read16(&mut st, a5.wrapping_sub(0x26)),
+                    read16(&mut st, a5.wrapping_sub(0x2a)),
+                    read16(&mut st, a5.wrapping_sub(0x28)),
+                    read16(&mut st, a5.wrapping_sub(0x2c)),
+                );
+                }
+            }
+
             let rdrf_before = trace_ikbd_reader
                 && ikbd_reader_hits < 40
                 && st.acia_keyboard.read(rust68::peripherals::atari_st::acia::reg::CONTROL_STATUS) & 0x01 != 0;
@@ -573,8 +662,14 @@ fn main() {
 
             if watch_video {
                 let base = st.shifter.video_base();
-                let start = base.wrapping_add(11 * 160);
-                let len: u32 = (67 - 11) * 160;
+                // Lignes 0-66 : inclut désormais la barre de menu elle-même
+                // (lignes 0-10) en plus de la zone sous le menu, pour
+                // repérer l'instruction qui écrit le curseur/la barre de
+                // menu quand le curseur en approche (indice utilisateur :
+                // le curseur devient partiellement jaune/rouge près du
+                // menu, et au clic sur une icône).
+                let start = base;
+                let len: u32 = 67 * 160;
                 let mut hash: u64 = 0xcbf29ce484222325;
                 for o in 0..len {
                     hash ^= st.read8(start.wrapping_add(o)) as u64;
@@ -583,12 +678,41 @@ fn main() {
                 if watch_video_hash != Some(hash) {
                     if watch_video_hash.is_some() {
                         watch_video_hits += 1;
+                        // `cpu.cycles` (et le delta depuis la dernière
+                        // modification détectée) permet de mesurer combien de
+                        // cycles CPU réels s'écoulent entre deux écritures
+                        // successives dans cette zone (ex. les 4 plans d'un
+                        // même sprite curseur) — à comparer aux 512
+                        // cycles/ligne PAL pour juger si une séquence
+                        // multi-plans réaliste peut effectivement chevaucher
+                        // une frontière de ligne (question du "cursor turns
+                        // yellow" : chevauchement de scanline pendant une
+                        // mise à jour multi-plans non atomique).
+                        let delta = cpu.cycles.wrapping_sub(watch_video_last_cycles);
                         eprintln!(
-                            "[watch] zone vidéo (lignes 11-66) modifiée par l'instruction en pc={pc_before:#08x} (changement #{watch_video_hits})"
+                            "[watch] zone vidéo (lignes 0-66) modifiée par l'instruction en pc={pc_before:#08x} (changement #{watch_video_hits}) cycles={} delta={delta}",
+                            cpu.cycles
                         );
                     }
                     watch_video_hash = Some(hash);
+                    watch_video_last_cycles = cpu.cycles;
                 }
+            }
+
+            if let Some((start, end)) = watch_range {
+                for (i, prev) in watch_range_snapshot.iter_mut().enumerate() {
+                    let addr = start + i as u32;
+                    let now = st.read8(addr);
+                    if now != *prev {
+                        watch_range_hits += 1;
+                        eprintln!(
+                            "[range] addr={addr:#08x} {:#04x}->{:#04x} pc={pc_before:#08x} (#{watch_range_hits})",
+                            *prev, now
+                        );
+                        *prev = now;
+                    }
+                }
+                let _ = end;
             }
 
             if debug && last_report.elapsed().as_secs_f64() >= 1.0 {
@@ -643,6 +767,18 @@ fn main() {
         }
 
         if !audio_buffer.is_empty() {
+            // `mute` : n'envoie pas le son réel à SDL, mais continue de
+            // remplir la file audio (avec du silence, même nombre
+            // d'échantillons) — c'est le REMPLISSAGE de cette file qui
+            // cadence la vitesse d'émulation (voir
+            // AUDIO_QUEUE_HIGH_WATERMARK plus haut) ; sauter complètement
+            // `queue_audio` (comme le faisait une version précédente)
+            // laissait la file en permanence vide et supprimait donc aussi
+            // ce cadencement, faisant tourner l'émulation bien plus vite
+            // que la vitesse réelle.
+            if mute {
+                audio_buffer.iter_mut().for_each(|s| *s = 0);
+            }
             let _ = audio_queue.queue_audio(&audio_buffer);
             audio_buffer.clear();
         }

@@ -11,6 +11,14 @@
 //! RAM et renvoie des pixels RGB 24 bits, prêts à être posés dans n'importe
 //! quel framebuffer hôte. C'est au board de :
 //! - mapper [`Shifter::read`]/[`Shifter::write`] dans son `Bus`,
+//! - appeler [`Shifter::write_palette_word`] pour tout accès `.W`/`.L` du
+//!   CPU touchant un registre de palette (`$FF8240`-`$FF825E`) — contrairement
+//!   à [`Shifter::write`], qui suppose systématiquement un accès `.B` isolé
+//!   et duplique l'octet écrit dans les deux moitiés du mot, comportement
+//!   réel du silicium mais faux pour une écriture `.W`/`.L` normale (voir la
+//!   doc de [`Shifter::write`]),
+//! - appeler [`Shifter::set_ste_palette`] juste après construction d'après le
+//!   modèle de machine ([`crate::systems::atari_st::model::MachineProfile::ste_palette`]),
 //! - appeler [`Shifter::start_frame`] à chaque VBL (recharge le compteur
 //!   vidéo depuis l'adresse de base),
 //! - appeler [`Shifter::render_scanline`] à chaque HBL en lui passant sa
@@ -19,9 +27,6 @@
 //!   `Bus::is_contended`/`TimedBus`, pas ici).
 //!
 //! ## Limitations connues (v1)
-//! - Format de palette **ST uniquement** (9 bits, 3×3 bits RGB) ; pas le
-//!   format étendu STE (12 bits, 3×4). Structuré pour rester extensible,
-//!   mais pas implémenté.
 //! - Les registres de compteur vidéo (`$FF8205`/`07`/`09`) acceptent
 //!   toujours l'écriture logicielle (comportement STE) ; sur ST d'origine,
 //!   ils sont normalement lecture seule.
@@ -108,8 +113,13 @@ pub struct Shifter {
     video_base: u32,
     video_counter: u32,
     resolution: Resolution,
-    /// 16 couleurs, format ST brut (bits 8-10=R, 4-6=G, 0-2=B, 3 bits chacun).
+    /// 16 couleurs. Format brut selon [`Self::ste_palette`] : ST (9 bits,
+    /// 8-10=R/4-6=G/0-2=B, 3 bits chacun) ou STE (12 bits, 8-11=R/4-7=G/0-3=B,
+    /// 4 bits chacun, nibbles contigus).
     palette: [u16; 16],
+    /// Palette étendue STE (12 bits/4 par composante) au lieu du format ST
+    /// d'origine (9 bits/3 par composante) — voir [`Self::set_ste_palette`].
+    ste_palette: bool,
 }
 
 impl Default for Shifter {
@@ -125,7 +135,34 @@ impl Shifter {
             video_counter: 0,
             resolution: Resolution::Low,
             palette: [0; 16],
+            ste_palette: false,
         }
+    }
+
+    /// Active/désactive le format de palette étendu STE (12 bits) — à
+    /// appeler juste après construction d'après [`crate::systems::atari_st::model::MachineProfile::ste_palette`].
+    pub fn set_ste_palette(&mut self, on: bool) {
+        self.ste_palette = on;
+    }
+
+    /// Réinitialise l'état interne (registres/compteur/palette) suite à un
+    /// `/RESET` matériel, en préservant [`Self::ste_palette`] : contrairement
+    /// aux registres, la présence de la palette étendue STE est une
+    /// caractéristique du silicium (quel Shifter est physiquement présent
+    /// dans la machine), pas un état remis à zéro par une impulsion RESET —
+    /// remplacer l'instance entière par `Shifter::new()` (comme le faisait
+    /// une version précédente de `AtariSt::reset_bus`) perdait ce réglage à
+    /// chaque exécution de l'instruction RESET (le TOS en exécute une au
+    /// démarrage), ce qui repassait silencieusement toute la session en
+    /// format de palette ST (9 bits) sur une machine STE.
+    pub fn reset(&mut self) {
+        let ste_palette = self.ste_palette;
+        *self = Self::new();
+        self.ste_palette = ste_palette;
+    }
+
+    fn palette_mask(&self) -> u16 {
+        if self.ste_palette { 0x0FFF } else { 0x0777 }
     }
 
     pub fn resolution(&self) -> Resolution {
@@ -191,16 +228,47 @@ impl Shifter {
                 self.video_counter = (self.video_counter & 0xFFFF00) | value as u32
             }
             addr::RESOLUTION => self.resolution = Resolution::from_bits(value),
+            // Écriture d'un SEUL octet dans un registre de palette : sur le
+            // silicium réel (confirmé par Hatari, `Video_ColorReg_WriteWord`,
+            // commentaire donnant `move.b #7,$ff8240 -> couleur 0 = $707`),
+            // l'octet écrit est dupliqué dans LES DEUX moitiés du mot AVANT
+            // masquage — l'autre moitié n'est PAS préservée. Une version
+            // précédente ne touchait que la moitié réellement écrite en
+            // conservant l'autre : correct pour une écriture .W/.L (voir
+            // [`Self::write_palette_word`], utilisé par le board pour ce
+            // cas), mais faux pour une instruction .B isolée, qui écrase
+            // alors la moitié non écrite avec une valeur non liée (ex. bits
+            // rouges corrompus par un reliquat d'une autre couleur) — cohérent
+            // avec un curseur/texte qui vire occasionnellement au rouge/jaune
+            // au lieu de rester noir.
             _ if (addr::PALETTE_BASE..addr::PALETTE_BASE + 32).contains(&bus_addr) => {
                 let color = ((bus_addr - addr::PALETTE_BASE) / 2) as usize;
-                let word = &mut self.palette[color];
-                if (bus_addr - addr::PALETTE_BASE) % 2 == 0 {
-                    *word = (*word & 0x00FF) | (((value & 0x07) as u16) << 8);
-                } else {
-                    *word = (*word & 0xFF00) | (value & 0x77) as u16;
+                let duplicated = ((value as u16) << 8) | value as u16;
+                self.palette[color] = duplicated & self.palette_mask();
+                if std::env::var("RUST68_TRACE_PALETTE").is_ok() {
+                    eprintln!(
+                        "[palette] .B addr={bus_addr:#08x} color={color} value={value:#04x} -> {:#06x}",
+                        self.palette[color]
+                    );
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Écrit un mot complet (16 bits) dans un registre de palette — chemin
+    /// utilisé par le board pour les accès `.W`/`.L` du CPU (contrairement à
+    /// [`Self::write`], qui ne voit qu'un octet à la fois et suppose donc
+    /// systématiquement un accès `.B` isolé ; voir la duplication d'octet
+    /// documentée là-bas). `bus_addr` doit être l'adresse paire du registre.
+    pub fn write_palette_word(&mut self, bus_addr: u32, value: u16) {
+        let color = ((bus_addr - addr::PALETTE_BASE) / 2) as usize;
+        self.palette[color] = value & self.palette_mask();
+        if std::env::var("RUST68_TRACE_PALETTE").is_ok() {
+            eprintln!(
+                "[palette] .W addr={bus_addr:#08x} color={color} value={value:#06x} -> {:#06x}",
+                self.palette[color]
+            );
         }
     }
 
@@ -264,14 +332,23 @@ impl Shifter {
         pixels
     }
 
-    /// Convertit un mot de palette ST brut (3×3 bits RGB) en RGB 24 bits,
-    /// par réplication de bits (0..7 -> 0..255 exactement, pas juste une
-    /// mise à l'échelle approximative).
+    /// Convertit un mot de palette brut en RGB 24 bits, par réplication de
+    /// bits (0..2^n-1 -> 0..255 exactement, pas juste une mise à l'échelle
+    /// approximative) — 3 bits/composante en ST (`$RGB` sur 9 bits), 4
+    /// bits/composante en STE (`$RGB` sur 12 bits, nibbles contigus, voir
+    /// [`Self::ste_palette`]).
     fn color_to_rgb(&self, word: u16) -> (u8, u8, u8) {
-        let r3 = ((word >> 8) & 0x07) as u8;
-        let g3 = ((word >> 4) & 0x07) as u8;
-        let b3 = (word & 0x07) as u8;
-        (expand3(r3), expand3(g3), expand3(b3))
+        if self.ste_palette {
+            let r4 = ((word >> 8) & 0x0F) as u8;
+            let g4 = ((word >> 4) & 0x0F) as u8;
+            let b4 = (word & 0x0F) as u8;
+            (expand4(r4), expand4(g4), expand4(b4))
+        } else {
+            let r3 = ((word >> 8) & 0x07) as u8;
+            let g3 = ((word >> 4) & 0x07) as u8;
+            let b3 = (word & 0x07) as u8;
+            (expand3(r3), expand3(g3), expand3(b3))
+        }
     }
 }
 
@@ -280,4 +357,10 @@ impl Shifter {
 /// entre les deux, plutôt qu'une simple multiplication approximative.
 fn expand3(v: u8) -> u8 {
     (v << 5) | (v << 2) | (v >> 1)
+}
+
+/// Réplique une valeur 4 bits (0-15) sur 8 bits (0-255) : `v<<4 | v` donne
+/// exactement 0 et 255 aux extrémités et une progression régulière.
+fn expand4(v: u8) -> u8 {
+    (v << 4) | v
 }

@@ -77,6 +77,9 @@ pub struct MachineProfile {
     pub tos_version: &'static str,
     /// Blitter présent de série sur ce modèle.
     pub has_blitter: bool,
+    /// Palette Shifter étendue STE (12 bits, 4 bits par composante) au lieu
+    /// du format ST d'origine (9 bits, 3 bits par composante).
+    pub ste_palette: bool,
 }
 
 impl AtariModel {
@@ -89,6 +92,7 @@ impl AtariModel {
                 ram_size: 512 * 1024,
                 tos_version: "1.02",
                 has_blitter: false,
+                ste_palette: false,
             },
             AtariModel::St1040 => MachineProfile {
                 name: "Atari 1040ST",
@@ -96,6 +100,7 @@ impl AtariModel {
                 ram_size: 1024 * 1024,
                 tos_version: "1.04",
                 has_blitter: false,
+                ste_palette: false,
             },
             AtariModel::MegaSt => MachineProfile {
                 name: "Atari Mega ST",
@@ -103,6 +108,7 @@ impl AtariModel {
                 ram_size: 1024 * 1024,
                 tos_version: "1.04",
                 has_blitter: true,
+                ste_palette: false,
             },
             AtariModel::Ste520 => MachineProfile {
                 name: "Atari 520STE",
@@ -110,6 +116,7 @@ impl AtariModel {
                 ram_size: 512 * 1024,
                 tos_version: "1.62",
                 has_blitter: true,
+                ste_palette: true,
             },
             AtariModel::Ste1040 => MachineProfile {
                 name: "Atari 1040STE",
@@ -117,6 +124,7 @@ impl AtariModel {
                 ram_size: 1024 * 1024,
                 tos_version: "1.62",
                 has_blitter: true,
+                ste_palette: true,
             },
             AtariModel::MegaSte => MachineProfile {
                 name: "Atari Mega STE",
@@ -124,6 +132,7 @@ impl AtariModel {
                 ram_size: 4 * 1024 * 1024,
                 tos_version: "2.06",
                 has_blitter: true,
+                ste_palette: true,
             },
         }
     }

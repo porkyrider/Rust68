@@ -30,23 +30,44 @@ fn resolution_lue_et_ecrite() {
 
 #[test]
 fn palette_round_trip() {
+    // Écriture par mot (`.W`/`.L`, chemin normal du board — voir
+    // `write_palette_word`) : les deux octets sont pris tels quels, pas de
+    // duplication (contrairement à `write`, réservé aux accès `.B` isolés,
+    // voir `octet_isole_duplique_dans_les_deux_moities`).
     let mut sh = Shifter::new();
     let addr_color3 = addr::PALETTE_BASE + 3 * 2;
-    sh.write(addr_color3, 0x07); // octet haut : R=7
-    sh.write(addr_color3 + 1, 0x77); // octet bas : G=7, B=7
+    sh.write_palette_word(addr_color3, 0x0777); // R=7, G=7, B=7
     assert_eq!(sh.read(addr_color3), 0x07);
     assert_eq!(sh.read(addr_color3 + 1), 0x77);
+}
+
+#[test]
+fn octet_isole_duplique_dans_les_deux_moities() {
+    // Comportement matériel réel documenté (Hatari, `Video_ColorReg_WriteWord`) :
+    // un accès `.B` isolé sur un registre de palette duplique l'octet écrit
+    // dans les DEUX moitiés du mot avant masquage — l'autre moitié n'est
+    // pas préservée. Reproduit l'exemple donné en commentaire côté Hatari :
+    //   move.w #0,$ff8240      -> couleur 0 = $000
+    //   move.b #7,$ff8240      -> couleur 0 = $707
+    //   move.b #$55,$ff8241    -> couleur 0 = $555
+    let mut sh = Shifter::new();
+    sh.write_palette_word(addr::PALETTE_BASE, 0x0000);
+    assert_eq!(sh.palette_raw()[0], 0x000);
+
+    sh.write(addr::PALETTE_BASE, 0x07); // .B sur l'octet haut
+    assert_eq!(sh.palette_raw()[0], 0x707, ".B haut duplique 0x07 dans les 2 octets");
+
+    sh.write(addr::PALETTE_BASE + 1, 0x55); // .B sur l'octet bas
+    assert_eq!(sh.palette_raw()[0], 0x555, ".B bas duplique 0x55 dans les 2 octets");
 }
 
 #[test]
 fn rendu_basse_resolution_un_groupe_16_pixels() {
     let mut sh = Shifter::new();
     // Palette : couleur 0 = noir, couleur 1 = blanc.
-    sh.write(addr::PALETTE_BASE, 0x00);
-    sh.write(addr::PALETTE_BASE + 1, 0x00);
+    sh.write_palette_word(addr::PALETTE_BASE, 0x0000);
     let c1 = addr::PALETTE_BASE + 1 * 2;
-    sh.write(c1, 0x07);
-    sh.write(c1 + 1, 0x77);
+    sh.write_palette_word(c1, 0x0777);
     sh.write(addr::RESOLUTION, 0b00); // basse résolution, 4 plans
 
     // Plan 0 = 0x8000 (bit15 posé), plans 1-3 = 0 : le pixel 0 doit avoir
@@ -69,8 +90,7 @@ fn rendu_moyenne_resolution_deux_plans() {
     let mut sh = Shifter::new();
     for (i, val) in [(0u32, 0x000), (1, 0x700), (2, 0x070), (3, 0x777)] {
         let a = addr::PALETTE_BASE + i * 2;
-        sh.write(a, (val >> 8) as u8);
-        sh.write(a + 1, val as u8);
+        sh.write_palette_word(a, val as u16);
     }
     sh.write(addr::RESOLUTION, 0b01); // moyenne résolution, 2 plans
 
