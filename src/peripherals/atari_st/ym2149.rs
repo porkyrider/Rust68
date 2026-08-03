@@ -81,8 +81,15 @@ impl ToneGenerator {
     /// Avance d'un cycle puce (déjà divisé du cycle CPU par l'appelant).
     /// Une tonalité désactivée (period 0, cas réel documenté : traité comme
     /// 1) bascule quand même au rythme minimal plutôt que de geler.
+    ///
+    /// Le compteur interne du silicium avance à clock/8 (pas à la fréquence
+    /// puce elle-même) : basculer tous les `period` cycles puce donnerait un
+    /// son 8× trop aigu. Confirmé par recoupement datasheet AY-3-8910/YM2149
+    /// et par l'implémentation de référence Hatari (`sound.c`,
+    /// `ToneA_count`/`ToneA_per` incrémentés une fois par tick à 250 kHz pour
+    /// une puce cadencée à 2 MHz).
     fn tick(&mut self, period_reg: u16) {
-        let period = period_reg.max(1);
+        let period = period_reg.max(1) * 8;
         self.counter += 1;
         if self.counter >= period {
             self.counter = 0;
@@ -93,7 +100,7 @@ impl ToneGenerator {
 
 #[derive(Debug, Clone, Default)]
 struct NoiseGenerator {
-    counter: u8,
+    counter: u16,
     /// LFSR 17 bits (bit 0 = sortie courante). Polynôme standard
     /// AY-3-8910 : rebouclage sur XOR des bits 0 et 3.
     lfsr: u32,
@@ -107,8 +114,12 @@ impl NoiseGenerator {
         }
     }
 
+    /// Le compteur de bruit du silicium avance deux fois moins vite que celui
+    /// de tonalité/enveloppe (clock/16 au lieu de clock/8) — vérifié dans
+    /// Hatari (`sound.c`, `YM2149_Freq_div_2` : `Noise_count` n'avance qu'un
+    /// cycle sur deux par rapport à `ToneX_count`).
     fn tick(&mut self, period_reg: u8) {
-        let period = period_reg.max(1);
+        let period = period_reg.max(1) as u16 * 16;
         self.counter += 1;
         if self.counter >= period {
             self.counter = 0;
@@ -146,7 +157,7 @@ impl EnvelopeShape {
 
 #[derive(Debug, Clone)]
 struct EnvelopeGenerator {
-    counter: u16,
+    counter: u32,
     /// Position dans la rampe 0..31 (5 bits de résolution, deux fois celle
     /// des canaux — comportement standard documenté du chip).
     step: u8,
@@ -179,11 +190,16 @@ impl EnvelopeGenerator {
         self.finished = false;
     }
 
+    /// Le compteur d'enveloppe avance au même rythme que celui de tonalité
+    /// (clock/8) — vérifié dans Hatari (`sound.c`, `Env_count`/`Env_per`
+    /// incrémentés dans la même boucle à 250 kHz que `ToneX_count`). La
+    /// résolution doublée (32 pas au lieu de 16) vient uniquement du nombre
+    /// de pas de la rampe, pas d'un diviseur d'horloge différent.
     fn tick(&mut self, period_reg: u16) {
         if self.finished {
             return;
         }
-        let period = period_reg.max(1);
+        let period = period_reg.max(1) as u32 * 8;
         self.counter += 1;
         if self.counter < period {
             return;
@@ -235,6 +251,15 @@ pub struct Ym2149 {
     /// `set_port_a_input`/`set_port_b_input`.
     port_a_in: u8,
     port_b_in: u8,
+    /// Somme des niveaux de sortie de chaque canal, accumulée À CHAQUE
+    /// cycle puce (pas juste échantillonnée ponctuellement) depuis le
+    /// dernier [`Self::take_averaged_levels`] — voir sa doc : nécessaire
+    /// pour éviter l'aliasing quand on convertit vers un taux
+    /// d'échantillonnage audio (44,1 kHz) bien plus lent que l'horloge
+    /// puce (2 MHz, jusqu'à ~45 bascules possibles entre deux échantillons
+    /// de sortie pour une tonalité aiguë).
+    level_accum: [u32; 3],
+    level_accum_count: u32,
 }
 
 impl Default for Ym2149 {
@@ -254,6 +279,8 @@ impl Ym2149 {
             envelope: EnvelopeGenerator::new(),
             port_a_in: 0,
             port_b_in: 0,
+            level_accum: [0; 3],
+            level_accum_count: 0,
         }
     }
 
@@ -338,7 +365,49 @@ impl Ym2149 {
             self.tone[2].tick(tone_c);
             self.noise.tick(noise_period);
             self.envelope.tick(envelope_period);
+            // Accumule le niveau de CE cycle puce précis (pas seulement
+            // l'état final après la boucle) — voir la doc de
+            // `level_accum`/`take_averaged_levels`.
+            for ch in 0..3 {
+                self.level_accum[ch] += self.channel_level(ch) as u32;
+            }
+            self.level_accum_count += 1;
         }
+    }
+
+    /// Moyenne temporelle du niveau de chaque canal depuis le dernier appel
+    /// (ou depuis la création/le reset si jamais appelé), puis remet
+    /// l'accumulateur à zéro pour la prochaine période — à appeler une fois
+    /// par échantillon de sortie audio produit (pas plus souvent), sans quoi
+    /// la moyenne ne porterait que sur une fraction de la période réelle.
+    ///
+    /// Contrairement à [`Self::channel_level`] (un échantillonnage ponctuel
+    /// de l'état instantané), ceci intègre TOUTES les bascules
+    /// tonalité/bruit survenues entre deux échantillons de sortie — sans ça,
+    /// une tonalité dont la période puce est plus courte que la période
+    /// d'échantillonnage audio (44,1 kHz vs 2 MHz : jusqu'à ~45 bascules
+    /// possibles par échantillon de sortie) produit un repliement de
+    /// spectre (aliasing) qui sonne comme un parasite granuleux au lieu
+    /// d'une tonalité propre — confirmé par un enregistrement réel de
+    /// l'utilisateur montrant une forme d'onde en escalier au lieu d'un
+    /// signal carré net.
+    pub fn take_averaged_levels(&mut self) -> [f32; 3] {
+        let count = self.level_accum_count;
+        let levels = if count == 0 {
+            // Aucun cycle puce écoulé depuis le dernier appel (sortie audio
+            // échantillonnée plus vite que l'horloge puce, cas limite) :
+            // retombe sur l'état instantané plutôt qu'une division par zéro.
+            [self.channel_level(0) as f32, self.channel_level(1) as f32, self.channel_level(2) as f32]
+        } else {
+            let mut out = [0.0f32; 3];
+            for ch in 0..3 {
+                out[ch] = self.level_accum[ch] as f32 / count as f32;
+            }
+            out
+        };
+        self.level_accum = [0; 3];
+        self.level_accum_count = 0;
+        levels
     }
 
     /// Niveau numérique de sortie 0-31 du canal `channel` (0=A, 1=B, 2=C) à

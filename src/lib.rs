@@ -40,9 +40,10 @@ mod cpu;
 mod execute;
 pub mod peripherals;
 pub mod systems;
+pub mod trace;
 
 pub use addressing::{Operand, Size};
-pub use bus::{Bus, TimedBus};
+pub use bus::{Bus, TimedBus, TraceSink, TracingBus};
 pub use cpu::{ADDR_MASK, Cpu, ccr, sr};
 pub use execute::StepError;
 

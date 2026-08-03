@@ -85,7 +85,7 @@ fn ipr_isr_ne_s_effacent_que_par_ecriture_de_zero() {
 }
 
 #[test]
-fn iack_calcule_le_vecteur_et_arme_isr_sauf_en_auto_eoi() {
+fn iack_calcule_le_vecteur_et_arme_isr_dans_les_deux_modes_eoi() {
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::AER, 0x01);
@@ -103,7 +103,15 @@ fn iack_calcule_le_vecteur_et_arme_isr_sauf_en_auto_eoi() {
     );
     assert_eq!(mfp.read(reg::IPRB) & 1, 0, "IPR est effacé par l'IACK");
 
-    // Mode auto-EOI (bit 3 du VR) : ISR ne doit jamais s'armer.
+    // Mode auto-EOI (bit 3 du VR) : ISR s'arme quand même après l'IACK — ce
+    // bit dispense seulement le logiciel d'avoir à l'effacer lui-même en fin
+    // de traitement (le matériel le ferait automatiquement), il ne rend pas
+    // le bit invisible pendant que le gestionnaire tourne. Confirmé par la
+    // cartouche de diagnostic usine STe : son gestionnaire d'interruption
+    // partagé (test "T0 MFP timer") programme VR=0x48 puis distingue quel
+    // timer a déclenché en lisant précisément ces bits ISR — un mécanisme
+    // qui ne pourrait jamais fonctionner sur aucun ST/STE réel si ISR
+    // n'était jamais armé en auto-EOI.
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::AER, 0x01);
@@ -112,7 +120,7 @@ fn iack_calcule_le_vecteur_et_arme_isr_sauf_en_auto_eoi() {
     mfp.write(reg::VR, 0x48); // bit3 = auto-EOI
     mfp.set_gpip_input(0, true);
     mfp.iack();
-    assert_eq!(mfp.read(reg::ISRB) & 1, 0, "auto-EOI : ISR reste à 0");
+    assert_eq!(mfp.read(reg::ISRB) & 1, 1, "auto-EOI : ISR s'arme aussi après l'IACK");
 }
 
 #[test]
@@ -224,13 +232,16 @@ fn timer_a_event_count_ignore_tick_et_reagit_a_pulse() {
     }
     assert!(!mfp.interrupt_requested(), "event-count : tick() ne doit rien décompter");
 
-    // pulse_ta() doit décompter : période = data+1 = 4 pulses.
-    for _ in 0..3 {
+    // pulse_ta() doit décompter : période = data = 3 pulses (même compteur
+    // que le mode delay, voir la doc de `Timer::decrement` — le compte
+    // affiché juste après rechargement vaut déjà `data`, donc le
+    // déclenchement a lieu au `data`-ième décrément, pas au `data+1`-ième).
+    for _ in 0..2 {
         mfp.pulse_ta();
         assert!(!mfp.interrupt_requested());
     }
     mfp.pulse_ta();
-    assert!(mfp.interrupt_requested(), "4e pulse : déclenchement attendu");
+    assert!(mfp.interrupt_requested(), "3e pulse : déclenchement attendu");
 }
 
 #[test]
@@ -257,4 +268,26 @@ fn usart_reception_et_transmission_au_niveau_octet() {
     assert_eq!(mfp.take_tx_byte(), Some(0x42));
     assert_eq!(mfp.take_tx_byte(), None);
     assert_eq!(mfp.read(reg::TSR) & 0x80, 0x80, "buffer empty après transmission");
+}
+
+#[test]
+fn tsr_buffer_empty_a_1_au_reset_et_survit_a_l_activation_emetteur() {
+    // Reproduit la séquence d'initialisation standard de l'USART (ex.
+    // cartouche de diagnostic usine STe) : TSR démarre à "buffer empty" par
+    // défaut (aucun octet en attente au reset), et l'activer via bit0
+    // (Transmitter Enable) ne doit pas effacer ce bit de statut matériel —
+    // sinon plus aucune transmission ne peut jamais avoir lieu ensuite.
+    let mut mfp = Mfp::new();
+    assert_eq!(mfp.read(reg::TSR) & 0x80, 0x80, "buffer empty dès le reset");
+
+    mfp.write(reg::TSR, 0x01); // active l'émetteur (bit0), comme le ferait un vrai pilote
+    assert_eq!(
+        mfp.read(reg::TSR) & 0x80,
+        0x80,
+        "buffer empty doit survivre à l'activation de l'émetteur"
+    );
+    assert_eq!(mfp.read(reg::TSR) & 0x01, 0x01, "bit d'activation bien pris en compte");
+
+    mfp.write(reg::UDR, 0x55);
+    assert_eq!(mfp.take_tx_byte(), Some(0x55), "la transmission doit fonctionner après l'activation");
 }

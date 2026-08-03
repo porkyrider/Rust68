@@ -42,7 +42,8 @@
 use rust68::peripherals::atari_st::stx::StxImage;
 use rust68::peripherals::atari_st::wd1772::{FloppyDisk, RawDiskImage};
 use rust68::systems::atari_st::AtariSt;
-use rust68::{Bus, Cpu};
+use rust68::trace::FileTraceSink;
+use rust68::{Bus, Cpu, TraceSink, TracingBus};
 
 use sdl2::audio::{AudioQueue, AudioSpecDesired};
 use sdl2::event::{Event, WindowEvent};
@@ -51,18 +52,46 @@ use sdl2::pixels::PixelFormatEnum;
 use std::time::Duration;
 
 const AUDIO_SAMPLE_RATE: i32 = 44_100;
-/// Seuil de remplissage de la file audio (en octets, mono i16 = 2 octets/échantillon)
-/// au-delà duquel on ralentit l'émulation pour rester au rythme temps réel.
-const AUDIO_QUEUE_HIGH_WATERMARK: u32 = (AUDIO_SAMPLE_RATE as u32) * 2 / 4; // ~250 ms
+/// Octets par échantillon de sortie : stéréo (2 canaux) × i16 (2 octets)
+/// — voir `desired_spec`.
+const AUDIO_BYTES_PER_SAMPLE: u32 = 4;
+/// Seuil de remplissage de la file audio (en octets) au-delà duquel on
+/// ralentit l'émulation pour rester au rythme temps réel.
+///
+/// Volontairement généreux (~500 ms, plutôt que les ~250 ms d'une version
+/// précédente) : le cadencement horloge murale (voir plus bas, où ce seuil
+/// n'est qu'un filet de sécurité secondaire) reste vulnérable à un `sleep`
+/// ponctuel bien plus long que demandé — regroupement de minuteurs macOS,
+/// mise en veille de l'app, ou simple préemption OS — qui peut vider une
+/// bonne partie de la file d'un coup ; une marge plus large absorbe ce genre
+/// d'épisode sans décroché audible plutôt que d'espérer l'éliminer à la
+/// source (hors de portée d'un simple `std::thread::sleep`).
+const AUDIO_QUEUE_HIGH_WATERMARK: u32 = AUDIO_SAMPLE_RATE as u32 * AUDIO_BYTES_PER_SAMPLE / 2; // ~500 ms
+/// Seuil de remplissage initial (en octets) avant de démarrer la lecture —
+/// sans cette marge, la file démarre vide et le device audio hôte consomme
+/// plus vite qu'on ne peut produire pendant les toutes premières trames
+/// (et à chaque micro-ralentissement ponctuel de l'émulation ensuite,
+/// puisque seul un seuil HAUT existait auparavant, sans coussin en cas de
+/// sous-remplissage) : chaque fois que la file se vide complètement, SDL2
+/// rejoue du silence ou boucle le dernier bloc selon le backend, entendu
+/// comme un « parasite »/clic — d'où le démarrage différé de la lecture ici.
+const AUDIO_QUEUE_PRIME_WATERMARK: u32 = AUDIO_SAMPLE_RATE as u32 * AUDIO_BYTES_PER_SAMPLE / 5; // ~200 ms
+/// Coefficient de lissage du gain Microwire (voir sa doc dans `main`) —
+/// constante de temps d'environ 1/coeff échantillons, ~4-5 ms à 44100 Hz :
+/// assez rapide pour suivre un vrai changement de volume voulu, assez lent
+/// pour éviter un saut audible en plein milieu d'un signal non nul.
+const GAIN_SMOOTH_COEFF: f32 = 0.005;
 /// Modèle par défaut si `--model` n'est pas précisé.
 const DEFAULT_MODEL: &str = "1040ste";
 
 fn usage(program: &str) -> ! {
     eprintln!(
-        "Usage : {program} [--model <nom>] <rom.img> [disque.stx|disque.st]\n\n\
+        "Usage : {program} [--model <nom>] [--ntsc] <rom.img> [disque.stx|disque.st]\n\n\
          Modèles disponibles (--model, casse indifférente) : 520st, 1040st, megast, \
          520ste, 1040ste (défaut), megaste — voir `systems::atari_st::model` pour le \
-         détail de chaque profil (RAM, Blitter…)."
+         détail de chaque profil (RAM, Blitter…).\n\
+         --ntsc : mode vidéo 60 Hz (263 lignes/trame) au lieu du PAL 50 Hz par défaut \
+         (313 lignes/trame) — voir `peripherals::atari_st::glue::VideoMode`."
     );
     std::process::exit(1);
 }
@@ -72,6 +101,7 @@ fn main() {
     let program = args[0].clone();
 
     let mut model_name = DEFAULT_MODEL.to_string();
+    let mut ntsc = false;
     let mut positional: Vec<&String> = Vec::new();
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -80,6 +110,8 @@ fn main() {
                 Some(v) => model_name = v.clone(),
                 None => usage(&program),
             }
+        } else if arg == "--ntsc" {
+            ntsc = true;
         } else {
             positional.push(arg);
         }
@@ -127,10 +159,50 @@ fn main() {
     let ram_size = profile.ram_size;
     let mut st = AtariSt::from_model(profile, rom);
     st.set_rom_base(rom_base);
+    if ntsc {
+        st.set_video_mode(rust68::peripherals::atari_st::glue::VideoMode::Ntsc60);
+        eprintln!("Mode vidéo : NTSC 60 Hz (--ntsc)");
+    }
     if let Some(path) = disk_path {
         match load_floppy(path) {
             Ok(disk) => st.floppy_a = Some(disk),
             Err(e) => eprintln!("Impossible de charger le disque {path} : {e} (démarrage sans disquette)"),
+        }
+    }
+
+    // `RUST68_CARTRIDGE_HGH`/`RUST68_CARTRIDGE_LOW` : deux images ROM 8 bits
+    // séparées (octet haut / octet bas de chaque mot — format EPROM courant
+    // des cartouches de diagnostic matériel ST/STE), entrelacées ici en une
+    // seule image 16 bits native et mappée au port cartouche (`$FA0000`).
+    if let (Ok(hgh_path), Ok(low_path)) = (
+        std::env::var("RUST68_CARTRIDGE_HGH"),
+        std::env::var("RUST68_CARTRIDGE_LOW"),
+    ) {
+        match (std::fs::read(&hgh_path), std::fs::read(&low_path)) {
+            (Ok(hgh), Ok(low)) if hgh.len() == low.len() => {
+                let mut cart = Vec::with_capacity(hgh.len() * 2);
+                for (h, l) in hgh.iter().zip(low.iter()) {
+                    cart.push(*h);
+                    cart.push(*l);
+                }
+                eprintln!("Cartouche chargée : {} octets ({hgh_path} + {low_path})", cart.len());
+                st.load_cartridge(cart);
+            }
+            (Ok(hgh), Ok(low)) => {
+                eprintln!(
+                    "Tailles HGH ({}) et LOW ({}) différentes, cartouche non chargée",
+                    hgh.len(),
+                    low.len()
+                );
+            }
+            (hgh_res, low_res) => {
+                if let Err(e) = hgh_res {
+                    eprintln!("Impossible de lire {hgh_path} : {e}");
+                }
+                if let Err(e) = low_res {
+                    eprintln!("Impossible de lire {low_path} : {e}");
+                }
+            }
         }
     }
 
@@ -175,6 +247,43 @@ fn main() {
     let mut cpu = Cpu::new();
     cpu.reset(&mut st);
 
+    if std::env::var("RUST68_COLD_BOOT").is_err() && !st.has_cartridge() {
+        // MEMORY_CONF ($FF8001) : même raccourci que memvalid/phystop
+        // ci-dessus — sauf que le TOS, lui, écrit INCONDITIONNELLEMENT
+        // MEMORY_CONF=0 très tôt au boot (avant même de consulter
+        // memvalid), normalement corrigé seulement en toute fin de
+        // l'algorithme de détection RAM que ce raccourci saute justement.
+        // Un simple pré-remplissage se ferait donc aussitôt écraser :
+        // `pin_memory_conf` fige la valeur pour qu'elle survive à cette
+        // écriture (voir sa doc). Fait APRÈS `cpu.reset()`, pas avant :
+        // désactiver l'overlay ROM à l'adresse 0 avant la lecture du
+        // vecteur reset (SSP/PC) le ferait lire dans de la RAM encore
+        // vierge plutôt que dans la ROM.
+        //
+        // Sauté si une cartouche est chargée (voir la doc de
+        // `has_cartridge`) : elle fait sa propre détection RAM en écrivant
+        // librement ce même registre, que figer casserait.
+        if let Some(conf) = AtariSt::expected_memory_conf(ram_size) {
+            st.pin_memory_conf(conf);
+        }
+    }
+
+    // `RUST68_TRACE_ALL=1` : journalise CHAQUE transaction bus réelle (CPU
+    // et Blitter — voir `RamBus` dans `systems::atari_st`, non couvert par
+    // ceci puisque le Blitter accède à la mémoire via son propre bus, pas
+    // celui du CPU) à sa taille exacte (.B/.W/.L), avec l'adresse de
+    // l'instruction appelante et une étiquette de composant — voir
+    // `rust68::trace::FileTraceSink` pour les variables d'environnement de
+    // filtrage (indispensables : sans `RUST68_TRACE_ALL_MIN`/`_MAX`, une
+    // session interactive complète génère des gigaoctets).
+    let ram_len = st.ram().len();
+    let rom_len = st.rom_len();
+    let blitter_present = st.blitter_present();
+    let mut trace_sink = FileTraceSink::from_env(Box::new(move |addr: u32| {
+        AtariSt::describe_addr_static(ram_len, rom_base, rom_len, blitter_present, addr)
+    }));
+    let trace_cpu_wanted = trace_sink.as_ref().map(|s| s.wants_cpu_trace()).unwrap_or(false);
+
     let sdl_context = sdl2::init().expect("init SDL2");
     let video_subsystem = sdl_context.video().expect("init sous-système vidéo");
     let audio_subsystem = sdl_context.audio().expect("init sous-système audio");
@@ -209,13 +318,23 @@ fn main() {
 
     let desired_spec = AudioSpecDesired {
         freq: Some(AUDIO_SAMPLE_RATE),
-        channels: Some(1),
+        // Stéréo (pas mono) : le son DMA (STE) a de vrais canaux gauche/
+        // droite indépendants (voir `DmaSound::next_sample`), avec des
+        // volumes gauche/droite indépendants pilotés par le Microwire/
+        // LMC1992 (voir `Microwire::left_gain`/`right_gain`) — la cartouche
+        // de diagnostic usine STe (test "Stereo 1 kHz/500 Hz tones") en
+        // dépend justement pour faire entendre 2 tons à des volumes
+        // distincts. Les fusionner en un seul canal mono, comme avant,
+        // rendait cette distinction impossible à entendre.
+        channels: Some(2),
         samples: Some(1024),
     };
     let audio_queue: AudioQueue<i16> = audio_subsystem
         .open_queue(None, &desired_spec)
         .expect("ouverture file audio");
-    audio_queue.resume();
+    // Lecture démarrée seulement une fois `AUDIO_QUEUE_PRIME_WATERMARK`
+    // atteint (voir sa doc) — pas de `resume()` ici.
+    let mut audio_started = false;
 
     let mut event_pump = sdl_context.event_pump().expect("event pump");
     let mut mouse_left = false;
@@ -259,6 +378,38 @@ fn main() {
     let cycles_per_sample = profile.cpu_hz as f64 / AUDIO_SAMPLE_RATE as f64;
     let mut audio_cycle_acc = 0.0f64;
     let mut audio_buffer: Vec<i16> = Vec::with_capacity(2048);
+    // Bloqueur DC (filtre passe-haut un pôle) sur le mélange final,
+    // gauche/droite séparément : notre mixage PSG (`mix_sample`) centre le
+    // niveau total des 3 canaux sur une constante fixe plutôt que sur la
+    // moyenne réelle (glissante) du signal, ce qui laisse un biais continu
+    // (DC) chaque fois qu'un nombre de canaux actifs différent de la
+    // moyenne théorique joue — visible comme une raie à 0 Hz au spectre, et
+    // audible comme un « pop » à chaque démarrage/arrêt de tonalité. Un
+    // bloqueur DC standard élimine ce biais dynamiquement, quelle que soit
+    // sa cause exacte, plutôt que de chercher une constante de centrage
+    // parfaite (impossible : la bonne valeur dépend du nombre de canaux
+    // actifs à cet instant précis, pas d'une constante globale).
+    let mut dc_blocker_left = DcBlocker::new();
+    let mut dc_blocker_right = DcBlocker::new();
+    // Gain lissé (pas appliqué tel quel à chaque échantillon) : le Microwire
+    // peut changer de volume À TOUT MOMENT du signal, y compris en plein
+    // milieu d'une période de tonalité non nulle — un saut instantané de
+    // gain à cet instant précis produit une discontinuité audible (un
+    // « clic »), même si le volume cible lui-même est correct. C'est un
+    // artefact bien connu des contrôles de volume numériques ("zipper
+    // noise") : le vrai LMC1992 (silicium analogique) a lui-même une
+    // certaine constante de temps de transition, donc lisser ici est plus
+    // fidèle qu'un saut instantané, pas juste un correctif ad-hoc.
+    // Initialisé au gain RÉEL de départ (pas 0) pour ne pas produire son
+    // propre clic de démarrage en rampant depuis le silence.
+    let mut gain_smooth_left = st.microwire.left_gain();
+    let mut gain_smooth_right = st.microwire.right_gain();
+    // `RUST68_RECORD_WAV=chemin.wav` : enregistre tel quel (après filtre DC
+    // et mixage, avant `mute`) le flux stéréo 16 bits envoyé à la file audio
+    // — pour inspecter le spectre du son réellement produit.
+    let mut wav_recorder = std::env::var("RUST68_RECORD_WAV").ok().map(|path| {
+        WavRecorder::create(&path).unwrap_or_else(|e| panic!("création RUST68_RECORD_WAV={path} : {e}"))
+    });
 
     // `RUST68_DEBUG=1` : affiche un point d'avancement (pas exécutés, PC,
     // SR) une fois par seconde sur stderr — utile pour vérifier que
@@ -294,6 +445,7 @@ fn main() {
     let mut watch_video_last_cycles: u64 = 0;
     let mut step_count: u64 = 0;
     let mut last_report = std::time::Instant::now();
+    let last_report_start = std::time::Instant::now();
 
     // `RUST68_WATCH_RANGE=debut,fin` (hex, ex: "0fb900,0fc900") : surveille
     // OCTET PAR OCTET (pas juste un hash global) une zone précise de RAM
@@ -362,6 +514,43 @@ fn main() {
     let trace_blit_caller = std::env::var("RUST68_TRACE_BLIT_CALLER").is_ok();
     let mut blit_caller_hits: u32 = 0;
     let mut cursor_hits: u32 = 0;
+    // `RUST68_TRACE_CA6A=1` : à CHAQUE entrée dans la boucle de "skew
+    // logiciel" ($E0CA6A, dispatch OR/AND/NOT/XOR avec décalage bit à bit,
+    // implémentation CPU pure — voir investigation menu "Visualisation")
+    // logue l'adresse de retour (sommet de pile, seulement au tout premier
+    // passage de chaque appel — a1 encore à sa valeur de départ) ainsi que
+    // a1 (destination courante) pour identifier l'appelant et corréler
+    // avec la zone mémoire touchée.
+    let trace_ca6a = std::env::var("RUST68_TRACE_CA6A").is_ok();
+    let mut ca6a_hits: u32 = 0;
+    let mut ca6a_last_ret: u32 = 0;
+    // Trace pas-à-pas (instruction par instruction) de la routine logicielle
+    // de "skew" du blitter (0xE0CA6A/0xE0CAB8), armée sur le premier appel
+    // seulement, pour observer d6 (décalage), les mots source lus via (a0)+
+    // et le résultat combiné réellement produit à l'exécution.
+    let trace_ca6a_steps = std::env::var("RUST68_TRACE_CA6A_STEPS").is_ok();
+    let mut ca6a_step_budget: u32 = 0;
+    let mut ca6a_step_armed = false;
+    // Trace l'entrée dans le dispatcher de dessin de texte/motif à
+    // 0xE0E480 (table de saut sur 8 entrées indexée via d6/d7, alimentant
+    // 0xE0E4B6/0xE0E4E6) : ces deux routines s'exécutent deux fois moins
+    // souvent en STE qu'en ST pour l'ouverture du même menu — objectif :
+    // voir si les registres d'entrée diffèrent déjà à ce point.
+    let trace_e480 = std::env::var("RUST68_TRACE_E480").is_ok();
+    let mut e480_hits: u32 = 0;
+    // Trace la routine de remplissage à motif (TOS 1.62, 0xE10B54-0xE10CA8)
+    // à ses trois points de déclenchement Blitter (TAS.B des branches
+    // "motif standard via table", "motif standard via copie directe" et
+    // "motif personnalisé/largeur variable") : objectif, retrouver dans QUEL
+    // appelant (adresse de retour) et avec quels paramètres d'objet (a2)
+    // naît l'appel hop=1 x=8 y=9 responsable du remplissage en damier
+    // observé à la place du texte du menu — corrélé dans le MÊME run que
+    // la trace complète des paramètres Blitter, pour éviter le piège
+    // méthodologique d'une comparaison entre deux runs séparés (la position
+    // de la souris fait légèrement varier l'alignement pixel d'un
+    // lancement manuel à l'autre).
+    let trace_fillpat = std::env::var("RUST68_TRACE_FILLPAT").is_ok();
+    let mut fillpat_hits: u32 = 0;
     // `RUST68_TRACE_IKBD_READER=1` : logue le PC + SR de l'instruction qui
     // vient de lire ACIA_KEYBOARD_DATA (RDRF retombé pendant ce pas) —
     // contrairement à `RUST68_TRACE_IKBD` (côté bus, sait QUOI a été lu
@@ -384,6 +573,7 @@ fn main() {
     let mut ikbd_dispatch_hits: u32 = 0;
     let mut sim_entry: Option<([u32; 8], [u32; 8])> = None;
     let mut sim_hits: u32 = 0;
+    let mut frame_count_dbg: u32 = 0;
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -417,6 +607,52 @@ fn main() {
                 Event::Window { win_event: WindowEvent::FocusLost, .. } if mouse_grab_enabled => {
                     canvas.window_mut().set_grab(false);
                     sdl_context.mouse().show_cursor(true);
+                }
+                // `RUST68_RAM_DUMP_KEY=1` : F2 écrit un instantané brut de
+                // toute la RAM installée dans `RUST68_RAM_DUMP_PATH` — pour
+                // rejouer ensuite une trace `RUST68_TRACE_BLITTER` depuis un
+                // état RAM complet et réel, sans le surcoût prohibitif de
+                // `RUST68_WATCH_RANGE` sur toute la RAM (qui rend le boot
+                // trop lent pour être interactif).
+                Event::KeyDown {
+                    scancode: Some(Scancode::F2),
+                    repeat: false,
+                    ..
+                } if std::env::var("RUST68_RAM_DUMP_KEY").is_ok() => {
+                    if let Ok(path) = std::env::var("RUST68_RAM_DUMP_PATH") {
+                        match std::fs::write(&path, st.ram()) {
+                            Ok(()) => eprintln!("[ram] instantané ({} octets) écrit dans {path}", st.ram().len()),
+                            Err(e) => eprintln!("[ram] échec d'écriture de l'instantané : {e}"),
+                        }
+                    }
+                }
+                // `RUST68_FB_DUMP_KEY=1` : F3 écrit `st.framebuffer` (déjà
+                // calculé par `Shifter::render_scanline`, avant tout passage
+                // par la texture SDL2) en PPM brut dans
+                // `RUST68_FB_DUMP_PATH` — pour comparer directement ce que
+                // notre moteur calcule en interne à une reconstruction de
+                // référence, sans dépendre de l'affichage SDL2 lui-même.
+                Event::KeyDown {
+                    scancode: Some(Scancode::F3),
+                    repeat: false,
+                    ..
+                } if std::env::var("RUST68_FB_DUMP_KEY").is_ok() => {
+                    if let Ok(path) = std::env::var("RUST68_FB_DUMP_PATH") {
+                        let h = st.framebuffer.len();
+                        let w = st.framebuffer.first().map(|r| r.len()).unwrap_or(0);
+                        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                        for row in &st.framebuffer {
+                            for &(r, g, b) in row {
+                                out.push(r);
+                                out.push(g);
+                                out.push(b);
+                            }
+                        }
+                        match std::fs::write(&path, &out) {
+                            Ok(()) => eprintln!("[fb] instantané ({w}x{h}) écrit dans {path}"),
+                            Err(e) => eprintln!("[fb] échec d'écriture de l'instantané : {e}"),
+                        }
+                    }
                 }
                 Event::KeyDown {
                     scancode: Some(sc),
@@ -605,6 +841,87 @@ fn main() {
                 );
             }
 
+            if trace_e480 && e480_hits < 500 && pc_before == 0xE0E480 {
+                e480_hits += 1;
+                let sp = cpu.a[7];
+                let ret_addr = st.read32(sp);
+                let a1 = cpu.a[1];
+                let before: Vec<String> = (0..8).map(|o| format!("{:02x}", st.read8(a1.wrapping_add(o)))).collect();
+                eprintln!(
+                    "[e480] appel #{e480_hits} retour={ret_addr:#010x} a4={:#010x} a1={:#010x} d2={:#010x} d3={:#010x} d4={:#010x} d6={:#010x} d7={:#010x} avant(a1..+8)={}",
+                    cpu.a[4], cpu.a[1], cpu.d[2], cpu.d[3], cpu.d[4], cpu.d[6], cpu.d[7], before.join(" "),
+                );
+            }
+
+            if trace_fillpat
+                && fillpat_hits < 500
+                && matches!(pc_before, 0xE10C04 | 0xE10C44 | 0xE10C94)
+            {
+                fillpat_hits += 1;
+                let sp = cpu.a[7];
+                // Au premier passage sur ce TAS.B, l'adresse de retour de la
+                // routine PARTAGÉE (e10b54-e10ca8) est au sommet de pile ;
+                // l'appelant de CETTE routine (celui qui nous intéresse
+                // vraiment, pour savoir QUI a demandé ce remplissage) est
+                // au niveau suivant.
+                let ret_addr = st.read32(sp);
+                let a2 = cpu.a[2];
+                let obj_bytes: Vec<u32> = (0..4).map(|i| st.read16(a2.wrapping_add(i * 2)) as u32).collect();
+                use rust68::peripherals::atari_st::blitter::reg as blitreg;
+                let hop = st.blitter.read(blitreg::HOP);
+                let op = st.blitter.read(blitreg::OP);
+                let x_count = ((st.blitter.read(blitreg::X_COUNT) as u16) << 8)
+                    | st.blitter.read(blitreg::X_COUNT1) as u16;
+                let y_count = ((st.blitter.read(blitreg::Y_COUNT) as u16) << 8)
+                    | st.blitter.read(blitreg::Y_COUNT1) as u16;
+                let long = |a: u32| {
+                    ((st.blitter.read(a) as u32) << 24)
+                        | ((st.blitter.read(a + 1) as u32) << 16)
+                        | ((st.blitter.read(a + 2) as u32) << 8)
+                        | st.blitter.read(a + 3) as u32
+                };
+                let dst_addr = long(blitreg::DST_ADDR);
+                let dst_x_inc = ((st.blitter.read(blitreg::DST_X_INC) as u16) << 8)
+                    | st.blitter.read(blitreg::DST_X_INC1) as u16;
+                let dst_y_inc = ((st.blitter.read(blitreg::DST_Y_INC) as u16) << 8)
+                    | st.blitter.read(blitreg::DST_Y_INC1) as u16;
+                eprintln!(
+                    "[fillpat] hit #{fillpat_hits} branche={pc_before:#08x} retour_routine_partagee={ret_addr:#010x} hop={hop} op={op:#04x} x={x_count} y={y_count} dst_addr={dst_addr:#010x} dst_xinc={dst_x_inc:#06x} dst_yinc={dst_y_inc:#06x} a2={a2:#010x} d3={:#010x} d4={:#010x} d5={:#010x} d6={:#010x} d7={:#010x}",
+                    cpu.d[3], cpu.d[4], cpu.d[5], cpu.d[6], cpu.d[7],
+                );
+                let _ = obj_bytes;
+            }
+
+            if trace_ca6a && ca6a_hits < 500 && pc_before == 0xE0CA6A {
+                let sp = cpu.a[7];
+                let ret_addr = st.read32(sp);
+                if ret_addr != ca6a_last_ret {
+                    ca6a_last_ret = ret_addr;
+                    ca6a_hits += 1;
+                    eprintln!(
+                        "[ca6a] appel #{ca6a_hits} retour={ret_addr:#010x} a1(dst)={:#010x} a2={:#010x} a3(mode)={:#010x} d3={:#010x} d4(stride)={:#010x} d5(compte-1)={:#010x} d6(skew)={:#010x} a0(src)={:#010x}",
+                        cpu.a[1], cpu.a[2], cpu.a[3], cpu.d[3], cpu.d[4], cpu.d[5], cpu.d[6], cpu.a[0],
+                    );
+                    eprintln!(
+                        "[ca6a-video] resolution={:?} video_base={:#010x}",
+                        st.shifter.resolution(),
+                        st.shifter.video_base(),
+                    );
+                    let table_base = cpu.a[0] & !1u32;
+                    let words: Vec<String> = (0..16)
+                        .map(|i| format!("{:04x}", st.read16(table_base.wrapping_add(i * 2))))
+                        .collect();
+                    eprintln!(
+                        "[ca6a-table] base={table_base:#010x} 16 mots = {}",
+                        words.join(" ")
+                    );
+                    if trace_ca6a_steps && !ca6a_step_armed {
+                        ca6a_step_armed = true;
+                        ca6a_step_budget = 400;
+                    }
+                }
+            }
+
             if trace_cursor && cursor_hits < 200_000 && pc_before == 0xE1366C {
                 let a5 = cpu.a[5];
                 let read16 = |st: &mut rust68::systems::atari_st::AtariSt, a: u32| st.read16(a);
@@ -636,13 +953,38 @@ fn main() {
                 && ikbd_reader_hits < 40
                 && st.acia_keyboard.read(rust68::peripherals::atari_st::acia::reg::CONTROL_STATUS) & 0x01 != 0;
 
-            let cycles = match cpu.step(&mut st) {
+            st.last_pc = cpu.pc;
+            if let Some(sink) = trace_sink.as_mut() {
+                if trace_cpu_wanted {
+                    sink.cpu_step(cpu.pc);
+                }
+                sink.maybe_break(&cpu);
+            }
+            let sink_ref: Option<&mut dyn TraceSink> =
+                trace_sink.as_mut().map(|s| s as &mut dyn TraceSink);
+            let mut tracing_bus = TracingBus {
+                inner: &mut st,
+                sink: sink_ref,
+                pc: cpu.pc,
+            };
+            let cycles = match cpu.step(&mut tracing_bus) {
                 Ok(cycles) => cycles,
                 Err(e) => {
                     eprintln!("Erreur CPU, arrêt : {e:?} pc={:#08x}", cpu.pc);
                     break 'running;
                 }
             };
+
+            if ca6a_step_budget > 0 {
+                ca6a_step_budget -= 1;
+                eprintln!(
+                    "[ca6a-step] pc={pc_before:#010x} -> {:#010x} d0={:#010x} d1={:#010x} d2={:#010x} d3={:#010x} d4={:#010x} d5={:#010x} d6={:#010x} a0={:#010x} a1={:#010x} a2={:#010x}",
+                    cpu.pc, cpu.d[0], cpu.d[1], cpu.d[2], cpu.d[3], cpu.d[4], cpu.d[5], cpu.d[6], cpu.a[0], cpu.a[1], cpu.a[2],
+                );
+                if ca6a_step_budget == 0 {
+                    ca6a_step_armed = false;
+                }
+            }
 
             if rdrf_before {
                 let rdrf_after = st.acia_keyboard.read(rust68::peripherals::atari_st::acia::reg::CONTROL_STATUS) & 0x01 != 0;
@@ -717,7 +1059,9 @@ fn main() {
 
             if debug && last_report.elapsed().as_secs_f64() >= 1.0 {
                 eprintln!(
-                    "steps={step_count} pc={:#08x} sr={:#06x} video_base={:#08x} video_counter={:#08x} phystop={:#08x} v_bas_ad={:#08x}",
+                    "steps={step_count} cycles={} mhz_effectif={:.3} pc={:#08x} sr={:#06x} video_base={:#08x} video_counter={:#08x} phystop={:#08x} v_bas_ad={:#08x}",
+                    cpu.cycles,
+                    cpu.cycles as f64 / 1_000_000.0 / last_report_start.elapsed().as_secs_f64(),
                     cpu.pc,
                     cpu.sr,
                     st.shifter.video_base(),
@@ -758,7 +1102,21 @@ fn main() {
             audio_cycle_acc += cycles as f64;
             while audio_cycle_acc >= cycles_per_sample {
                 audio_cycle_acc -= cycles_per_sample;
-                audio_buffer.push(mix_sample(&st.ym2149));
+                let dma_lr = st.next_dma_sample(AUDIO_SAMPLE_RATE as u32);
+                let ym_levels = st.ym2149.take_averaged_levels();
+                let (raw_left, raw_right) = mix_sample(ym_levels, dma_lr);
+                // DC retiré AVANT le gain (artefact de notre mixage PSG, pas
+                // un phénomène physique que le volume devrait mettre à
+                // l'échelle) ; gain lissé APRÈS (voir sa doc plus haut).
+                let dc_left = dc_blocker_left.process(raw_left);
+                let dc_right = dc_blocker_right.process(raw_right);
+                gain_smooth_left += (st.microwire.left_gain() - gain_smooth_left) * GAIN_SMOOTH_COEFF;
+                gain_smooth_right += (st.microwire.right_gain() - gain_smooth_right) * GAIN_SMOOTH_COEFF;
+                let left = (dc_left * gain_smooth_left).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                let right = (dc_right * gain_smooth_right).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                // Entrelacé L,R,L,R... (file audio stéréo, voir `desired_spec`).
+                audio_buffer.push(left);
+                audio_buffer.push(right);
             }
 
             if st.glue.frame_count() != frame_before {
@@ -767,6 +1125,18 @@ fn main() {
         }
 
         if !audio_buffer.is_empty() {
+            let mut recording_failed = false;
+            if let Some(recorder) = wav_recorder.as_mut() {
+                // Avant `mute` : on enregistre le son réellement produit,
+                // pas un silence si l'utilisateur a coupé le son hôte.
+                if let Err(e) = recorder.append(&audio_buffer) {
+                    eprintln!("RUST68_RECORD_WAV : erreur d'écriture ({e}), enregistrement arrêté");
+                    recording_failed = true;
+                }
+            }
+            if recording_failed {
+                wav_recorder = None;
+            }
             // `mute` : n'envoie pas le son réel à SDL, mais continue de
             // remplir la file audio (avec du silence, même nombre
             // d'échantillons) — c'est le REMPLISSAGE de cette file qui
@@ -783,27 +1153,164 @@ fn main() {
             audio_buffer.clear();
         }
 
+        if !audio_started && audio_queue.size() >= AUDIO_QUEUE_PRIME_WATERMARK {
+            audio_queue.resume();
+            audio_started = true;
+        }
+
+        if std::env::var("RUST68_TRACE_PALETTE").is_ok() {
+            frame_count_dbg += 1;
+            if frame_count_dbg % 100 == 0 {
+                eprintln!("[palette] frame={frame_count_dbg} {:?}", st.shifter.palette_raw());
+            }
+        }
         render_frame(&st, &mut texture);
         canvas.clear();
         let _ = canvas.copy(&texture, None, None);
         canvas.present();
 
-        // Throttling temps réel : la file audio se vide au rythme réel de la
-        // carte son hôte, c'est donc l'horloge de référence pour ne pas
-        // émuler plus vite que le temps réel (aucun minuteur dédié n'existe
-        // ailleurs dans ce crate).
+        // Cadencement temps réel : on dort exactement l'écart entre le temps
+        // CPU émulé (cpu.cycles / cpu_hz) et le temps réel écoulé depuis le
+        // début (`last_report_start`), pour ne jamais émuler plus vite que
+        // le temps réel. Remplace l'ancien cadencement indirect par le seul
+        // remplissage de la file audio : ce dernier ne corrigeait qu'une
+        // AVANCE sur le temps réel (sommeil tant que la file est trop
+        // pleine), jamais un RETARD — un simple sommeil ponctuel trop long
+        // (regroupement de minuteurs / mise en veille de l'app côté macOS,
+        // entre autres) faisait alors dériver l'émulation en retard sur le
+        // temps réel sans aucun rattrapage, vidant la file et provoquant un
+        // décroché audio toutes les quelques secondes. Une référence
+        // horloge murale directe s'auto-corrige : un sommeil trop long une
+        // fois ne fait que réduire d'autant le suivant, sans dérive
+        // cumulative — et si on est très en retard (fenêtre mise en arrière-
+        // plan, point d'arrêt de débogueur...), on ne dort simplement pas le
+        // temps de rattraper, sans à-coup de rattrapage brutal.
+        let target_elapsed = Duration::from_secs_f64(cpu.cycles as f64 / profile.cpu_hz as f64);
+        let real_elapsed = last_report_start.elapsed();
+        if target_elapsed > real_elapsed {
+            std::thread::sleep(target_elapsed - real_elapsed);
+        }
+
+        // Filet de sécurité : borne aussi la file audio elle-même (device
+        // audio hôte anormalement lent à la vider, par exemple), au cas où
+        // le cadencement horloge murale ci-dessus ne suffirait pas seul.
         while audio_queue.size() > AUDIO_QUEUE_HIGH_WATERMARK {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
-/// Mixe les 3 canaux du YM2149 (niveaux 0-31 chacun) en un échantillon PCM
-/// signé 16 bits mono, centré sur zéro.
-fn mix_sample(ym: &rust68::peripherals::atari_st::ym2149::Ym2149) -> i16 {
-    let total = ym.channel_level(0) as i32 + ym.channel_level(1) as i32 + ym.channel_level(2) as i32;
-    // total in 0..=93 ; centre sur 0 et met à l'échelle sur la pleine plage i16.
-    ((total - 46) * (i16::MAX as i32 / 46)) as i16
+/// Mixe la PSG (YM2149, 3 canaux niveaux 0-31 déjà MOYENNÉS temporellement
+/// depuis le dernier échantillon — voir [`Ym2149::take_averaged_levels`],
+/// sans quoi une tonalité aiguë (période puce plus courte que la période
+/// d'échantillonnage audio) donnerait un repliement de spectre sonnant
+/// comme un parasite granuleux plutôt qu'une tonalité propre) et le DMA
+/// Sound (STE, vrais échantillons gauche/droite indépendants) en un
+/// échantillon stéréo, **brut** : ni gain Microwire ni retrait de DC ni
+/// écrêtage — voir leur application séparée dans `main` (gain lissé pour
+/// éviter un « clic » de zipper noise, DC retiré avant ce gain puisque
+/// c'est un artefact de ce mixage, pas un phénomène physique que le volume
+/// devrait mettre à l'échelle).
+///
+/// Chaque contribution est réduite de moitié pour laisser de la marge et
+/// éviter l'écrêtage quand les deux sources jouent en même temps — pas un
+/// étage de gain fidèle au LMC1992 (bass/treble non filtrés, voir la doc de
+/// `DmaSound`), suffisant pour une lecture correcte et sans coupure.
+fn mix_sample(ym_levels: [f32; 3], dma_lr: (i8, i8)) -> (f32, f32) {
+    let total = ym_levels[0] + ym_levels[1] + ym_levels[2];
+    // total in 0.0..=93.0 ; centre sur 0 et met à l'échelle sur la moitié de la plage i16.
+    let ym_sample = (total - 46.0) * (i16::MAX as f32 / 46.0) / 2.0;
+
+    let (l, r) = dma_lr;
+    // Échantillons PCM 8 bits signés (-128..127), mis à l'échelle sur
+    // environ la moitié de la plage i16 (comme pour la PSG) — gauche et
+    // droite restent SÉPARÉS (pas de moyenne), contrairement à la version
+    // mono précédente.
+    let dma_left = l as f32 * 128.0;
+    let dma_right = r as f32 * 128.0;
+
+    (ym_sample + dma_left, ym_sample + dma_right)
+}
+
+/// Enregistreur WAV minimal (PCM 16 bits stéréo, pas de dépendance externe)
+/// — voir `RUST68_RECORD_WAV` dans `main`. L'en-tête est réécrit après
+/// chaque ajout (coût négligeable : 44 octets, une fois par trame vidéo)
+/// plutôt qu'une seule fois à la fermeture, pour que le fichier reste un
+/// WAV valide même si le processus est arrêté brutalement (fermeture de
+/// fenêtre, Ctrl-C) sans passage par un code de sortie propre.
+struct WavRecorder {
+    file: std::fs::File,
+    data_bytes_written: u32,
+}
+
+impl WavRecorder {
+    const CHANNELS: u16 = 2;
+    const BITS_PER_SAMPLE: u16 = 16;
+
+    fn create(path: &str) -> std::io::Result<Self> {
+        let mut file = std::fs::File::create(path)?;
+        Self::write_header(&mut file, 0)?;
+        Ok(WavRecorder { file, data_bytes_written: 0 })
+    }
+
+    fn write_header(file: &mut std::fs::File, data_bytes: u32) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        file.seek(SeekFrom::Start(0))?;
+        let sample_rate = AUDIO_SAMPLE_RATE as u32;
+        let byte_rate = sample_rate * Self::CHANNELS as u32 * Self::BITS_PER_SAMPLE as u32 / 8;
+        let block_align = Self::CHANNELS * Self::BITS_PER_SAMPLE / 8;
+        file.write_all(b"RIFF")?;
+        file.write_all(&(36 + data_bytes).to_le_bytes())?;
+        file.write_all(b"WAVE")?;
+        file.write_all(b"fmt ")?;
+        file.write_all(&16u32.to_le_bytes())?;
+        file.write_all(&1u16.to_le_bytes())?; // PCM
+        file.write_all(&Self::CHANNELS.to_le_bytes())?;
+        file.write_all(&sample_rate.to_le_bytes())?;
+        file.write_all(&byte_rate.to_le_bytes())?;
+        file.write_all(&block_align.to_le_bytes())?;
+        file.write_all(&Self::BITS_PER_SAMPLE.to_le_bytes())?;
+        file.write_all(b"data")?;
+        file.write_all(&data_bytes.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn append(&mut self, samples: &[i16]) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        self.file.seek(SeekFrom::End(0))?;
+        for s in samples {
+            self.file.write_all(&s.to_le_bytes())?;
+        }
+        self.data_bytes_written += (samples.len() * 2) as u32;
+        Self::write_header(&mut self.file, self.data_bytes_written)?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
+    }
+}
+
+/// Bloqueur DC (filtre passe-haut un pôle) : `y[n] = x[n] - x[n-1] + R·y[n-1]`,
+/// technique standard pour retirer un biais continu d'un signal audio sans
+/// connaître sa cause exacte ni sa valeur précise — voir le commentaire sur
+/// son usage dans `main`. `R` proche de 1 place la coupure très bas (quasi
+/// inaudible sur le contenu utile, seul le DC pur est retiré).
+struct DcBlocker {
+    prev_x: f32,
+    prev_y: f32,
+}
+
+impl DcBlocker {
+    const R: f32 = 0.995;
+
+    fn new() -> Self {
+        DcBlocker { prev_x: 0.0, prev_y: 0.0 }
+    }
+
+    fn process(&mut self, x: f32) -> f32 {
+        let y = x - self.prev_x + Self::R * self.prev_y;
+        self.prev_x = x;
+        self.prev_y = y;
+        y
+    }
 }
 
 /// Copie le framebuffer du board (une ligne par entrée, RGB 24 bits) dans la

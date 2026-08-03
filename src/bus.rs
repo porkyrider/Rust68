@@ -105,6 +105,111 @@ pub trait Bus {
     }
 }
 
+/// Puits d'événements pour [`TracingBus`] — découplé du format de sortie
+/// (fichier, canal en mémoire, etc.) pour que `TracingBus` reste générique
+/// et testable sans I/O.
+pub trait TraceSink {
+    /// `pc` : adresse de l'instruction CPU en cours (fournie par l'appelant,
+    /// voir [`TracingBus::pc`]). `size` : 1/2/4 octets. `value` : la valeur
+    /// lue/écrite, alignée à droite (pas de décalage selon `size`).
+    fn on_read(&mut self, pc: u32, addr: u32, size: u8, value: u32);
+    fn on_write(&mut self, pc: u32, addr: u32, size: u8, value: u32);
+}
+
+/// Bus intercalé qui journalise toute transaction bus réelle (taille exacte
+/// de l'accès — .B/.W/.L — telle qu'émise par le CPU ou tout autre appelant
+/// générique sur `impl Bus`) vers un [`TraceSink`], de façon transparente
+/// pour le code traversé (comme [`TimedBus`] pour le minutage).
+///
+/// Contrairement à un traçage ad hoc dispersé dans les implémentations
+/// `Bus` individuelles (qui ne peut voir qu'un octet à la fois dès que
+/// l'appelant utilise les implémentations `read16`/`write16` par défaut du
+/// trait, ou qui doit dupliquer la logique de traçage dans chaque
+/// surcharge `read16`/`write16`/`read32`/`write32` spécifique à un
+/// système), ce décorateur capture la transaction telle qu'émise par
+/// l'appelant, à sa taille réelle, en un seul point — puis délègue à
+/// `inner`, qui peut la décomposer ou la court-circuiter comme il
+/// l'entend sans jamais avoir besoin de connaître le traçage.
+///
+/// `sink: None` est le chemin rapide quand le traçage est désactivé (un
+/// seul test `Option::is_none` par accès, pas d'allocation ni de
+/// formatage) — permet de toujours envelopper le bus dans la boucle
+/// principale sans code dupliqué pour le cas "pas de traçage".
+pub struct TracingBus<'b, B: Bus> {
+    pub inner: &'b mut B,
+    pub sink: Option<&'b mut dyn TraceSink>,
+    /// PC de l'instruction en cours — à mettre à jour par l'appelant avant
+    /// chaque `Cpu::step` (le CPU n'expose pas son PC courant au `Bus`).
+    pub pc: u32,
+}
+
+impl<'b, B: Bus> Bus for TracingBus<'b, B> {
+    fn read8(&mut self, addr: u32) -> u8 {
+        let v = self.inner.read8(addr);
+        if let Some(sink) = self.sink.as_deref_mut() {
+            sink.on_read(self.pc, addr, 1, v as u32);
+        }
+        v
+    }
+
+    fn write8(&mut self, addr: u32, value: u8) {
+        if let Some(sink) = self.sink.as_deref_mut() {
+            sink.on_write(self.pc, addr, 1, value as u32);
+        }
+        self.inner.write8(addr, value);
+    }
+
+    fn read16(&mut self, addr: u32) -> u16 {
+        let v = self.inner.read16(addr);
+        if let Some(sink) = self.sink.as_deref_mut() {
+            sink.on_read(self.pc, addr, 2, v as u32);
+        }
+        v
+    }
+
+    fn write16(&mut self, addr: u32, value: u16) {
+        if let Some(sink) = self.sink.as_deref_mut() {
+            sink.on_write(self.pc, addr, 2, value as u32);
+        }
+        self.inner.write16(addr, value);
+    }
+
+    fn read32(&mut self, addr: u32) -> u32 {
+        let v = self.inner.read32(addr);
+        if let Some(sink) = self.sink.as_deref_mut() {
+            sink.on_read(self.pc, addr, 4, v);
+        }
+        v
+    }
+
+    fn write32(&mut self, addr: u32, value: u32) {
+        if let Some(sink) = self.sink.as_deref_mut() {
+            sink.on_write(self.pc, addr, 4, value);
+        }
+        self.inner.write32(addr, value);
+    }
+
+    fn reset_bus(&mut self) {
+        self.inner.reset_bus();
+    }
+
+    fn is_contended(&self, addr: u32) -> bool {
+        self.inner.is_contended(addr)
+    }
+
+    fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
+        self.inner.take_bus_fault()
+    }
+
+    fn irq_level(&self) -> u8 {
+        self.inner.irq_level()
+    }
+
+    fn irq_ack(&mut self, level: u8) -> u8 {
+        self.inner.irq_ack(level)
+    }
+}
+
 /// Bus intercalé qui applique le modèle de wait-state DRAM/vidéo (façon
 /// Steem : `RAM_ACCESS_WS`) à chaque transaction bus réelle, de façon
 /// transparente pour tout le code du CPU (addressing.rs / execute.rs)

@@ -52,12 +52,44 @@ fn tonalite_bascule_au_rythme_programme() {
 
     let mut levels = Vec::new();
     for _ in 0..6 {
-        chip.tick(4); // 1 cycle puce
+        // Le compteur interne du silicium avance à clock/8 : avec
+        // période=1, la bascule survient tous les 8 cycles puce.
+        for _ in 0..8 {
+            chip.tick(4); // 1 cycle puce
+        }
         levels.push(chip.channel_level(0));
     }
-    // Période minimale (1) : bascule dès le premier cycle puce, puis
-    // alterne 30 (0x0F*2) / 0 à chaque cycle suivant.
+    // Période minimale (1) : bascule au bout de 8 cycles puce, puis
+    // alterne 30 (0x0F*2) / 0 tous les 8 cycles suivants.
     assert_eq!(levels, vec![30, 0, 30, 0, 30, 0]);
+}
+
+#[test]
+fn take_averaged_levels_moyenne_les_bascules_intermediaires() {
+    // Anti-repliement (aliasing) : `channel_level` est un échantillonnage
+    // ponctuel de l'état instantané ; si de nombreuses bascules ont eu lieu
+    // depuis le dernier appel (tonalité aiguë tickée en un seul gros bloc de
+    // cycles CPU, comme le fait le binaire SDL2 une fois par instruction),
+    // `channel_level` seul ne verrait que l'état final, pas la moyenne
+    // réelle du signal — d'où l'existence de `take_averaged_levels`.
+    let mut chip = Ym2149::new();
+    write_reg(&mut chip, reg::TONE_A_FINE, 1); // bascule tous les 8 cycles puce
+    write_reg(&mut chip, reg::TONE_A_COARSE, 0);
+    write_reg(&mut chip, reg::MIXER, 0b0000_1000); // tonalité A active, bruit A coupé
+    write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F); // niveau 30 quand "haut"
+
+    // Un seul gros tick couvrant un nombre ENTIER de périodes complètes (80
+    // cycles puce = 320 cycles CPU = 5 × 16 cycles, période=1 basculant
+    // tous les 8 cycles puce) : la moyenne doit valoir exactement 50% du
+    // niveau max (30), pas juste l'état final ponctuel après la boucle.
+    chip.tick(320);
+    let levels = chip.take_averaged_levels();
+    assert!((levels[0] - 15.0).abs() < 0.01, "moyenne attendue = 15 (50% de 30), obtenu {}", levels[0]);
+
+    // L'accumulateur est remis à zéro : un appel immédiatement après sans
+    // nouveau tick() ne doit pas réutiliser l'ancienne moyenne.
+    let levels_apres_reset = chip.take_averaged_levels();
+    assert_eq!(levels_apres_reset[0], chip.channel_level(0) as f32, "accumulateur vide -> retombe sur l'état instantané");
 }
 
 #[test]
@@ -120,8 +152,10 @@ fn enveloppe_attack_sans_continue_se_fige_a_31_apres_une_rampe() {
     write_reg(&mut chip, reg::ENVELOPE_SHAPE, 0b0100);
     write_reg(&mut chip, reg::AMPLITUDE_A, 0x10);
 
-    // 32 paliers pour compléter la rampe (période=1 cycle puce = 4 cycles CPU).
-    for _ in 0..32 {
+    // 32 paliers pour compléter la rampe (période=1 → 8 cycles puce par
+    // palier, le compteur d'enveloppe avançant à clock/8 comme celui de
+    // tonalité, chaque cycle puce = 4 cycles CPU).
+    for _ in 0..(32 * 8) {
         chip.tick(4);
     }
     // L'enveloppe a sa propre échelle 0-31 (résolution double de l'ampli

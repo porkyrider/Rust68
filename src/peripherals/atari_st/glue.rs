@@ -49,6 +49,15 @@ impl VideoMode {
             VideoMode::Ntsc60 => 263,
         }
     }
+
+    /// Nombre de lignes réellement affichées (identique PAL/NTSC — seule la
+    /// durée du blanking vertical qui suit diffère). Voir la doc de
+    /// [`Glue::vbl_edge_count`] pour pourquoi cette frontière, pas le
+    /// bouclage complet de [`Self::lines_per_frame`], est ce qui déclenche
+    /// VBL sur silicium réel.
+    fn visible_lines(self) -> u32 {
+        200
+    }
 }
 
 /// État du générateur de timing HBL/VBL.
@@ -60,6 +69,7 @@ pub struct Glue {
     frame: u64,
     hbl_pending: bool,
     vbl_pending: bool,
+    vbl_edges: u64,
 }
 
 impl Glue {
@@ -71,11 +81,15 @@ impl Glue {
             frame: 0,
             hbl_pending: false,
             vbl_pending: false,
+            vbl_edges: 0,
         }
     }
 
-    /// Avance le générateur de `cpu_cycles` cycles CPU, armant HBL à
-    /// chaque fin de ligne et VBL à chaque fin de trame.
+    /// Avance le générateur de `cpu_cycles` cycles CPU, armant HBL à chaque
+    /// fin de ligne et VBL à la transition ligne visible -> blanking
+    /// vertical (voir la doc de [`Self::vbl_edge_count`]) — PAS au bouclage
+    /// complet de la trame (`line` reprenant à 0), qui reste réservé à
+    /// [`Self::frame_count`].
     pub fn tick(&mut self, cpu_cycles: u32) {
         self.cycles_in_line += cpu_cycles;
         let per_line = self.mode.cycles_per_line();
@@ -83,10 +97,13 @@ impl Glue {
             self.cycles_in_line -= per_line;
             self.hbl_pending = true;
             self.line += 1;
+            if self.line == self.mode.visible_lines() {
+                self.vbl_pending = true;
+                self.vbl_edges += 1;
+            }
             if self.line >= self.mode.lines_per_frame() {
                 self.line = 0;
                 self.frame += 1;
-                self.vbl_pending = true;
             }
         }
     }
@@ -122,6 +139,29 @@ impl Glue {
     /// reset — utile pour cadencer un rendu vidéo externe.
     pub fn frame_count(&self) -> u64 {
         self.frame
+    }
+
+    /// Nombre de fronts VBL survenus depuis la création/le dernier reset —
+    /// à la transition ligne visible -> blanking vertical (voir la doc de
+    /// [`Self::tick`]), PAS au bouclage complet de la trame.
+    ///
+    /// Distinct de [`Self::frame_count`] (qui, lui, avance seulement au
+    /// bouclage complet) : sur silicium réel, VBL survient au DÉBUT du
+    /// blanking vertical (juste après la dernière ligne visible), avec tout
+    /// le reste du blanking (~113 lignes en PAL) qui s'écoule ENSUITE avant
+    /// que la ligne 0 de la trame suivante ne soit affichée. Le board
+    /// ([`crate::systems::atari_st::AtariSt::tick`]) doit détecter ce
+    /// changement (pas celui de `frame_count`) pour recharger le compteur
+    /// vidéo du Shifter depuis sa base — sinon celui-ci ne redémarrerait
+    /// qu'au bouclage 0, dans le MÊME appel `tick()` qui rendrait déjà la
+    /// ligne visible 0 de la trame suivante, sans laisser au logiciel la
+    /// moindre chance de prendre l'interruption VBL avant que cette ligne
+    /// ne soit déjà rendue — confirmé nécessaire par la cartouche de
+    /// diagnostic usine STe (test "T4 Video Counter in Memory Controller",
+    /// qui échouait systématiquement d'exactement une ligne vidéo à sa toute
+    /// première lecture après reprogrammation de la base).
+    pub fn vbl_edge_count(&self) -> u64 {
+        self.vbl_edges
     }
 
     /// Nombre de lignes par trame dans le mode vidéo courant — utile pour

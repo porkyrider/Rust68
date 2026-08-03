@@ -284,15 +284,26 @@ impl Shifter {
     /// le board à chaque HBL.
     ///
     /// `ram` doit couvrir au moins `video_counter + bytes_per_line()` —
-    /// renvoie une ligne de zéros (noir) sans avancer le compteur si ce
-    /// n'est pas le cas, plutôt que de paniquer (fin de RAM installée).
+    /// renvoie une ligne de zéros (noir) si ce n'est pas le cas, plutôt que
+    /// de paniquer (fin de RAM installée, ou base vidéo pointée au-delà par
+    /// un logiciel de test). Le compteur, lui, avance TOUJOURS (avant même
+    /// de savoir si la lecture réussira) : sur silicium réel, le compteur
+    /// d'adresse du Shifter est un simple générateur d'adresses, indépendant
+    /// de la présence physique de RAM à cette adresse précise — seul le
+    /// contenu lu en dépend, pas l'avancement du compteur. Ne PAS avancer ici
+    /// bloquait le compteur indéfiniment (donc toute lecture logicielle de
+    /// `VIDEO_COUNTER_*`) dès que la base vidéo dépassait la RAM installée —
+    /// confirmé nécessaire par la cartouche de diagnostic usine STe (test
+    /// "T4 Video Counter in Memory Controller", qui déplace délibérément la
+    /// base vidéo jusqu'à la toute fin de la RAM installée pour vérifier que
+    /// le compteur continue de progresser correctement).
     pub fn render_scanline(&mut self, ram: &[u8]) -> Vec<(u8, u8, u8)> {
         let bytes_per_line = self.resolution.bytes_per_line();
         let start = self.video_counter as usize;
+        self.video_counter += bytes_per_line as u32;
         let Some(line) = ram.get(start..start + bytes_per_line) else {
             return vec![(0, 0, 0); self.resolution.width()];
         };
-        self.video_counter += bytes_per_line as u32;
 
         match self.resolution {
             Resolution::High => self.render_mono(line),

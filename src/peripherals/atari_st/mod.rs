@@ -12,9 +12,11 @@
 
 pub mod acia;
 pub mod blitter;
+pub mod dma_sound;
 pub mod glue;
 pub mod ikbd;
 pub mod mfp;
+pub mod microwire;
 pub mod shifter;
 pub mod stx;
 pub mod wd1772;

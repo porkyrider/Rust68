@@ -138,13 +138,40 @@ impl Timer {
     }
 
     /// Décrémente le compteur d'un cran ; renvoie `true` s'il vient de
-    /// passer par zéro (et se recharge alors depuis `data`, 0 valant 256).
+    /// déclencher (et se recharge alors depuis `data`).
+    ///
+    /// Le déclenchement a lieu au `N`-ième décrément après un rechargement à
+    /// `data = N` (pas au `N+1`-ième) : le compteur, lu pendant qu'il tourne,
+    /// vaut `N` juste après le rechargement (jamais `N-1`), donc c'est déjà
+    /// en train de compter le premier des `N` intervalles à ce moment — le
+    /// déclenchement doit avoir lieu au décrément qui le ferait passer sous 1,
+    /// pas à un décrément supplémentaire une fois arrivé à 0. L'ancienne
+    /// version testait `counter == 0` en entrée (au lieu de `<= 1`), ce qui
+    /// ajoutait un cran MFP superflu au tout premier intervalle suivant
+    /// chaque écriture du registre de contrôle (TACR/TBCR/TCDCR) — écart
+    /// confirmé par la cartouche de diagnostic usine STe (test "T0 MFP
+    /// timer" : Timer A/B/C/D en ÷200, rechargement 4, dont la fenêtre
+    /// d'attente logicielle est trop serrée pour tolérer ce cran de trop).
+    ///
+    /// Le test doit être une égalité stricte `== 1`, pas `<= 1` : si
+    /// `counter` vaut déjà 0 en entrée (compteur jamais chargé — cas réel
+    /// documenté "data=0 signifie 256", ou compteur resté à sa valeur
+    /// précédente parce que TACR/TBCR a été écrit avant TADR/TBDR, ce que la
+    /// cartouche de diagnostic fait réellement pour armer le son DMA via
+    /// XSINT), le vrai silicium ne déclenche PAS tout de suite : il boucle
+    /// 0→255 (registre 8 bits) et ne déclenche qu'au bout de 256 décréments
+    /// de plus — confirmé dans Hatari (`mfp.c`, `MFP_TimerA_EventCount` :
+    /// `if (TA_MAINCOUNTER == 1) { ... déclenche ... } else { TA_MAINCOUNTER--; }`,
+    /// avec le commentaire explicite sur le rebouclage 0→255 attendu). Avec
+    /// `<= 1`, un compteur resté à 0 déclenchait instantanément dès le tout
+    /// premier pulse — cause du test audio DMA de la cartouche qui semblait
+    /// « sauté »/trop rapide.
     fn decrement(&mut self) -> bool {
-        if self.counter == 0 {
-            self.counter = if self.data == 0 { 255 } else { self.data - 1 };
+        if self.counter == 1 {
+            self.counter = self.data;
             true
         } else {
-            self.counter -= 1;
+            self.counter = self.counter.wrapping_sub(1);
             false
         }
     }
@@ -182,8 +209,16 @@ impl Default for Mfp {
 }
 
 impl Mfp {
-    /// État après reset matériel : tous les registres à zéro (comportement
-    /// du MC68901 documenté au reset, RSR/TSR compris).
+    /// État après reset matériel : tous les registres à zéro, à l'exception
+    /// de TSR bit7 ("Buffer Empty") qui démarre à 1 — le tampon d'émission
+    /// est réellement vide au reset (aucun octet en attente), donc
+    /// disponible pour en accepter un nouveau. Confirmé nécessaire par la
+    /// cartouche de diagnostic usine STe, dont la routine de sortie
+    /// caractère (RS232, utilisée comme console texte principale) attend ce
+    /// bit à 1 avant d'écrire le tout premier octet dans UDR — avec TSR à 0
+    /// au reset, plus aucune écriture ne pouvait jamais avoir lieu (le seul
+    /// mécanisme qui positionne ce bit est justement une écriture d'UDR),
+    /// bloquant indéfiniment le tout premier caractère affiché.
     pub fn new() -> Self {
         Mfp {
             gpip_in: 0,
@@ -202,7 +237,7 @@ impl Mfp {
             scr: 0,
             ucr: 0,
             rsr: 0,
-            tsr: 0,
+            tsr: TSR_BUFFER_EMPTY,
             udr: 0,
             rx_queue: std::collections::VecDeque::new(),
             tx_queue: std::collections::VecDeque::new(),
@@ -338,7 +373,20 @@ impl Mfp {
             reg::SCR => self.scr = value,
             reg::UCR => self.ucr = value,
             reg::RSR => self.rsr = value,
-            reg::TSR => self.tsr = value,
+            // Bits 7 (Buffer Empty) et 6 (Underrun Error) sont des bits de
+            // statut matériel en lecture seule sur le vrai MC68901, non
+            // affectés par une écriture logicielle — seuls les bits de
+            // contrôle 0-5 (Transmitter Enable, Break, End Of Transmission,
+            // Auto Turnaround) le sont. Un remplacement complet du registre
+            // ici effaçait Buffer Empty dès la séquence d'initialisation
+            // standard de l'USART (écriture de TSR=0x01 pour activer
+            // l'émetteur), verrouillant définitivement tout octet suivant :
+            // plus aucune transmission ne pouvait jamais avoir lieu, puisque
+            // seule une écriture d'UDR repose Buffer Empty, et qu'aucune
+            // écriture d'UDR ne peut avoir lieu tant que Buffer Empty est à
+            // zéro. Confirmé par la cartouche de diagnostic usine STe, dont
+            // toute la sortie texte passe par ce port RS232.
+            reg::TSR => self.tsr = (self.tsr & 0xC0) | (value & 0x3F),
             reg::UDR => {
                 self.udr = value;
                 self.tx_queue.push_back(value);
@@ -456,6 +504,9 @@ impl Mfp {
 
     /// Arme le bit "pending" d'un canal (IPR) s'il est activé (IER).
     fn request(&mut self, chan: u8) {
+        if std::env::var("RUST68_TRACE_MFP_REQUEST").is_ok() {
+            eprintln!("[mfp] request chan={chan} ier={:#06x} arme={}", self.ier, self.ier & (1u16 << chan) != 0);
+        }
         let mask = 1u16 << chan;
         if self.ier & mask != 0 {
             self.ipr |= mask;
@@ -482,10 +533,23 @@ impl Mfp {
 
     /// Cycle d'acquittement d'interruption (IACK) : calcule le vecteur pour
     /// le canal actif de plus haute priorité, efface son bit pending, et
-    /// arme son bit "in service" — sauf en mode "automatic end-of-interrupt"
-    /// (bit S du VR, bit 3), où ISR n'est jamais posé (le canal reste libre
-    /// de se re-déclencher immédiatement, ce mode ne bloque pas les
-    /// interruptions de même priorité).
+    /// arme son bit "in service".
+    ///
+    /// Armé dans les deux modes du bit S du VR (bit 3, "automatic
+    /// end-of-interrupt"), pas seulement en mode logiciel : ce bit dispense
+    /// le logiciel d'avoir à *effacer* ISR lui-même en fin de traitement (le
+    /// matériel le fait automatiquement), mais ISR reste bien lisible
+    /// PENDANT le traitement — confirmé par la cartouche de diagnostic
+    /// usine STe (test "T0 MFP timer"), dont le gestionnaire d'interruption
+    /// partagé (une seule routine installée aux 4 vecteurs Timer A/B/C/D)
+    /// distingue quel timer a déclenché en lisant précisément ces bits ISR,
+    /// alors même qu'elle programme VR=0x48 (auto-EOI posé) : si ISR n'était
+    /// jamais armé dans ce mode, ce mécanisme ne pourrait fonctionner sur
+    /// aucun ST/STE réel. Notre ancienne lecture ("jamais armé en auto-EOI")
+    /// venait d'une interprétation du datasheet jamais vérifiée contre du
+    /// vrai logiciel — corrigée ici après l'avoir vue bloquer ce test précis
+    /// (le compteur $284 attendu à zéro restait bloqué à une valeur non
+    /// nulle, ISRA jamais vu posé par le gestionnaire).
     ///
     /// Renvoie le vecteur complet : bits 7-4 = `VR[7:4]` (base programmée
     /// par le logiciel), bits 3-0 = numéro de canal (0-15 — le bit 3 du VR
@@ -501,10 +565,7 @@ impl Mfp {
         };
         let mask = 1u16 << chan;
         self.ipr &= !mask;
-        const AUTO_EOI: u8 = 0x08;
-        if self.vr & AUTO_EOI == 0 {
-            self.isr |= mask;
-        }
+        self.isr |= mask;
         (self.vr & 0xF0) | chan
     }
 

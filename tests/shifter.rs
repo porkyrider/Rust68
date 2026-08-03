@@ -130,11 +130,15 @@ fn compteur_video_avance_du_nombre_d_octets_consommes() {
 }
 
 #[test]
-fn ram_insuffisante_renvoie_une_ligne_noire_sans_avancer() {
+fn ram_insuffisante_renvoie_une_ligne_noire_mais_avance_quand_meme() {
+    // Le compteur d'adresse du Shifter est un simple générateur, indépendant
+    // de la présence physique de RAM à cette adresse (voir la doc de
+    // `render_scanline`) : seul le CONTENU affiché dépend de la RAM
+    // disponible, pas l'avancement du compteur.
     let mut sh = Shifter::new();
     sh.write(addr::RESOLUTION, 0b00);
     let ram = vec![0u8; 10]; // bien moins que 160 octets requis
     let pixels = sh.render_scanline(&ram);
     assert!(pixels.iter().all(|&p| p == (0, 0, 0)));
-    assert_eq!(sh.read(addr::VIDEO_COUNTER_LOW), 0, "compteur inchangé");
+    assert_eq!(sh.read(addr::VIDEO_COUNTER_LOW), 160, "le compteur avance quand même");
 }

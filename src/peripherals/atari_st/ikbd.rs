@@ -58,6 +58,15 @@ pub struct Ikbd {
     /// Cycles restants avant la livraison d'une réponse `0xF1` de reset en
     /// attente (voir [`IKBD_RESET_CYCLES`]). `None` = aucun reset en cours.
     reset_pending_cycles: Option<u32>,
+    /// Octets clavier/souris survenus pendant un reset en cours (voir
+    /// [`Self::reset_pending_cycles`]), mis en attente pour être livrés
+    /// juste après `0xF1` plutôt qu'avant. Sur le vrai HD6301, le
+    /// contrôleur exécute son autotest et ne scanne pas le clavier durant
+    /// ce délai ; livrer un scancode avant `0xF1` fait croire au logiciel
+    /// hôte (ex. la cartouche de diagnostic, test K1) que le clavier ne
+    /// répond pas correctement, et le fait basculer en mode RS232 de
+    /// secours ("clavier HS").
+    pending_during_reset: VecDeque<u8>,
 }
 
 impl Ikbd {
@@ -73,6 +82,7 @@ impl Ikbd {
             // Autotest de mise sous tension : différé comme un reset logiciel
             // (voir la doc de IKBD_RESET_CYCLES), pas disponible dès le cycle 0.
             reset_pending_cycles: Some(IKBD_RESET_CYCLES),
+            pending_during_reset: VecDeque::new(),
         }
     }
 
@@ -84,6 +94,7 @@ impl Ikbd {
             if cycles >= remaining {
                 self.reset_pending_cycles = None;
                 self.tx_queue.push_back(0xF1);
+                self.tx_queue.extend(self.pending_during_reset.drain(..));
             } else {
                 self.reset_pending_cycles = Some(remaining - cycles);
             }
@@ -174,12 +185,23 @@ impl Ikbd {
 
     /// Signale l'appui d'une touche (make). `scancode` est le scancode IKBD Atari.
     pub fn key_make(&mut self, scancode: u8) {
-        self.tx_queue.push_back(scancode);
+        self.push_output(scancode);
     }
 
     /// Signale le relâchement d'une touche (break). Code = `0x80 | make`.
     pub fn key_break(&mut self, scancode: u8) {
-        self.tx_queue.push_back(0x80 | scancode);
+        self.push_output(0x80 | scancode);
+    }
+
+    /// Route un octet clavier/souris vers `tx_queue`, ou vers
+    /// `pending_during_reset` si un reset est en cours (voir la doc de ce
+    /// champ) pour qu'il n'arrive jamais avant le `0xF1` d'autotest.
+    fn push_output(&mut self, byte: u8) {
+        if self.reset_pending_cycles.is_some() {
+            self.pending_during_reset.push_back(byte);
+        } else {
+            self.tx_queue.push_back(byte);
+        }
     }
 
     /// Signale un mouvement relatif de la souris et l'état des boutons.
@@ -192,9 +214,9 @@ impl Ikbd {
         if dx == 0 && dy == 0 && !buttons_changed {
             return;
         }
-        self.tx_queue.push_back(0xF8 | (buttons & 0x03));
-        self.tx_queue.push_back(dx as u8);
-        self.tx_queue.push_back(eff_dy as u8);
+        self.push_output(0xF8 | (buttons & 0x03));
+        self.push_output(dx as u8);
+        self.push_output(eff_dy as u8);
     }
 }
 
@@ -226,6 +248,23 @@ mod tests {
     }
 
     #[test]
+    fn touche_pressee_pendant_un_reset_arrive_apres_0xf1_pas_avant() {
+        // Reproduit le scénario cartouche de diagnostic (test K1) : une
+        // touche pressée pendant la fenêtre de reset ne doit jamais
+        // devancer le 0xF1 d'autotest, sous peine de faire croire au test
+        // que le clavier ne répond pas (bascule RS232 "clavier HS").
+        let mut ikbd = Ikbd::new();
+        ikbd.tick(IKBD_RESET_CYCLES / 2);
+        ikbd.key_make(0x1E); // touche 'A' pressée en plein milieu du reset
+        assert!(
+            drain(&mut ikbd).is_empty(),
+            "le scancode ne doit pas être livré avant la fin du reset"
+        );
+        ikbd.tick(IKBD_RESET_CYCLES / 2);
+        assert_eq!(drain(&mut ikbd), vec![0xF1, 0x1E]);
+    }
+
+    #[test]
     fn commande_reset_relance_le_delai() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
@@ -241,6 +280,8 @@ mod tests {
     #[test]
     fn paquet_mouvement_relatif_format_standard() {
         let mut ikbd = Ikbd::new();
+        ikbd.tick(IKBD_RESET_CYCLES);
+        drain(&mut ikbd);
         ikbd.mouse_move(5, -3, 0b01);
         assert_eq!(drain(&mut ikbd), vec![0xF9, 5, (-3i8) as u8]);
     }
@@ -248,6 +289,8 @@ mod tests {
     #[test]
     fn aucun_paquet_si_rien_ne_change() {
         let mut ikbd = Ikbd::new();
+        ikbd.tick(IKBD_RESET_CYCLES);
+        drain(&mut ikbd);
         ikbd.mouse_move(0, 0, 0);
         assert!(drain(&mut ikbd).is_empty());
     }
@@ -255,6 +298,8 @@ mod tests {
     #[test]
     fn axe_y_inverse_par_commande_0x0f() {
         let mut ikbd = Ikbd::new();
+        ikbd.tick(IKBD_RESET_CYCLES);
+        drain(&mut ikbd);
         ikbd.receive_cmd(0x0F); // Y=0 en bas
         ikbd.mouse_move(0, 10, 0);
         assert_eq!(drain(&mut ikbd), vec![0xF8, 0, (-10i8) as u8]);

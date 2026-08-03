@@ -349,8 +349,17 @@ fn busy_efface_et_y_count_retrouve_sa_valeur_initiale_apres_execute() {
     bl.execute(&mut bus);
 
     assert!(!bl.busy(), "BUSY doit être effacé après execute()");
-    assert_eq!(bl.read(reg::Y_COUNT), 0, "octet haut de Y_COUNT=5");
-    assert_eq!(bl.read(reg::Y_COUNT + 1), 5, "Y_COUNT doit retrouver sa valeur initiale (5), pas 0");
+    // Y_COUNT est un compteur VIVANT (décompte réellement à chaque ligne
+    // traitée, pas une copie figée relue à l'identique) — confirmé par
+    // Hatari (`BlitterRegs.y_count--`) et Steem SSE (`Blitter.YCounter--`
+    // puis `Blitter.YCount=(WORD)Blitter.YCounter`, resynchronisé à chaque
+    // ligne). Une fois le blit entièrement terminé, il lit donc 0, pas sa
+    // valeur de départ — une version précédente de ce test supposait
+    // l'inverse (registre figé), cohérent avec l'ancien modèle "tout
+    // d'un coup" qui ne modifiait jamais le registre visible, seulement
+    // une copie locale.
+    assert_eq!(bl.read(reg::Y_COUNT), 0, "octet haut de Y_COUNT après un blit terminé");
+    assert_eq!(bl.read(reg::Y_COUNT + 1), 0, "Y_COUNT doit valoir 0 une fois le blit entièrement terminé");
 }
 
 #[test]
@@ -413,14 +422,22 @@ fn fxsr_amorce_le_registre_tampon_avant_la_premiere_lecture() {
 }
 
 #[test]
-fn nfsr_supprime_la_derniere_lecture_source_de_la_ligne() {
-    // NFSR (bit 6 de SKEW) : la dernière lecture source d'une ligne n'est
-    // pas effectuée — le registre tampon source garde la dernière valeur
-    // qui y a été chargée (confirmé par Hatari : `Blitter_SourceFetch(true)`
-    // réutilise `bus_word` au lieu de relire la mémoire). Ici FXSR=0, donc
-    // le tampon initial vaut 0 : le résultat est 0 non pas parce que NFSR
-    // force un zéro, mais parce que c'est la valeur (par ailleurs nulle) déjà
-    // présente dans le tampon. Voir le test suivant pour un tampon non nul.
+fn nfsr_ligne_d_un_seul_mot_relit_et_combine_le_mot_avec_lui_meme() {
+    // NFSR (bit 6 de SKEW) sur une ligne d'UN SEUL mot est un cas
+    // particulier documenté séparément par Hatari (`Blitter_ProcessWord`,
+    // commentaire "Special 'weird' case for x_count=1 and NFSR=1") : la
+    // lecture source normale a bien lieu (contrairement à une ligne
+    // multi-mots, où NFSR omet la dernière lecture), MAIS le silicium
+    // effectue en plus un décalage+relecture supplémentaire (réutilisant
+    // le dernier mot bus lu) avant ET après le traitement du mot. Avec
+    // SKEW=0, cela revient à combiner le mot source avec lui-même dans le
+    // registre tampon 32 bits, ce qui redonne simplement ce même mot en
+    // sortie — vérifié par un test différentiel exhaustif comparant notre
+    // implémentation à un portage direct de `Blitter_ProcessWord`
+    // (`tests/blitter_hatari_diff.rs`, 0 divergence sur 8731 configurations
+    // dont celle-ci). Une version précédente traitait NFSR comme un simple
+    // "réutilise le mot précédent" y compris pour X_COUNT=1, ce qui aurait
+    // donné 0x0000 ici (tampon initial nul) plutôt que 0xFFFF.
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 2); // source seule
     bl.write(reg::OP, 0x3); // copie
@@ -434,25 +451,26 @@ fn nfsr_supprime_la_derniere_lecture_source_de_la_ligne() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    bus.write16(0x1000, 0xFFFF); // ne doit pas être lu
+    bus.write16(0x1000, 0xFFFF);
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0x0000, "NFSR=1, FXSR=0 : tampon initial nul réutilisé");
+    assert_eq!(bus.read16(0x2000), 0xFFFF, "NFSR=1, ligne d'un seul mot : lu puis recombiné avec lui-même");
 }
 
 #[test]
-fn nfsr_reutilise_le_dernier_mot_source_lu_et_non_zero() {
-    // Avec FXSR=1 ET NFSR=1, le tampon source est amorcé par la lecture
-    // FXSR (à SRC_ADDR courant, 0x1000) puis, comme X_COUNT=1 fait du seul
-    // mot de la ligne le dernier, NFSR empêche toute nouvelle lecture bus
-    // (qui aurait eu lieu à 0x1000+SRC_X_INC=0x1002 sinon) : c'est donc la
-    // valeur amorcée par FXSR qui doit apparaître en sortie, PAS zéro. Une
-    // version précédente forçait la source du dernier mot à 0, ce qui
-    // aurait donné 0x0000 ici au lieu de 0xABCD — bug réel identifié en
-    // comparant avec Hatari (`bus_word` réutilisé, pas remis à zéro).
+fn nfsr_ligne_d_un_seul_mot_avec_fxsr_relit_aussi_le_mot_normal() {
+    // Même cas particulier que le test précédent, mais avec FXSR=1 en
+    // plus : le tampon est d'abord amorcé par la lecture FXSR (à
+    // SRC_ADDR=0x1000), PUIS la lecture "normale" du mot 0 a bien lieu
+    // elle aussi (à 0x1000+SRC_X_INC=0x1002 — le cas X_COUNT=1 ne
+    // supprime PAS cette lecture, seul le décalage+relecture
+    // supplémentaire de fin de mot réutilise le dernier mot bus lu, ici
+    // celui de 0x1002, pas celui de 0x1000). Avec SKEW=0, c'est donc la
+    // valeur lue à 0x1002 qui domine en sortie, pas celle de l'amorçage
+    // FXSR — vérifié par le même test différentiel exhaustif.
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 2); // source seule
     bl.write(reg::OP, 0x3); // copie
@@ -467,7 +485,7 @@ fn nfsr_reutilise_le_dernier_mot_source_lu_et_non_zero() {
 
     let mut bus = FlatBus::new();
     bus.write16(0x1000, 0xABCD); // lu par FXSR (à SRC_ADDR courant)
-    bus.write16(0x1002, 0x1111); // ne doit PAS être lu (NFSR)
+    bus.write16(0x1002, 0x1111); // lu par la lecture normale du mot 0
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
@@ -475,8 +493,8 @@ fn nfsr_reutilise_le_dernier_mot_source_lu_et_non_zero() {
 
     assert_eq!(
         bus.read16(0x2000),
-        0xABCD,
-        "NFSR=1 : réutilise le mot amorcé par FXSR, pas zéro"
+        0x1111,
+        "NFSR=1+FXSR=1, ligne d'un seul mot : la lecture normale (0x1002) domine en sortie"
     );
 }
 

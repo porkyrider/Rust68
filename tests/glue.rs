@@ -27,22 +27,38 @@ fn hbl_arme_a_la_fin_de_chaque_ligne() {
 }
 
 #[test]
-fn vbl_arme_a_la_fin_de_trame_et_la_ligne_boucle() {
+fn vbl_arme_a_la_transition_visible_blanking_pas_au_bouclage() {
+    // Sur silicium réel, VBL survient au DÉBUT du blanking vertical (juste
+    // après la dernière ligne visible), pas au bouclage complet de la trame
+    // (`line` revenant à 0) — tout le reste du blanking (~113 lignes en
+    // PAL) s'écoule ENSUITE, avant que la ligne 0 de la trame suivante ne
+    // soit affichée. Confondre les deux ferait rendre cette ligne 0 dans le
+    // même souffle que l'armement de VBL, sans laisser au logiciel la
+    // moindre chance de prendre l'interruption avant qu'elle ne soit déjà
+    // consommée.
     let mut glue = Glue::new(VideoMode::Pal50);
-    // 312 lignes complètes : pas encore de VBL (313 lignes/trame en PAL).
-    glue.tick(512 * 312);
-    assert_eq!(glue.current_line(), 312);
+    // 199 lignes complètes (dernière ligne visible, 0..199 en PAL) : pas
+    // encore de VBL.
+    glue.tick(512 * 199);
+    assert_eq!(glue.current_line(), 199);
     assert!(!glue.vbl_pending());
     assert_eq!(glue.frame_count(), 0);
 
-    // La 313e ligne complète la trame.
+    // La 200e ligne (transition vers le blanking vertical) déclenche VBL.
     glue.tick(512);
     assert!(glue.vbl_pending());
-    assert!(glue.hbl_pending(), "la fin de trame est aussi une fin de ligne (HBL)");
-    assert_eq!(glue.current_line(), 0, "la ligne boucle à 0 en début de trame suivante");
-    assert_eq!(glue.frame_count(), 1);
+    assert!(glue.hbl_pending(), "toute fin de ligne est aussi une fin de ligne (HBL)");
+    assert_eq!(glue.current_line(), 200);
+    assert_eq!(glue.frame_count(), 0, "la trame ne bascule qu'au bouclage complet (313 lignes)");
 
     glue.ack_vbl();
+    assert!(!glue.vbl_pending());
+
+    // Le reste du blanking (113 lignes) fait boucler la ligne et avancer
+    // frame_count(), sans réarmer VBL (déjà consommé plus haut).
+    glue.tick(512 * 113);
+    assert_eq!(glue.current_line(), 0, "la ligne boucle à 0 en début de trame suivante");
+    assert_eq!(glue.frame_count(), 1);
     assert!(!glue.vbl_pending());
 }
 

@@ -10,7 +10,7 @@ use rust68::peripherals::atari_st::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
     BLITTER_BASE, DEFAULT_ROM_BASE, DMA_ADDR_HIGH, DMA_ADDR_LOW, DMA_ADDR_MID, DMA_MODE, FDC_DATA,
-    IO_BASE, MFP_BASE, STE_DMA_SOUND_BASE, YM2149_DATA, YM2149_SELECT, model,
+    IO_BASE, MEMORY_CONF, MFP_BASE, STE_DMA_SOUND_BASE, YM2149_DATA, YM2149_SELECT, model,
 };
 use rust68::{Bus, Cpu};
 
@@ -105,7 +105,10 @@ fn acces_flottant_au_dela_de_la_ram_dans_les_4_mo() {
     // à l'adresse précise. Un accès y "flotte" : contrairement à de la
     // vraie RAM, une lecture ne renvoie PAS ce qui vient d'être écrit —
     // c'est justement ce que le TOS observe (pas un repliement d'adresse)
-    // pour sa détection de RAM au tout début du boot froid.
+    // pour sa détection de RAM au tout début du boot froid. Confirmé par le
+    // code source de Hatari (`stMemory.c`, `VoidMem_bank`) — voir la doc de
+    // `AtariSt::in_floating_st_ram` pour l'historique des tentatives de
+    // bus error/mirroring essayées et abandonnées ici.
     let mut st = AtariSt::new(0x1000, vec![]); // 4 Ko de RAM réelle
 
     st.write8(0x0010_0000, 0x42); // bien au-delà des 4 Ko réels, mais < 4 Mo
@@ -127,6 +130,43 @@ fn acces_flottant_au_dela_de_la_ram_dans_les_4_mo() {
 const ST_RAM_ADDRESS_SPACE_TEST: u32 = 4 * 1024 * 1024;
 
 #[test]
+fn ecriture_dans_les_8_premiers_octets_declenche_bus_error_avec_vraie_rom() {
+    // Documenté noir sur blanc par Atari (Mega Service Manual, carte
+    // mémoire RAM) : "the first 8 bytes of ROM are mapped into addresses
+    // 0-7. These are reset vectors which the 68000 uses on start-up" — un
+    // mirroring permanent, distinct de l'overlay désactivable par
+    // MEMORY_CONF. Écrire dedans doit déclencher un vrai bus error (Glue :
+    // "asserts Bus Error if... writing to ROM"), pas être silencieusement
+    // ignoré. Confirmé nécessaire par la cartouche de diagnostic usine STe
+    // (test "I7 Bus error not detected").
+    let rom = vec![0u8; 0x1000];
+    let mut st = AtariSt::new(0x1000, rom);
+
+    st.write8(0x0000, 0x42);
+    assert_eq!(st.take_bus_fault(), Some((0x0000, true)));
+
+    st.write8(0x0007, 0x42);
+    assert_eq!(st.take_bus_fault(), Some((0x0007, true)));
+
+    // À partir de l'adresse 8 : RAM normale, aucun bus error (la lecture y
+    // voit encore l'overlay ROM tant qu'il est actif — voir `AtariSt::overlay`
+    // — mais l'écriture, elle, aboutit bien en RAM sans faute).
+    st.write8(0x0008, 0x42);
+    assert_eq!(st.take_bus_fault(), None);
+}
+
+#[test]
+fn ecriture_dans_les_8_premiers_octets_sans_vraie_rom_ne_faute_pas() {
+    // Sans ROM réelle (banc d'essai nu), ce mirroring matériel n'a pas de
+    // sens : plusieurs tests d'intégration écrivent directement en RAM
+    // basse (vecteur de reset de test, contenu vidéo à l'adresse 0...).
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(0x0000, 0x42);
+    assert_eq!(st.take_bus_fault(), None);
+    assert_eq!(st.read8(0x0000), 0x42);
+}
+
+#[test]
 fn peripherique_non_emule_repond_neutre_sans_fault() {
     let mut st = AtariSt::new(0x1000, vec![]);
     let addr = IO_BASE + 0x950; // zone encore libre, au-delà du stub DMA sound/Microwire
@@ -145,6 +185,94 @@ fn stub_dma_sound_microwire_repond_zero_pas_0xff() {
     st.write8(STE_DMA_SOUND_BASE + 0x22, 0x34);
     assert_eq!(st.read8(STE_DMA_SOUND_BASE + 0x22), 0x00);
     assert_eq!(st.take_bus_fault(), None);
+}
+
+#[test]
+fn dma_sound_lit_les_echantillons_depuis_la_ram_via_le_bus_complet() {
+    // Câblage bout-en-bout (pas juste le module `DmaSound` isolé) : les
+    // registres écrits via le bus `AtariSt` doivent piloter une lecture
+    // réelle dans SA PROPRE RAM (voir `AtariSt::next_dma_sample`).
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(0x100, 0x11);
+    st.write8(0x101, 0x22);
+
+    st.write8(STE_DMA_SOUND_BASE + 0x07, 0x00); // frame start low (base 0x100 déjà à 0)
+    st.write8(STE_DMA_SOUND_BASE + 0x05, 0x01); // frame start mid -> début = 0x100
+    st.write8(STE_DMA_SOUND_BASE + 0x13, 0x02); // frame end low
+    st.write8(STE_DMA_SOUND_BASE + 0x11, 0x01); // frame end mid -> fin = 0x102
+    st.write8(STE_DMA_SOUND_BASE + 0x21, 0x83); // mono, 50066 Hz
+    st.write8(STE_DMA_SOUND_BASE + 0x01, 0x01); // PLAY (sans boucle)
+
+    assert_eq!(st.next_dma_sample(50066), (0x11, 0x11));
+    assert_eq!(st.next_dma_sample(50066), (0x22, 0x22));
+    // Fin de trame atteinte, pas de boucle : silence ensuite.
+    assert_eq!(st.next_dma_sample(50066), (0, 0));
+}
+
+#[test]
+fn dma_sound_boucle_pulse_le_timer_a_via_xsint() {
+    // Câblage matériel réel : XSINT (fin de trame DMA, y compris en
+    // boucle) est relié à l'entrée de comptage d'événements du Timer A du
+    // MFP — sans ce relais, un logiciel qui compte les bouclages via ce
+    // timer (la cartouche de diagnostic usine STe, test Audio) n'obtient
+    // jamais son interruption. Reproduit précisément ce scénario : Timer A
+    // en mode comptage d'événements (bit3 posé), armé pour interrompre
+    // après 3 bouclages.
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(0x100, 0x11);
+    st.write8(0x101, 0x22);
+
+    // Trame d'un seul mot (2 octets — les adresses de trame sont alignées
+    // mot sur silicium réel, bit0 câblé à masse, voir `DmaSound::write`),
+    // boucle activée : les 2 octets consommés font boucler à chaque fois.
+    st.write8(STE_DMA_SOUND_BASE + 0x07, 0x00);
+    st.write8(STE_DMA_SOUND_BASE + 0x05, 0x01); // début = 0x100
+    st.write8(STE_DMA_SOUND_BASE + 0x13, 0x02);
+    st.write8(STE_DMA_SOUND_BASE + 0x11, 0x01); // fin = 0x102
+    st.write8(STE_DMA_SOUND_BASE + 0x21, 0x83); // mono, 50066 Hz
+    st.write8(STE_DMA_SOUND_BASE + 0x01, 0x03); // PLAY + LOOP
+
+    // La donnée doit être écrite AVANT le contrôle : `reload()` (déclenché
+    // par l'écriture de TACR) recharge le compteur depuis la donnée.
+    st.mfp.write(reg::TADR, 3); // 3 pulses avant déclenchement
+    st.mfp.write(reg::TACR, 0x08); // bit3 = mode comptage d'événements
+    st.mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
+    st.mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
+
+    // Mono, 2 octets/trame : 2 appels consomment une trame entière (1 front
+    // XSINT). 3 bouclages nécessitent donc 6 appels.
+    for _ in 0..5 {
+        st.next_dma_sample(50066);
+        assert!(!st.mfp.interrupt_requested(), "pas encore 3 bouclages");
+    }
+    st.next_dma_sample(50066);
+    assert!(st.mfp.interrupt_requested(), "3 bouclages : Timer A doit avoir déclenché");
+}
+
+#[test]
+fn microwire_volume_maitre_cablee_bout_en_bout_via_le_bus() {
+    // Câblage bout-en-bout (pas juste le module `Microwire` isolé) : les
+    // registres MASK ($FF8924) puis DATA ($FF8922) écrits via le bus
+    // `AtariSt` doivent piloter `st.microwire.left_gain()`/`right_gain()` —
+    // c'est ainsi que la cartouche de diagnostic usine STe change de volume
+    // entre ses différents tests de tonalité (masque toujours `$7FF`,
+    // donnée = commande | `$400`).
+    let mut st = AtariSt::new(0x1000, vec![]);
+    assert!((st.microwire.left_gain() - 1.0).abs() < 0.001, "volume plein par défaut");
+
+    // Type=3 (volume maître) << 6, valeur=0 : index le plus atténué (-80dB).
+    let cmd: u16 = 0x400 | (3 << 6);
+    st.write8(0xFF8924, 0x07); // MASK haut
+    st.write8(0xFF8925, 0xFF); // MASK bas -> 0x7FF
+    st.write8(0xFF8922, (cmd >> 8) as u8); // DATA haut
+    st.write8(0xFF8923, (cmd & 0xFF) as u8); // DATA bas -> décode ici
+
+    assert!(st.microwire.left_gain() < 0.01, "commande via le bus doit fortement atténuer");
+    assert!(st.microwire.right_gain() < 0.01, "les deux canaux sont atténués par le volume maître");
+
+    // DATA se relit toujours à 0 immédiatement (silicium simulé "décalage
+    // déjà terminé", voir la doc de `read8`).
+    assert_eq!(st.read8(0xFF8922), 0x00);
 }
 
 #[test]
@@ -426,8 +554,12 @@ fn tick_rend_une_ligne_video_dans_le_framebuffer() {
 fn tick_rend_une_trame_complete() {
     let mut st = AtariSt::new(0x1_0000, vec![]);
     st.write8(shifter_addr::RESOLUTION, 0b00);
-    st.tick(512 * 313); // une trame PAL complète (313 lignes)
-    assert_eq!(st.framebuffer.len(), 313);
+    st.tick(512 * 313); // une trame PAL complète (313 lignes, dont 200 visibles)
+    // Seules les 200 lignes visibles sont rendues (voir `Glue::visible_lines`
+    // et `AtariSt::tick`) : le Shifter ne fetch/avance son compteur vidéo
+    // que là, pas pendant les ~113 lignes de blanking vertical, exactement
+    // comme sur silicium réel.
+    assert_eq!(st.framebuffer.len(), 200);
     assert!(
         st.framebuffer.iter().all(|line| line.len() == 320),
         "chaque ligne rendue doit avoir la largeur de la résolution basse"
@@ -607,4 +739,47 @@ fn reset_bus_reinitialise_le_blitter() {
     st.write8(BLITTER_BASE + blitter_reg::OP, 0xC);
     st.reset_bus();
     assert_eq!(st.blitter.read(blitter_reg::OP), 0, "reset_bus doit réinitialiser le Blitter");
+}
+
+#[test]
+fn mirroring_mmu_intra_banque_ste_quand_memconf_surestime_la_ram_reelle() {
+    // 1040STE réel : deux banques de 512 Ko chacune (1 Mo total). Au reset à
+    // froid, MEMCONF vaut 0 (banques "128 Ko" par défaut, voir
+    // `AtariSt::translate_ram_addr`) — le logiciel de détection RAM écrit
+    // ensuite une estimation candidate (ex: "2 Mo" par banque) AVANT de la
+    // corriger ; c'est justement PENDANT cette fenêtre que le mirroring
+    // matériel doit se manifester, pour que la correction puisse avoir
+    // lieu. Reproduit le bug réel trouvé via la cartouche de diagnostic
+    // usine STe (annonçait "2M RAM" au lieu d'1 Mo) et vérifié directement
+    // contre Hatari (qui, lui, affiche "1M RAM" correctement).
+    let mut st = AtariSt::from_model(model::AtariModel::Ste1040.profile(), vec![]);
+    assert!(st.blitter_present(), "le 1040STE a un Blitter (STE)");
+
+    // MEMCONF = 0x0A : banque 0 = 2 Mo (bits 3-2 = 10), banque 1 = 2 Mo
+    // (bits 1-0 = 10) — l'estimation "trop grande" que prend la cartouche
+    // avant de la corriger.
+    st.write8(MEMORY_CONF, 0x0A);
+
+    // Écrit un motif au tout début de la banque 0 réelle.
+    st.write32(0x10, 0xA5A51234);
+    // Adresse au-delà de la banque 0 RÉELLE (512 Ko) mais toujours dans sa
+    // taille LOGIQUE actuelle (2 Mo) : doit boucler sur la même RAM
+    // physique (mirroring), pas lire une valeur indépendante.
+    assert_eq!(
+        st.read32(0x10 + 0x80000),
+        0xA5A51234,
+        "adresse au-delà de la banque réelle (512 Ko) mais dans sa taille logique (2 Mo) : doit boucler"
+    );
+
+    // Une fois MEMCONF corrigé à la vraie configuration (512 Ko + 512 Ko,
+    // code 0x05), le mirroring disparaît : les deux adresses redeviennent
+    // indépendantes (identité, comportement normal une fois le TOS booté).
+    st.write8(MEMORY_CONF, 0x05);
+    st.write32(0x10 + 0x80000, 0xDEADBEEF);
+    assert_eq!(
+        st.read32(0x10),
+        0xA5A51234,
+        "MEMCONF correct : plus de mirroring, la banque 1 est indépendante"
+    );
+    assert_eq!(st.read32(0x10 + 0x80000), 0xDEADBEEF);
 }

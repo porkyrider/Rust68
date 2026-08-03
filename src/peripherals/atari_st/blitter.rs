@@ -82,6 +82,7 @@ pub mod reg {
 }
 
 const CONTROL_BUSY: u8 = 1 << 7;
+const CONTROL_HOG: u8 = 1 << 6;
 
 #[derive(Debug, Clone)]
 pub struct Blitter {
@@ -107,6 +108,31 @@ pub struct Blitter {
     /// "Armement" du Blitter — voir [`Self::execute`] pour le bug réel que
     /// ce champ corrige.
     armed: bool,
+    /// Vrai entre le début et la fin RÉELLE (Y_COUNT atteignant 0) d'un
+    /// blit — c'est-à-dire tant qu'il reste du travail, y compris entre
+    /// deux tranches en mode non-HOG (voir [`Self::execute`]). Distinct de
+    /// `armed` : `armed` autorise un DÉMARRAGE (ou redémarrage explicite,
+    /// Y_COUNT vient d'être réécrit), `mid_blit` autorise la POURSUITE d'un
+    /// blit déjà commencé sans qu'aucun registre n'ait besoin d'être
+    /// réécrit entre les tranches.
+    mid_blit: bool,
+    /// Registre à décalage source 32 bits, persistant entre les tranches
+    /// (voir [`Self::execute`]).
+    buffer: u32,
+    /// Dernier mot effectivement lu sur le bus source — réutilisé par NFSR
+    /// (voir [`Self::execute`]).
+    bus_word: u16,
+    /// Vrai si la lecture d'amorçage FXSR de la ligne EN COURS a déjà eu
+    /// lieu (remis à faux à chaque nouvelle ligne).
+    have_fxsr: bool,
+    /// Vrai si la prochaine lecture source doit être omise (NFSR,
+    /// positionné dynamiquement quand X_COUNT atteint 2).
+    nfsr_dynamic: bool,
+    /// Largeur (en mots) de la ligne en cours de blit — capturée une seule
+    /// fois au véritable début du blit (contrairement à `x_count`, qui
+    /// décompte réellement et se réinitialise à cette valeur à chaque fin
+    /// de ligne).
+    x_count_reset: u32,
 }
 
 impl Default for Blitter {
@@ -133,6 +159,12 @@ impl Blitter {
             skew: 0,
             control: 0,
             armed: false,
+            mid_blit: false,
+            buffer: 0,
+            bus_word: 0,
+            have_fxsr: false,
+            nfsr_dynamic: false,
+            x_count_reset: 0,
         }
     }
 
@@ -230,7 +262,14 @@ impl Blitter {
                 self.src_addr = (self.src_addr & 0xFF00_FFFF) | ((value as u32) << 16)
             }
             reg::SRC_ADDR2 => self.src_addr = (self.src_addr & 0xFFFF_00FF) | ((value as u32) << 8),
-            reg::SRC_ADDR3 => self.src_addr = (self.src_addr & 0xFFFF_FF00) | value as u32,
+            // Bit 0 forcé à zéro (registre câblé mot uniquement sur le
+            // silicium réel — même contrainte que `write_long` applique
+            // déjà à l'écriture `.L` complète, et que les registres
+            // d'incrément appliquent déjà à leur propre octet bas
+            // ci-dessous) : sans ce masquage, une écriture octet isolée du
+            // bas de SRC_ADDR pouvait laisser une adresse impaire, désalignant
+            // la lecture des mots et mélangeant les plans de bits entrelacés.
+            reg::SRC_ADDR3 => self.src_addr = (self.src_addr & 0xFFFF_FF00) | (value as u32 & 0xFE),
             reg::ENDMASK_1 => self.endmask[0] = (self.endmask[0] & 0x00FF) | ((value as u16) << 8),
             reg::ENDMASK_11 => self.endmask[0] = (self.endmask[0] & 0xFF00) | value as u16,
             reg::ENDMASK_2 => self.endmask[1] = (self.endmask[1] & 0x00FF) | ((value as u16) << 8),
@@ -258,7 +297,9 @@ impl Blitter {
                 self.dst_addr = (self.dst_addr & 0xFF00_FFFF) | ((value as u32) << 16)
             }
             reg::DST_ADDR2 => self.dst_addr = (self.dst_addr & 0xFFFF_00FF) | ((value as u32) << 8),
-            reg::DST_ADDR3 => self.dst_addr = (self.dst_addr & 0xFFFF_FF00) | value as u32,
+            // Bit 0 forcé à zéro — voir le commentaire équivalent sur
+            // `SRC_ADDR3` juste au-dessus.
+            reg::DST_ADDR3 => self.dst_addr = (self.dst_addr & 0xFFFF_FF00) | (value as u32 & 0xFE),
             reg::X_COUNT => self.x_count = (self.x_count & 0x00FF) | ((value as u32) << 8),
             reg::X_COUNT1 => self.x_count = (self.x_count & 0xFF00) | value as u32,
             reg::Y_COUNT => {
@@ -331,7 +372,7 @@ impl Blitter {
     /// (motif "déjà là" avant même l'application d'un blit de teinte, par
     /// exemple).
     fn write_control(&mut self, value: u8) {
-        if value & CONTROL_BUSY != 0 && !self.armed {
+        if value & CONTROL_BUSY != 0 && !self.armed && !self.mid_blit {
             self.control = (self.control & CONTROL_BUSY) | (value & !CONTROL_BUSY);
         } else {
             self.control = value;
@@ -426,30 +467,59 @@ impl Blitter {
     /// blits entiers depuis des adresses déjà avancées — une fois ce bug
     /// corrigé séparément, ce correctif de direction a pu être réappliqué
     /// sans regression.
-    fn skewed_source(&self, previous: u16, current: u16) -> u16 {
-        let skew = (self.skew & 0x0F) as u32;
-        let combined: u32 = if self.src_x_inc < 0 {
-            ((current as u32) << 16) | previous as u32
+    /// Décale le registre à décalage source 32 bits (`buffer`, voir
+    /// [`Self::execute`]) : pour un parcours croissant (`src_x_inc >= 0`),
+    /// l'ancien contenu remonte en HAUT (place nette en BAS pour le
+    /// prochain mot lu) ; pour un parcours décroissant, c'est l'inverse.
+    /// Traduction directe de `Blitter_SourceShift` (Hatari,
+    /// `src/blitter.c`).
+    fn shift_buffer(buffer: &mut u32, src_x_inc: i16) {
+        if src_x_inc < 0 {
+            *buffer >>= 16;
         } else {
-            ((previous as u32) << 16) | current as u32
-        };
-        (combined >> skew) as u16
+            *buffer <<= 16;
+        }
+    }
+
+    /// Charge `word` dans la moitié du registre à décalage source que
+    /// [`Self::shift_buffer`] vient de libérer. Traduction directe de
+    /// `Blitter_SourceFetch` (Hatari, `src/blitter.c`).
+    fn fetch_buffer(buffer: &mut u32, src_x_inc: i16, word: u16) {
+        if src_x_inc < 0 {
+            *buffer |= (word as u32) << 16;
+        } else {
+            *buffer |= word as u32;
+        }
     }
 
     /// Exécute le blit dans son intégralité (modèle synchrone, voir
     /// limitations du module), en utilisant `bus` pour lire/écrire la RAM
     /// aux adresses source/destination courantes. Met à jour les
-    /// registres d'adresse source/destination et le compteur Y à zéro en
-    /// fin d'exécution ; efface le bit BUSY.
+    /// registres d'adresse source/destination en fin d'exécution ; efface
+    /// le bit BUSY.
     ///
-    /// `FXSR` (lecture d'amorçage en début de ligne) et `NFSR` (dernière
-    /// lecture source de la ligne omise) sont honorés d'après le bit du
-    /// registre [`reg::SKEW`] plutôt que déduits de `skew != 0`. En mode
-    /// `SMUDGE`, le mot de demi-teinte utilisé pour chaque mot vient des 4
-    /// bits bas du mot source décalé (`skewed_source`) plutôt que du
-    /// numéro de ligne courant ; sinon, le numéro de ligne (bits 0-3 de
-    /// [`reg::CONTROL`]) avance ou recule à la fin de chaque ligne selon
-    /// le signe de `DST_Y_INC`.
+    /// Traite le blit **mot par mot** (pas ligne par ligne avec une
+    /// formule d'avance d'adresse précalculée) — traduction directe de la
+    /// machine à états de Hatari (`Blitter_ProcessWord`,
+    /// `Blitter_SourceShift`/`Blitter_SourceFetch`), afin de reproduire
+    /// fidèlement le registre à décalage source 32 bits (`buffer`
+    /// ci-dessous) : sur le silicium réel, ce registre **persiste sur la
+    /// durée ENTIÈRE du blit** (toutes les lignes), jamais remis à zéro
+    /// entre deux lignes — seuls un décalage puis une lecture le
+    /// modifient, à chaque mot lu (y compris l'amorçage FXSR). Une version
+    /// précédente, structurée ligne par ligne avec une formule d'avance
+    /// d'adresse batch, réinitialisait le mot "précédent" à 0 au début de
+    /// CHAQUE ligne (sauf FXSR) et gérait NFSR comme un cas particulier
+    /// local plutôt que la véritable suppression de lecture/avance
+    /// qu'implique le silicium réel — confirmé faux par un test
+    /// différentiel comparant exhaustivement notre sortie à un portage
+    /// direct de `Blitter_ProcessWord` (`tests/blitter_hatari_diff.rs`) :
+    /// pour un blit multi-lignes en direction négative avec SKEW=0 et
+    /// X_COUNT=1, l'ancienne version produisait 0 au lieu du mot de la
+    /// ligne précédente à chaque nouvelle ligne ; avec NFSR actif, elle
+    /// divergeait aussi de l'avance d'adresse source réelle (qui saute
+    /// entièrement l'avance de fin de ligne quand la dernière lecture est
+    /// omise).
     ///
     /// **Armement** (voir [`Self::write_control`]) : ne fait RIEN si
     /// [`Self::armed`] est faux — c'est-à-dire si le logiciel n'a pas
@@ -461,158 +531,240 @@ impl Blitter {
     /// le commentaire détaillé de [`Self::write_control`] pour le bug réel
     /// que ceci corrige.
     pub fn execute(&mut self, bus: &mut impl crate::Bus) {
-        if !self.armed {
+        if self.armed {
+            // Véritable démarrage (Y_COUNT vient d'être réécrit) : (ré)initialise
+            // tout l'état de progression persistant. `x_count_reset` reste
+            // borné à 1 (`.max(1)`) uniquement pour éviter une boucle
+            // infinie plus bas, pas pour lui donner une signification
+            // particulière.
+            self.x_count = self.x_count.max(1);
+            self.x_count_reset = self.x_count;
+            // NE PAS remettre `self.buffer` à zéro ici : sur le silicium
+            // réel (confirmé par Hatari ET Steem SSE — aucune des deux
+            // références ne réinitialise jamais `BlitterVars.buffer`/
+            // `Blitter.SrcBuffer` au démarrage d'un blit, uniquement via
+            // les décalages/lectures normaux), le registre à décalage
+            // source persiste sur la durée de vie de la puce, y compris
+            // entre deux blits LOGIQUEMENT SÉPARÉS (Y_COUNT réécrit entre
+            // les deux). TOS dessine typiquement une icône ou un glyphe
+            // colonne par colonne via une SUITE de petits blits adjacents
+            // (X_COUNT=1, SKEW non nul) qui s'appuient sur ce
+            // chaînage pour reconstituer correctement les pixels à cheval
+            // sur une frontière de mot — une remise à zéro systématique ici
+            // clive alors chaque nouvelle colonne, cohérent avec la
+            // corruption RVB observée sur les icônes glissées et le texte
+            // des menus (uniquement les blits utilisant réellement la
+            // source, jamais les remplissages/inversions purs qui n'en ont
+            // pas besoin).
+            self.bus_word = 0;
+            self.have_fxsr = false;
+            self.nfsr_dynamic = false;
+            self.armed = false;
+            self.mid_blit = true;
+            self.control |= CONTROL_BUSY;
+        } else if !self.mid_blit {
             return;
         }
-        self.control |= CONTROL_BUSY;
 
-        // X_COUNT/Y_COUNT : le manuel Blitter officiel documente 0 comme
-        // désignant 65536 — mais cette conversion a désormais lieu à
-        // l'ÉCRITURE du registre (voir `write_word_count`), pas ici. Deux
-        // tentatives précédentes de l'appliquer directement ici (sur un
-        // champ 16 bits, via `.max(1)`) confondaient "0 explicitement écrit
-        // `y_count == 0` fait légitimement 0 tour de boucle externe (blit
-        // sans effet). `x_count` reste borné à 1 (`.max(1)`) uniquement pour
-        // éviter un dépassement arithmétique dans `(x_count - 1)` plus bas
-        // (avance de fin de ligne), pas pour lui donner une signification
-        // particulière.
-        let x_count = self.x_count.max(1);
-        let y_count = self.y_count;
+        let x_count_reset = self.x_count_reset;
         let smudge = self.control & 0x20 != 0;
-        let fxsr = self.skew & 0x80 != 0;
-        let nfsr = self.skew & 0x40 != 0;
+        let fxsr_reg = self.skew & 0x80 != 0;
+        let nfsr_reg = self.skew & 0x40 != 0;
+        let skew = (self.skew & 0x0F) as u32;
+        // Mode HOG (bit 6 de CONTROL) : le Blitter garde le bus jusqu'à la
+        // fin complète du blit, sans jamais rendre la main au CPU. En mode
+        // non-HOG, le silicium réel ne traite qu'un nombre BORNÉ d'accès
+        // bus (documenté ~64) avant de rendre le bus — le logiciel doit
+        // reposer BUSY (typiquement via `TAS.B`, qui relit/rendosse au
+        // passage le numéro de ligne demi-teinte déjà avancé par le
+        // matériel) pour faire progresser la suite. Confirmé nécessaire
+        // par trace réelle Hatari (`--trace blitter`) sur ce cas précis :
+        // une longue série d'écritures CONTROL avec BUSY posé et un numéro
+        // de ligne qui progresse entre chaque écriture (pas une seule
+        // écriture qui termine tout d'un coup), avec des centaines de
+        // cycles d'instructions CPU authentiques entre deux écritures —
+        // c'est-à-dire du VRAI travail CPU entrelacé avec la progression
+        // du blit. Une version précédente exécutait tout le blit
+        // instantanément dès le premier déclenchement CONTROL, empêchant
+        // ce travail CPU entrelacé de s'exécuter dans le bon ordre relatif
+        // à la progression réelle du blit — cohérent avec la corruption
+        // observée dans le rendu de menus GEM (TOS 1.62/STE) qui persistait
+        // malgré une vérification exhaustive, par ailleurs correcte, de
+        // l'arithmétique interne du Blitter (table OP, HOP, skew, endmask,
+        // avance d'adresse — voir `tests/blitter_hatari_diff.rs`).
+        let hog = self.control & CONTROL_HOG != 0;
+        const WORDS_PER_SLICE: u32 = 16;
+        let mut words_this_slice: u32 = 0;
 
         // `need_src` (repris de Hatari, `Blitter_Step`) : le pointeur
-        // source n'avance en fin de ligne QUE si l'opération lit
-        // effectivement la source — c'est-à-dire si OP n'est pas l'une des
-        // 4 fonctions logiques qui ignorent la source (0x0/0x5/0xA/0xF :
-        // constante 0, "destination", "NOT destination", constante 1) ET
-        // si HOP produit une valeur dépendant de la source (HOP=2/3, ou
-        // HOP=1 seulement en mode SMUDGE, qui lit la source pour choisir la
-        // demi-teinte).
+        // source n'avance QUE si l'opération lit effectivement la source —
+        // c'est-à-dire si OP n'est pas l'une des 4 fonctions logiques qui
+        // ignorent la source (0x0/0x5/0xA/0xF : constante 0, "destination",
+        // "NOT destination", constante 1) ET si HOP produit une valeur
+        // dépendant de la source (HOP=2/3, ou HOP=1 seulement en mode
+        // SMUDGE, qui lit la source pour choisir la demi-teinte).
         let lop_needs_src = !matches!(self.op, 0x00 | 0x05 | 0x0A | 0x0F);
         let hop_needs_src = (self.hop & 0x02) != 0 || (self.hop == 1 && smudge);
         let need_src = lop_needs_src && hop_needs_src;
 
-        for _ in 0..y_count {
+        let trace_words = std::env::var("RUST68_TRACE_BLITTER_WORDS").is_ok();
+        let trace_slices = std::env::var("RUST68_TRACE_BLITTER_SLICES").is_ok();
+
+        if trace_slices {
+            eprintln!(
+                "[slice] entree hog={hog} y_count={} x_count={} mid_blit_deja={}",
+                self.y_count, self.x_count, self.mid_blit,
+            );
+        }
+        while self.y_count > 0 {
+            if !hog && words_this_slice >= WORDS_PER_SLICE {
+                if trace_slices {
+                    eprintln!(
+                        "[slice] pause budget epuise, y_count_restant={} x_count_restant={}",
+                        self.y_count, self.x_count,
+                    );
+                }
+                // Tranche épuisée : on rend la main au CPU sans effacer
+                // BUSY — le prochain déclenchement CONTROL (typiquement
+                // `TAS.B` dans la boucle de relance logicielle) reprendra
+                // exactement où on s'est arrêté, via `mid_blit`.
+                return;
+            }
+            words_this_slice += 1;
+
+            let x_count = self.x_count;
+            let first_word = x_count == x_count_reset;
+            if first_word {
+                self.nfsr_dynamic = false;
+            }
+
+            // Cas particulier d'une ligne d'un seul mot (`x_count_reset ==
+            // 1`) : d'après le manuel Blitter officiel, ENDMASK_1 est
+            // utilisé seul (pas de combinaison avec ENDMASK_3, qui est
+            // simplement ignoré) — "In the case of a one word line
+            // ENDMASK 1 is used."
+            let mask = if first_word || x_count_reset == 1 {
+                self.endmask[0]
+            } else if x_count == 1 {
+                self.endmask[2]
+            } else {
+                self.endmask[1]
+            };
+
+            // FXSR (lecture d'amorçage, une fois en début de ligne) : sur
+            // le silicium réel, cette lecture a lieu à l'adresse COURANTE,
+            // PUIS `src_addr` avance de SRC_X_INC avant même la première
+            // lecture "normale" du mot 0 — le mot 0 est donc réellement lu
+            // à `src_addr+SRC_X_INC`, pas à `src_addr`.
+            if fxsr_reg && !self.have_fxsr && need_src {
+                Self::shift_buffer(&mut self.buffer, self.src_x_inc);
+                let w = bus.read16(self.src_addr & crate::ADDR_MASK);
+                self.bus_word = w;
+                Self::fetch_buffer(&mut self.buffer, self.src_x_inc, w);
+                self.src_addr = self.src_addr.wrapping_add(self.src_x_inc as i32 as u32);
+                self.have_fxsr = true;
+            }
+
+            // Lecture source normale — omise si NFSR est actif ET que ce
+            // mot est celui identifié comme "dernier" par le mécanisme
+            // dynamique ci-dessous (`nfsr_dynamic`, posé quand X_COUNT==2
+            // était vrai au mot précédent).
+            let mut fetch_src = false;
+            if need_src && !self.nfsr_dynamic {
+                Self::shift_buffer(&mut self.buffer, self.src_x_inc);
+                let w = bus.read16(self.src_addr & crate::ADDR_MASK);
+                self.bus_word = w;
+                Self::fetch_buffer(&mut self.buffer, self.src_x_inc, w);
+                fetch_src = true;
+            }
+
+            // Cas particulier NFSR : le silicium réel effectue un
+            // décalage+relecture (réutilisant le dernier mot bus lu) avant
+            // ET après le traitement du DERNIER mot de CHAQUE ligne — pas
+            // seulement les lignes d'un seul mot. Confirmé dans le vrai
+            // source Hatari (`Blitter_ProcessWord`, blitter.c) : la
+            // condition y est `BlitterVars.nfsr && BlitterRegs.x_count ==
+            // 1`, où `BlitterRegs.x_count` est le compteur COURANT (pas la
+            // valeur initiale `x_count_reset`) — donc vrai à la fin de
+            // chaque ligne, quelle que soit sa largeur.
+            let weird_single_word_nfsr = nfsr_reg && x_count == 1;
+            if weird_single_word_nfsr {
+                Self::shift_buffer(&mut self.buffer, self.src_x_inc);
+                Self::fetch_buffer(&mut self.buffer, self.src_x_inc, self.bus_word);
+            }
+
+            let source = (self.buffer >> skew) as u16;
             let halftone_line = self.control & 0x0F;
-            let mut src = self.src_addr;
-            let mut dst = self.dst_addr;
-            // FXSR (lecture d'amorçage) : sur le silicium réel (confirmé
-            // par Hatari, `Blitter_ProcessWord`), cette lecture a lieu à
-            // l'adresse COURANTE (`src`, celle configurée par le logiciel
-            // comme point de départ de la ligne), PUIS `src` avance de
-            // SRC_X_INC avant même la première lecture "normale" du mot 0 —
-            // le mot 0 est donc réellement lu à `src+SRC_X_INC`, pas à
-            // `src`. Une version précédente lisait l'amorçage à
-            // `src-SRC_X_INC` en laissant `src` inchangé pour le mot 0,
-            // inversant l'ordre réel et décalant d'un mot entier TOUTE la
-            // ligne dès que FXSR est actif — cohérent avec la corruption
-            // toujours observée dans la barre de menu (texte/icônes GEM,
-            // qui posent FXSR dès que SKEW≠0).
-            let mut previous_source = if fxsr {
-                let primed = bus.read16(src & crate::ADDR_MASK);
-                src = src.wrapping_add(self.src_x_inc as i32 as u32);
-                primed
+            let halftone_word = if smudge {
+                self.halftone[(source & 0x0F) as usize]
             } else {
-                0
+                self.halftone[halftone_line as usize]
             };
 
-            for word_index in 0..x_count {
-                let is_last_word = word_index == x_count - 1;
-                // NFSR (No Final Source Read) : sur le dernier mot de la
-                // ligne, aucune nouvelle lecture bus n'a lieu — le registre
-                // tampon source conserve la dernière valeur qui y a été
-                // chargée. Une précédente version forçait cette valeur à 0,
-                // ce qui était faux (confirmé par Hatari, référence de
-                // l'émulateur : `Blitter_SourceFetch(true)` réutilise
-                // `bus_word`, la dernière valeur lue, au lieu de lire la
-                // mémoire ou d'utiliser 0) : `previous_source` contient déjà
-                // exactement cette dernière valeur lue (amorcée par FXSR ou
-                // par le mot précédent de la ligne).
-                let current_source = if is_last_word && nfsr {
-                    previous_source
-                } else {
-                    bus.read16(src & crate::ADDR_MASK)
-                };
-                let source = self.skewed_source(previous_source, current_source);
-                previous_source = current_source;
+            let hop_result = self.apply_hop(source, halftone_word);
+            let dest_current = bus.read16(self.dst_addr & crate::ADDR_MASK);
+            let mut result = self.apply_op(hop_result, dest_current);
+            result = (result & mask) | (dest_current & !mask);
 
-                let halftone_word = if smudge {
-                    self.halftone[(source & 0x0F) as usize]
-                } else {
-                    self.halftone[halftone_line as usize]
-                };
-
-                let hop_result = self.apply_hop(source, halftone_word);
-                let dest_current = bus.read16(dst & crate::ADDR_MASK);
-                let mut result = self.apply_op(hop_result, dest_current);
-
-                // Cas particulier d'une ligne d'un seul mot (`x_count ==
-                // 1`) : d'après le manuel Blitter officiel, ENDMASK_1 est
-                // utilisé seul (pas de combinaison avec ENDMASK_3, qui est
-                // simplement ignoré) — "In the case of a one word line
-                // ENDMASK 1 is used." C'est au logiciel appelant de
-                // précalculer la valeur combinée souhaitée et de l'écrire
-                // dans ENDMASK_1 avant de déclencher le blit ; une
-                // précédente tentative de combiner ENDMASK_1 et ENDMASK_3
-                // par ET ici (en lisant la doc comme "les deux masques
-                // fusionnent") mettait silencieusement à zéro des blits
-                // valides dès qu'ENDMASK_3 valait 0 — un cas très fréquent
-                // en pratique (observé sur les petits blits du curseur
-                // souris), confirmant que cette lecture était erronée.
-                let mask = if word_index == 0 {
-                    self.endmask[0]
-                } else if is_last_word {
-                    self.endmask[2]
-                } else {
-                    self.endmask[1]
-                };
-                result = (result & mask) | (dest_current & !mask);
-
-                bus.write16(dst & crate::ADDR_MASK, result);
-
-                src = src.wrapping_add(self.src_x_inc as i32 as u32);
-                dst = dst.wrapping_add(self.dst_x_inc as i32 as u32);
+            if trace_words
+                && ((source != 0x0000 && source != 0xFFFF)
+                    || (self.hop == 1 && self.halftone[0] != self.halftone[1]))
+            {
+                eprintln!(
+                    "[bw] src={:#08x} dst={:#08x} x_count={x_count} fxsr={fxsr_reg} nfsr={nfsr_reg} buffer={:#010x} skewed={source:#06x} halftone_line={halftone_line} halftone={halftone_word:#06x} hop={hop_result:#06x} dest_avant={dest_current:#06x} mask={mask:#06x} ecrit={result:#06x}",
+                    self.src_addr & crate::ADDR_MASK,
+                    self.dst_addr & crate::ADDR_MASK,
+                    self.buffer,
+                );
             }
 
-            // Avance de fin de ligne : sur le silicium réel (confirmé par
-            // Hatari, `Blitter_Step`), le pointeur n'est incrémenté de
-            // X_INC qu'entre les mots ; pour le DERNIER mot de la ligne,
-            // c'est Y_INC qui est appliqué À LA PLACE de X_INC (pas en
-            // plus) — le logiciel appelant précalcule donc Y_INC en
-            // tenant déjà compte des (X_COUNT-1) pas de X_INC déjà
-            // parcourus. Le code précédent ajoutait Y_INC seul à l'adresse
-            // de DÉBUT de ligne, perdant entièrement la contribution des
-            // (X_COUNT-1) pas de X_INC — correct par accident pour les
-            // lignes d'un seul mot (X_COUNT=1, ex. curseur souris) mais
-            // faux dès que X_COUNT>1 (texte/icônes GEM), cohérent avec la
-            // corruption observée qui épargnait le curseur mais touchait
-            // le texte/les icônes.
-            let src_x_steps = (x_count - 1) as i32 * self.src_x_inc as i32;
-            let dst_x_steps = (x_count - 1) as i32 * self.dst_x_inc as i32;
-            if need_src {
-                // FXSR consomme un pas SRC_X_INC supplémentaire (voir plus
-                // haut) qui doit se retrouver dans l'adresse de fin de
-                // ligne, en plus des (x_count-1) pas normaux.
-                let fxsr_step = if fxsr { self.src_x_inc as i32 } else { 0 };
-                self.src_addr = self
-                    .src_addr
-                    .wrapping_add(src_x_steps as u32)
-                    .wrapping_add(fxsr_step as u32)
-                    .wrapping_add(self.src_y_inc as i32 as u32);
-            }
-            self.dst_addr = self
-                .dst_addr
-                .wrapping_add(dst_x_steps as u32)
-                .wrapping_add(self.dst_y_inc as i32 as u32);
+            bus.write16(self.dst_addr & crate::ADDR_MASK, result);
 
-            let next_line = if self.dst_y_inc < 0 {
-                halftone_line.wrapping_sub(1) & 0x0F
+            if weird_single_word_nfsr {
+                Self::shift_buffer(&mut self.buffer, self.src_x_inc);
+                Self::fetch_buffer(&mut self.buffer, self.src_x_inc, self.bus_word);
+            }
+
+            // Le mot qui vient d'être traité est celui où X_COUNT==2 :
+            // c'est le mot qui PRÉCÈDE le dernier de la ligne. Si NFSR est
+            // actif, la lecture source du PROCHAIN mot (le dernier) doit
+            // être omise — posé ici pour le prochain tour de boucle.
+            if x_count == 2 && nfsr_reg {
+                self.nfsr_dynamic = true;
+            }
+
+            // Avance de l'adresse source : uniquement si une lecture a eu
+            // lieu ce mot-ci. Sur le DERNIER mot de la ligne (ou si la
+            // lecture suivante sera omise par NFSR), l'avance utilise
+            // SRC_Y_INC au lieu de SRC_X_INC — le logiciel appelant
+            // configure donc SRC_Y_INC en connaissance de cause.
+            if fetch_src {
+                if x_count == 1 || self.nfsr_dynamic {
+                    self.src_addr = self.src_addr.wrapping_add(self.src_y_inc as i32 as u32);
+                } else {
+                    self.src_addr = self.src_addr.wrapping_add(self.src_x_inc as i32 as u32);
+                }
+            }
+
+            if x_count == 1 {
+                // Fin de ligne : DST_Y_INC remplace DST_X_INC (pas en
+                // plus) — le logiciel appelant précalcule donc Y_INC en
+                // tenant déjà compte des (X_COUNT-1) pas de X_INC déjà
+                // parcourus.
+                self.have_fxsr = false;
+                self.y_count -= 1;
+                self.x_count = x_count_reset;
+                self.dst_addr = self.dst_addr.wrapping_add(self.dst_y_inc as i32 as u32);
+                let next_line = if self.dst_y_inc >= 0 {
+                    (halftone_line + 1) & 0x0F
+                } else {
+                    halftone_line.wrapping_sub(1) & 0x0F
+                };
+                self.control = (self.control & 0xF0) | next_line;
             } else {
-                (halftone_line + 1) & 0x0F
-            };
-            self.control = (self.control & 0xF0) | next_line;
+                self.x_count -= 1;
+                self.dst_addr = self.dst_addr.wrapping_add(self.dst_x_inc as i32 as u32);
+            }
         }
 
         // NOTE : ne PAS remettre `self.y_count`/`self.x_count` (registres
@@ -622,7 +774,19 @@ impl Blitter {
         // `self.armed` (qui, lui, passe à faux ci-dessous et empêche tout
         // redémarrage tant que le logiciel n'a pas explicitement réécrit
         // Y_COUNT).
-        self.control &= !CONTROL_BUSY;
+        //
+        // Le bit HOG (bit 6) est également effacé en fin de blit, pas
+        // seulement BUSY — confirmé par Steem SSE (`blitter.cpp`,
+        // `Blitter_Start_Line`, commentaire "hog bit also reset
+        // (BLTBENCH.TOS)", citant un comportement observé sur silicium réel
+        // via l'outil de test BLTBENCH.TOS). Une version précédente ne
+        // touchait pas ce bit, laissant HOG visible à `1` après un blit en
+        // mode HOG même une fois terminé — un logiciel qui relit CONTROL
+        // pour décider de son comportement pour le blit SUIVANT (dans une
+        // longue séquence d'appels, comme le dessin d'un menu GEM) pouvait
+        // donc prendre un chemin différent de celui du matériel réel.
+        self.control &= !(CONTROL_BUSY | CONTROL_HOG);
         self.armed = false;
+        self.mid_blit = false;
     }
 }
