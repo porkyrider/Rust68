@@ -185,15 +185,14 @@ pub const MEMORY_CONF: u32 = 0xFF8001;
 /// le type d'accès (CPU direct vs DMA).
 const ST_RAM_ADDRESS_SPACE: u32 = 4 * 1024 * 1024;
 
-/// Cycles CPU accordés au CPU entre deux tranches de blit non-HOG (16 mots,
-/// voir `Blitter::execute`), c'est-à-dire le temps que le CPU a pour
-/// s'exécuter en parallèle avant que le Blitter ne reprenne la main —
-/// PAS le temps que le Blitter lui-même met à traiter sa tranche (aucun
-/// rapport direct avec `WORDS_PER_SLICE`, qui approxime plutôt les 64
-/// accès bus que le silicium réel accorde au Blitter à chaque tour).
-/// Utilisé pour cadencer la reprise autonome du Blitter dans
-/// [`AtariSt::tick`] au même rythme que le vrai matériel, plutôt qu'une
-/// tranche entière par instruction CPU (bien trop rapide).
+/// Cycles CPU accordés au CPU entre deux tranches de blit non-HOG (64
+/// accès bus, voir `Blitter::execute`/`BUS_ACCESSES_PER_SLICE`),
+/// c'est-à-dire le temps que le CPU a pour s'exécuter en parallèle avant
+/// que le Blitter ne reprenne la main — PAS le temps que le Blitter
+/// lui-même met à traiter sa tranche. Utilisé pour cadencer la reprise
+/// autonome du Blitter dans [`AtariSt::tick`] au même rythme que le vrai
+/// matériel, plutôt qu'une tranche entière par instruction CPU (bien trop
+/// rapide).
 ///
 /// Valeur reprise de Hatari (`src/blitter.c`, `Blitter_Start`, mode non
 /// "cycle exact" — celui qui correspond à notre propre modèle, sans
@@ -707,6 +706,13 @@ impl AtariSt {
             self.blitter_slice_cycle_acc += cpu_cycles;
             if self.blitter_slice_cycle_acc >= BLITTER_SLICE_CYCLES {
                 self.blitter_slice_cycle_acc -= BLITTER_SLICE_CYCLES;
+                if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
+                    eprintln!(
+                        "[blit-reg] pc={:#010x} tick declenche execute() acc_avant_maj={}",
+                        blitter::DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed),
+                        self.blitter_slice_cycle_acc + BLITTER_SLICE_CYCLES,
+                    );
+                }
                 let mut ram_bus = RamBus {
                     ram: &mut self.ram,
                     rom: &self.rom,
@@ -1273,6 +1279,30 @@ impl Bus for AtariSt {
                 )
             {
                 self.blitter.write_word(reg_offset, value);
+                return;
+            }
+            // CONTROL+SKEW ($FF8A3C/$FF8A3D) : TOS les écrit régulièrement
+            // en un seul accès `.W` (ex. TOS 1.62, `$E11746`, `MOVE.W
+            // D7,(A5)`, D7 empaquetant les deux octets pour armer un blit
+            // avec le bon SKEW dès le départ). La composition générique
+            // octet par octet ci-dessous écrirait CONTROL (octet HAUT)
+            // AVANT SKEW (octet BAS) — or `write8` déclenche `execute()`
+            // *synchrone et immédiat* dès que CONTROL est écrit avec le bit
+            // BUSY posé (voir plus bas) : le Blitter démarrerait alors le
+            // blit avec l'ANCIEN SKEW, un instant avant que le nouveau ne
+            // soit posé par ce même accès `.W` — confirmé par comparaison
+            // directe avec un vrai Hatari (trace `RUST68_HATARI_TRACE`) sur
+            // un blit de restauration de menu GEM : les 4 plans doivent
+            // partager le même SKEW (armé en une fois par TOS avant la
+            // boucle), mais seul le premier ressortait avec SKEW=0 côté
+            // Rust68 — exactement le plan dont le blit démarre pendant ce
+            // même accès `.W`. Écrire SKEW en premier (sans effet de bord)
+            // puis déléguer à `write8` pour CONTROL (chemin normal,
+            // inchangé) résout l'ordre sans dupliquer la logique de
+            // déclenchement.
+            if reg_offset == blitter::reg::CONTROL {
+                self.blitter.write(blitter::reg::SKEW, value as u8);
+                self.write8(addr, (value >> 8) as u8);
                 return;
             }
         }

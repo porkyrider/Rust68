@@ -38,11 +38,16 @@
 //! ## Limitations connues (v1) — à prendre avec prudence
 //! - Le vol de cycles bus au CPU (mode "hog"/"steal") EST modélisé (voir
 //!   ci-dessus et `systems::atari_st::AtariSt::tick`/`BLITTER_SLICE_CYCLES`),
-//!   mais par une approximation à gros grain : une tranche fixe de 16 mots
-//!   entre deux passages de bus (`WORDS_PER_SLICE` dans [`Self::execute`]),
-//!   pas un décompte exact des accès bus individuels comme le fait Hatari
-//!   en mode "cycle exact" (64 accès bus précis, potentiellement 63 dans
-//!   un cas de bug documenté du silicium réel — non reproduit ici).
+//!   par une tranche de 64 accès bus RÉELS entre deux passages de bus
+//!   (`BUS_ACCESSES_PER_SLICE` dans [`Self::execute`] — lecture source,
+//!   lecture destination et écriture destination chacune comptée
+//!   séparément, pas un nombre de mots traités), reprise directement du
+//!   source de Hatari (`src/blitter.c`, `BLITTER_NONHOG_BUS_BLITTER`).
+//!   Reste néanmoins une approximation par rapport au mode "cycle exact"
+//!   de Hatari, qui entrelace ces accès AU MILIEU de l'exécution des
+//!   instructions CPU (plutôt qu'entre deux instructions complètes comme
+//!   ici) et reproduit un cas de bug documenté du silicium réel où le
+//!   Blitter s'arrête parfois à 63 accès au lieu de 64 — non modélisé ici.
 //! - Aucune suite de test équivalente à TomHarte n'existe pour le
 //!   Blitter : la logique est vérifiée par recoupement documentaire
 //!   (datasheet, BLIT_FAQ.TXT, code source de Hatari) plutôt que contre
@@ -98,6 +103,13 @@ pub mod reg {
 
 const CONTROL_BUSY: u8 = 1 << 7;
 const CONTROL_HOG: u8 = 1 << 6;
+
+/// PC courant du CPU, pour diagnostic uniquement (`RUST68_TRACE_BLIT_REGS`) —
+/// mis à jour par l'appelant (ex. `examples/rd_menu_ca6a.rs`) juste avant
+/// chaque `cpu.step()`, lu par les traces d'écriture de registre ci-dessous
+/// pour identifier l'instruction ROM responsable sans changer la signature
+/// publique de `write`/`write_word`.
+pub static DEBUG_LAST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
 pub struct Blitter {
@@ -322,17 +334,33 @@ impl Blitter {
             reg::X_COUNT => self.x_count = (self.x_count & 0x00FF) | ((value as u32) << 8),
             reg::X_COUNT1 => self.x_count = (self.x_count & 0xFF00) | value as u32,
             reg::Y_COUNT => {
+                if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
+                    eprintln!("[blit-reg] pc={:#010x} write Y_COUNT(hi)={value:#04x} (skew_actuel={:#04x} dst_addr_actuel={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
+                }
                 self.y_count = (self.y_count & 0x00FF) | ((value as u32) << 8);
                 self.armed = true;
             }
             reg::Y_COUNT1 => {
+                if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
+                    eprintln!("[blit-reg] pc={:#010x} write Y_COUNT(lo)={value:#04x} (skew_actuel={:#04x} dst_addr_actuel={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
+                }
                 self.y_count = (self.y_count & 0xFF00) | value as u32;
                 self.armed = true;
             }
             reg::HOP => self.hop = value & 0x03,
             reg::OP => self.op = value & 0x0F,
-            reg::SKEW => self.skew = value,
-            reg::CONTROL => self.write_control(value),
+            reg::SKEW => {
+                if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
+                    eprintln!("[blit-reg] pc={:#010x} write SKEW={value:#04x}", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                self.skew = value;
+            }
+            reg::CONTROL => {
+                if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
+                    eprintln!("[blit-reg] pc={:#010x} write CONTROL={value:#04x} (skew_actuel={:#04x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew);
+                }
+                self.write_control(value);
+            }
             _ => {}
         }
     }
@@ -363,6 +391,9 @@ impl Blitter {
             reg::ENDMASK_3 => self.endmask[2] = value,
             reg::X_COUNT => self.x_count = value as u32,
             reg::Y_COUNT => {
+                if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
+                    eprintln!("[blit-reg] pc={:#010x} write_word Y_COUNT={value:#06x} (skew_actuel={:#04x} dst_addr_actuel={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
+                }
                 self.y_count = value as u32;
                 self.armed = true;
             }
@@ -404,6 +435,16 @@ impl Blitter {
     /// `.W` isolé sur ces registres est ignoré sur le silicium réel, seul
     /// un accès `.L` complet est honoré.
     pub fn write_long(&mut self, addr: u32, value: u32) {
+        if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok()
+            && matches!(addr, reg::SRC_ADDR | reg::DST_ADDR)
+        {
+            eprintln!(
+                "[blit-reg] pc={:#010x} write_long {}={:#010x} control_actuel={:#04x} busy={} mid_blit={} armed={}",
+                DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed),
+                if addr == reg::SRC_ADDR { "SRC_ADDR" } else { "DST_ADDR" },
+                value, self.control, self.busy(), self.mid_blit, self.armed,
+            );
+        }
         match addr {
             reg::SRC_ADDR => self.src_addr = value & 0x00FF_FFFE,
             reg::DST_ADDR => self.dst_addr = value & 0x00FF_FFFE,
@@ -581,6 +622,16 @@ impl Blitter {
             self.armed = false;
             self.mid_blit = true;
             self.control |= CONTROL_BUSY;
+            if std::env::var("RUST68_TRACE_BLIT_START").is_ok() {
+                eprintln!(
+                    "[blit-start] pc={:#010x} dst_addr={:#010x} src_addr={:#010x} x_count={} y_count={} dst_x_inc={} dst_y_inc={} src_x_inc={} src_y_inc={} hop={} op={:#04x} skew={:#04x} control={:#04x} endmask={:#06x},{:#06x},{:#06x} buffer_avant={:#010x}",
+                    DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed),
+                    self.dst_addr, self.src_addr, self.x_count, self.y_count,
+                    self.dst_x_inc, self.dst_y_inc, self.src_x_inc, self.src_y_inc,
+                    self.hop, self.op, self.skew, self.control,
+                    self.endmask[0], self.endmask[1], self.endmask[2], self.buffer,
+                );
+            }
         } else if !self.mid_blit {
             return;
         }
@@ -593,7 +644,8 @@ impl Blitter {
         // Mode HOG (bit 6 de CONTROL) : le Blitter garde le bus jusqu'à la
         // fin complète du blit, sans jamais rendre la main au CPU. En mode
         // non-HOG, le silicium réel ne traite qu'un nombre BORNÉ d'accès
-        // bus (documenté ~64) avant de rendre le bus — le logiciel doit
+        // bus RÉELS (lecture OU écriture, chacun compté séparément — pas un
+        // nombre de MOTS traités) avant de rendre le bus — le logiciel doit
         // reposer BUSY (typiquement via `TAS.B`, qui relit/rendosse au
         // passage le numéro de ligne demi-teinte déjà avancé par le
         // matériel) pour faire progresser la suite. Confirmé nécessaire
@@ -611,9 +663,25 @@ impl Blitter {
         // malgré une vérification exhaustive, par ailleurs correcte, de
         // l'arithmétique interne du Blitter (table OP, HOP, skew, endmask,
         // avance d'adresse — voir `tests/blitter_hatari_diff.rs`).
+        //
+        // Le seuil de 64 accès bus (`BUS_ACCESSES_PER_SLICE` ci-dessous) et
+        // le fait qu'il compte des accès réels et non des mots viennent
+        // directement du source de Hatari (`src/blitter.c`,
+        // `BLITTER_NONHOG_BUS_BLITTER`, avec un commentaire notant qu'un
+        // silicium réel peut occasionnellement s'arrêter à 63 au lieu de 64
+        // — cas de bug non reproduit ici, comme l'irrégularité de
+        // rafraîchissement RAM déjà documentée ailleurs). Une version
+        // précédente comptait 16 MOTS traités par tranche (pas d'accès bus)
+        // — un mot "normal" avec lecture source ET écriture destination vaut
+        // 3 accès bus réels (lecture source, lecture destination pour la
+        // combinaison OP, écriture destination), donc l'ancienne tranche de
+        // 16 mots représentait en réalité 32 à 48 accès bus selon le blit
+        // (jamais 64) : la fréquence de rendu de main au CPU était
+        // systématiquement trop élevée, cohérent avec un blit qui progresse
+        // plus lentement (en cycles CPU réels) que sur silicium réel/Hatari.
         let hog = self.control & CONTROL_HOG != 0;
-        const WORDS_PER_SLICE: u32 = 16;
-        let mut words_this_slice: u32 = 0;
+        const BUS_ACCESSES_PER_SLICE: u32 = 64;
+        let mut bus_accesses_this_slice: u32 = 0;
 
         // `need_src` (repris de Hatari, `Blitter_Step`) : le pointeur
         // source n'avance QUE si l'opération lit effectivement la source —
@@ -636,7 +704,7 @@ impl Blitter {
             );
         }
         while self.y_count > 0 {
-            if !hog && words_this_slice >= WORDS_PER_SLICE {
+            if !hog && bus_accesses_this_slice >= BUS_ACCESSES_PER_SLICE {
                 if trace_slices {
                     eprintln!(
                         "[slice] pause budget epuise, y_count_restant={} x_count_restant={}",
@@ -649,7 +717,6 @@ impl Blitter {
                 // exactement où on s'est arrêté, via `mid_blit`.
                 return;
             }
-            words_this_slice += 1;
 
             let x_count = self.x_count;
             let first_word = x_count == x_count_reset;
@@ -678,6 +745,7 @@ impl Blitter {
             if fxsr_reg && !self.have_fxsr && need_src {
                 Self::shift_buffer(&mut self.buffer, self.src_x_inc);
                 let w = bus.read16(self.src_addr & crate::ADDR_MASK);
+                bus_accesses_this_slice += 1;
                 self.bus_word = w;
                 Self::fetch_buffer(&mut self.buffer, self.src_x_inc, w);
                 self.src_addr = self.src_addr.wrapping_add(self.src_x_inc as i32 as u32);
@@ -692,6 +760,7 @@ impl Blitter {
             if need_src && !self.nfsr_dynamic {
                 Self::shift_buffer(&mut self.buffer, self.src_x_inc);
                 let w = bus.read16(self.src_addr & crate::ADDR_MASK);
+                bus_accesses_this_slice += 1;
                 self.bus_word = w;
                 Self::fetch_buffer(&mut self.buffer, self.src_x_inc, w);
                 fetch_src = true;
@@ -722,6 +791,7 @@ impl Blitter {
 
             let hop_result = self.apply_hop(source, halftone_word);
             let dest_current = bus.read16(self.dst_addr & crate::ADDR_MASK);
+            bus_accesses_this_slice += 1;
             let mut result = self.apply_op(hop_result, dest_current);
             result = (result & mask) | (dest_current & !mask);
 
@@ -738,6 +808,7 @@ impl Blitter {
             }
 
             bus.write16(self.dst_addr & crate::ADDR_MASK, result);
+            bus_accesses_this_slice += 1;
 
             if weird_single_word_nfsr {
                 Self::shift_buffer(&mut self.buffer, self.src_x_inc);

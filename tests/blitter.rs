@@ -855,3 +855,53 @@ fn control_busy_repose_sans_reecrire_y_count_ne_redeclenche_pas() {
         "après réarmement explicite de Y_COUNT, un nouveau blit doit s'exécuter"
     );
 }
+
+#[test]
+fn tranche_non_hog_compte_les_acces_bus_reels_pas_les_mots() {
+    // Distingue le modèle actuel (`BUS_ACCESSES_PER_SLICE` = 64 accès bus
+    // réels) de l'ancienne approximation par mots traités : ce blit LIT la
+    // source (HOP=2 "source seule", OP=0x3 "copie" — need_src=true), donc
+    // chaque mot coûte 3 accès bus (lecture source + lecture destination
+    // pour la combinaison OP + écriture destination), pas 2 comme le blit
+    // HOP=0 utilisé par les tests de tranche de `tests/atari_st.rs`.
+    //
+    // Le budget se vérifie AVANT de traiter un mot, avec le total accumulé
+    // par les mots déjà traités (pas un arrêt en plein milieu d'un mot) :
+    // après 21 mots (63 accès, < 64), le mot 22 démarre quand même et porte
+    // le total à 66 — la tranche s'arrête donc après 22 mots, pas 21.
+    let mut bl = Blitter::new();
+    bl.write(reg::HOP, 2); // source seule
+    bl.write(reg::OP, 0x3); // copie (source ET destination lues/écrites)
+    bl.write(reg::SKEW, 0x00); // pas de FXSR (pas d'accès bus supplémentaire à compter)
+
+    write_word(&mut bl, reg::SRC_X_INC, 0);
+    write_word(&mut bl, reg::SRC_Y_INC, 2);
+    write_word(&mut bl, reg::DST_X_INC, 0);
+    write_word(&mut bl, reg::DST_Y_INC, 2);
+    write_word(&mut bl, reg::X_COUNT, 1);
+    write_word(&mut bl, reg::Y_COUNT, 30); // 30 lignes d'1 mot = 30 mots
+    write_word(&mut bl, reg::ENDMASK_1, 0xFFFF);
+    write_word(&mut bl, reg::ENDMASK_2, 0xFFFF);
+    write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
+    write_long(&mut bl, reg::SRC_ADDR, 0x1000);
+    write_long(&mut bl, reg::DST_ADDR, 0x2000);
+
+    let mut bus = FlatBus::new();
+    bl.write(reg::CONTROL, 0x80); // BUSY=1, HOG=0 : déclenche la première tranche
+
+    bl.execute(&mut bus);
+    assert_eq!(
+        (bl.read(reg::Y_COUNT) as u16) << 8 | bl.read(reg::Y_COUNT + 1) as u16,
+        30 - 22,
+        "22 mots (66 accès bus) traités par la première tranche, pas 21 (63) ni un multiple de 64/3 arrondi au mot"
+    );
+    assert!(bl.busy(), "blit pas fini : BUSY doit rester observable par polling");
+
+    // Reprise (`TAS.B` typique : repose BUSY sans réécrire Y_COUNT) :
+    // les 8 mots restants (24 accès, sous le budget de 64) terminent le blit.
+    bl.write(reg::CONTROL, 0x80);
+    bl.execute(&mut bus);
+    assert_eq!(bl.read(reg::Y_COUNT), 0, "blit terminé après la deuxième tranche");
+    assert_eq!(bl.read(reg::Y_COUNT + 1), 0);
+    assert!(!bl.busy());
+}

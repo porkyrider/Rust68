@@ -3,8 +3,13 @@
 Émulateur de la série **Motorola 68000** (68k) en Rust.
 
 L'objectif à terme est de couvrir toute la famille 68000 et ses variantes
-(68010, 68020, 68030…). Cette première version cible le **MC68000** d'origine,
-celui qui équipe l'Atari ST et l'Amiga.
+(68010, 68020, 68030…). Le cœur **MC68000** d'origine est complet et 100 %
+conforme à la suite de tests [TomHarte](https://github.com/SingleStepTests/m68000)
+(état ET cycles). Un système **Atari ST/STE** complet est construit dessus
+(CPU, MFP 68901, GLUE, ACIA×2, IKBD, YM2149, Shifter, WD1772, Blitter, DMA
+Sound/Microwire, formats disquette `.st`/`.stx`/`.msa`) — un vrai TOS non
+modifié démarre jusqu'au bureau GEM interactif. Voir [ETAT.md](ETAT.md)
+pour l'état détaillé, à jour, du projet.
 
 ## Architecture
 
@@ -39,7 +44,8 @@ assert_eq!(cpu.pc, 0x0402);
 ## Tests
 
 ```sh
-cargo test
+cargo test                      # cœur 68000 seul
+cargo test --features atari-st  # + tous les périphériques Atari ST
 ```
 
 Deux niveaux de tests :
@@ -63,17 +69,14 @@ Deux niveaux de tests :
 
 ## État d'avancement
 
-Jeu d'instructions actuellement implémenté (amorçage) :
+Le jeu d'instructions MC68000 complet est implémenté (tous les modes
+d'adressage, toutes les exceptions — bus/address error, interruptions IPL,
+trace), 100 % conforme état ET cycle-exact sur les 317 500 tests TomHarte.
 
-- Transferts : `MOVE`, `MOVEA`, `MOVEQ`, `LEA`, `CLR`
-- Arithmétique : `ADD`, `ADDA` (avec flags X/N/Z/V/C corrects)
-- Contrôle : `NOP`, `RESET`, `BRA`, `BSR`, `Bcc`
-
-Modes d'adressage : tous les modes du 68000 (`Dn`, `An`, `(An)`, `(An)+`,
-`-(An)`, `(d16,An)`, `(d8,An,Xn)`, absolu court/long, relatif PC, immédiat).
-
-Le squelette de décodage est conçu pour accueillir le reste du jeu
-d'instructions sans refonte.
+Le système Atari ST (feature `atari-st`) et son frontend SDL2 (feature
+`sdl2-frontend`) sont construits sur ce cœur — voir [ETAT.md](ETAT.md) pour
+le détail par composant, l'architecture du code et les limitations
+connues.
 
 ## Licence
 

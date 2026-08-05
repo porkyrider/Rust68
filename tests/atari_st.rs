@@ -982,13 +982,17 @@ fn mirroring_mmu_intra_banque_ste_quand_memconf_surestime_la_ram_reelle() {
 /// à 1, donc `HOP=0` ignore la source) — seule la progression (tranchage,
 /// `BUSY`) nous intéresse ici, pas le contenu écrit. `DST_ADDR` doit
 /// pointer dans la RAM allouée par l'appelant.
-fn setup_blit_20_mots(st: &mut AtariSt, dst_addr: u32, control: u8) {
+/// Blit HOP=0/OP=0x0F (constante 1, ignore la source — voir `need_src` dans
+/// `Blitter::execute`) : chaque mot ne coûte que 2 accès bus réels (lecture
+/// + écriture destination, pas de lecture source), `y_count` lignes d'1 mot
+/// chacune.
+fn setup_blit_lignes(st: &mut AtariSt, dst_addr: u32, control: u8, y_count: u16) {
     st.write8(BLITTER_BASE + blitter_reg::HOP, 0);
     st.write8(BLITTER_BASE + blitter_reg::OP, 0x0F);
     st.write16(BLITTER_BASE + blitter_reg::DST_X_INC, 0);
     st.write16(BLITTER_BASE + blitter_reg::DST_Y_INC, 2);
     st.write16(BLITTER_BASE + blitter_reg::X_COUNT, 1);
-    st.write16(BLITTER_BASE + blitter_reg::Y_COUNT, 20);
+    st.write16(BLITTER_BASE + blitter_reg::Y_COUNT, y_count);
     st.write16(BLITTER_BASE + blitter_reg::ENDMASK_1, 0xFFFF);
     st.write16(BLITTER_BASE + blitter_reg::ENDMASK_2, 0xFFFF);
     st.write16(BLITTER_BASE + blitter_reg::ENDMASK_3, 0xFFFF);
@@ -1004,29 +1008,37 @@ fn blit_y_count(st: &mut AtariSt) -> u16 {
 }
 
 #[test]
-fn blit_non_hog_progresse_par_tranches_de_16_mots_au_rythme_du_cpu() {
+fn blit_non_hog_progresse_par_tranches_de_64_acces_bus_au_rythme_du_cpu() {
     // Limitation historique corrigée (voir la doc du module blitter) : le
     // Blitter en mode partagé (non-HOG) doit rendre la main au CPU toutes
-    // les 16 mots (`WORDS_PER_SLICE`), pas exécuter le blit entier d'un
-    // coup — et la reprise doit être pilotée par `AtariSt::tick` au rythme
-    // réel du CPU (`BLITTER_SLICE_CYCLES` = 256 cycles entre deux
-    // tranches, calibré contre Hatari `src/blitter.c`), pas par une
-    // simple réécriture logicielle de CONTROL.
+    // les 64 accès bus RÉELS (`BUS_ACCESSES_PER_SLICE`, valeur et méthode
+    // de comptage reprises de Hatari, `BLITTER_NONHOG_BUS_BLITTER`), pas
+    // exécuter le blit entier d'un coup ni approximer par un nombre de mots
+    // traités — et la reprise doit être pilotée par `AtariSt::tick` au
+    // rythme réel du CPU (`BLITTER_SLICE_CYCLES` = 256 cycles entre deux
+    // tranches, calibré contre Hatari `src/blitter.c`), pas par une simple
+    // réécriture logicielle de CONTROL.
+    //
+    // Blit HOP=0/OP=0x0F (voir `setup_blit_lignes`) : chaque mot coûte 2
+    // accès bus (pas de lecture source), donc 32 mots tiennent dans une
+    // tranche de 64 accès — 40 lignes d'1 mot forcent une deuxième tranche
+    // (32 puis 8 restants).
     let mut st = AtariSt::new(0x1_0000, vec![]);
-    setup_blit_20_mots(&mut st, 0x2000, 0x80); // BUSY=1, HOG=0
+    setup_blit_lignes(&mut st, 0x2000, 0x80, 40); // BUSY=1, HOG=0
 
     // Première tranche déjà traitée par l'écriture CONTROL elle-même :
-    // 16 des 20 mots (20 lignes, 1 mot/ligne) sont faits, 4 restent.
-    assert_eq!(blit_y_count(&mut st), 4, "16 lignes traitées par la première tranche");
+    // 32 des 40 mots (40 lignes, 1 mot/ligne, 2 accès bus/mot) sont faits,
+    // 8 restent.
+    assert_eq!(blit_y_count(&mut st), 8, "32 lignes (64 accès bus) traitées par la première tranche");
     assert!(st.blitter.busy(), "blit pas fini : BUSY doit rester observable par polling");
 
     // Moins de 256 cycles écoulés : aucune tranche supplémentaire.
     st.tick(255);
-    assert_eq!(blit_y_count(&mut st), 4, "pas encore assez de cycles CPU pour une nouvelle tranche");
+    assert_eq!(blit_y_count(&mut st), 8, "pas encore assez de cycles CPU pour une nouvelle tranche");
     assert!(st.blitter.busy());
 
-    // Le cycle 256e déclenche la tranche suivante, qui termine le blit
-    // (il ne reste que 4 mots, sous le budget de 16).
+    // Le cycle 256e déclenche la tranche suivante, qui termine le blit (il
+    // ne reste que 8 mots, sous le budget de 32 mots/64 accès).
     st.tick(1);
     assert_eq!(blit_y_count(&mut st), 0, "blit terminé après la deuxième tranche");
     assert!(!st.blitter.busy(), "BUSY retombe une fois le blit réellement fini");
@@ -1039,7 +1051,7 @@ fn blit_hog_se_termine_en_une_seule_tranche() {
     // un seul appel (celui déclenché par l'écriture CONTROL) doit suffire,
     // quelle que soit la taille du blit.
     let mut st = AtariSt::new(0x1_0000, vec![]);
-    setup_blit_20_mots(&mut st, 0x2000, 0xC0); // BUSY=1, HOG=1
+    setup_blit_lignes(&mut st, 0x2000, 0xC0, 40); // BUSY=1, HOG=1
 
     assert_eq!(blit_y_count(&mut st), 0, "mode HOG : tout traité en un seul appel");
     assert!(!st.blitter.busy());

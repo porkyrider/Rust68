@@ -1,6 +1,6 @@
 # Rust68 — État de l'émulateur MC68000
 
-> Dernière mise à jour : 2026-07-28
+> Dernière mise à jour : 2026-08-05
 
 ## Licence
 
@@ -45,30 +45,35 @@ faut explicitement `--features atari-st` pour l'Atari ST :
 
 ```
 src/
-  cpu.rs          (~520 l.)  — registres, SR, USP/SSP, fetch_word, take_exception,
+  cpu.rs          (~685 l.)  — registres, SR, USP/SSP, fetch_word, take_exception,
                                 take_bus_error_full, take_interrupt, take_trace_exception,
                                 exception_log
-  addressing.rs   (~380 l.)  — Operand, Size, resolve_ea (tous les modes 68000)
-  execute.rs     (~2810 l.)  — décodage et exécution de toutes les instructions
-  bus.rs          (~195 l.)  — trait Bus + FlatBus (16 Mo RAM plate) + TimedBus
+  addressing.rs   (~455 l.)  — Operand, Size, resolve_ea (tous les modes 68000)
+  execute.rs     (~3290 l.)  — décodage et exécution de toutes les instructions
+  bus.rs          (~320 l.)  — trait Bus + FlatBus (16 Mo RAM plate) + TimedBus
                                 (wait-states DRAM/vidéo) + take_bus_fault() + irq_level/irq_ack
   peripherals/
     mod.rs                   — `#[cfg(feature = "atari-st")] pub mod atari_st;`
     atari_st/
-      mfp.rs      (~550 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
-      glue.rs     (~130 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
+      mfp.rs      (~615 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
+      glue.rs     (~170 l.)  — timing HBL/VBL du GLUE (cf. section dédiée)
       acia.rs     (~150 l.)  — MC6850 ACIA (chip seul, cf. section dédiée)
-      ym2149.rs   (~375 l.)  — PSG YM2149 (chip seul, cf. section dédiée)
-      shifter.rs  (~265 l.)  — vidéo Shifter (chip seul, cf. section dédiée)
-      wd1772.rs   (~370 l.)  — contrôleur disquette WD1772 (chip seul, cf. section dédiée)
-      blitter.rs  (~340 l.)  — coprocesseur BitBlt Blitter (chip seul, cf. section dédiée)
-      stx.rs                 — lecteur minimal de disquettes `.stx` (Pasti)
+      ikbd.rs     (~335 l.)  — contrôleur IKBD HD6301 clavier/souris (cf. section dédiée)
+      ym2149.rs   (~465 l.)  — PSG YM2149 (chip seul, cf. section dédiée)
+      microwire.rs(~205 l.)  — interface série vers le mixeur LMC1992 (STE)
+      dma_sound.rs(~295 l.)  — DMA Sound STE (lecture PCM 8 bits depuis la RAM)
+      drive_sound.rs(~270 l.)— bruitage mécanique du lecteur de disquette
+      shifter.rs  (~390 l.)  — vidéo Shifter (chip seul, cf. section dédiée)
+      wd1772.rs   (~945 l.)  — contrôleur disquette WD1772 (chip seul, cf. section dédiée)
+      stx.rs      (~610 l.)  — lecteur minimal de disquettes `.stx` (Pasti)
+      msa.rs      (~265 l.)  — lecteur de disquettes `.msa` (Magic Shadow Archiver)
+      blitter.rs  (~880 l.)  — coprocesseur BitBlt Blitter (chip seul, cf. section dédiée)
   systems/
     mod.rs                   — `#[cfg(feature = "atari-st")] pub mod atari_st;`
     atari_st/
-      mod.rs      (~570 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
+      mod.rs     (~1695 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
                                 Blitter, cf. section dédiée)
-      model.rs               — lexique des modèles ST/STE/Mega ST/Mega STE (RAM, Blitter, TOS
+      model.rs                — lexique des modèles ST/STE/Mega ST/Mega STE (RAM, Blitter, TOS
                                 d'origine — cf. section dédiée)
   bin/
     atari_st_sdl2.rs         — frontend SDL2 (vidéo/clavier/souris/son), feature `sdl2-frontend`
@@ -84,8 +89,13 @@ tests/
   shifter.rs                   — tests de la vidéo Shifter (feature `atari-st`)
   wd1772.rs                    — tests du contrôleur disquette WD1772 (feature `atari-st`)
   blitter.rs                   — tests du Blitter (feature `atari-st`)
+  blitter_hatari_diff.rs      — oracle différentiel (portage direct de `Blitter_ProcessWord`)
   atari_st.rs                 — tests du board Atari ST, bout-en-bout (feature `atari-st`)
   tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
+examples/
+  rd_menu_repro.rs / rd_menu_ca6a.rs — reproduction headless (sans SDL2) d'un clic-glisser
+                                de menu GEM, avec traçage Blitter/CPU ciblé — infrastructure
+                                de diagnostic conservée, pas des scripts jetables.
 ```
 
 ### Features Cargo
@@ -242,7 +252,7 @@ Limitations connues, documentées dans le module :
 - Si plusieurs périodes s'écoulent en un seul appel `tick()`, une seule
   interruption est signalée, pas une par période.
 
-Testé dans `tests/mfp.rs` (11 tests).
+Testé dans `tests/mfp.rs` (13 tests).
 
 ---
 
@@ -338,7 +348,7 @@ mêmes correctifs, adaptés à l'absence de joystick ici) :
   sans elle, `ASL.W #3,($0EE4).L; BPL` du gestionnaire Timer C prendrait
   la mauvaise branche et n'écoulerait jamais les octets IKBD en attente).
 
-Testé dans `src/peripherals/atari_st/ikbd.rs` (7 tests unitaires).
+Testé dans `src/peripherals/atari_st/ikbd.rs` (8 tests unitaires).
 
 ---
 
@@ -366,7 +376,7 @@ sur ST/STE). Ne génère pas d'IPL (pas d'interruption sur ST).
   signification des bits (sélection lecteur, joystick, Centronics…) non
   interprétée, à charge du board/de l'appelant.
 
-Testé dans `tests/ym2149.rs` (9 tests).
+Testé dans `tests/ym2149.rs` (10 tests).
 
 ---
 
@@ -397,8 +407,8 @@ convention de polarité du mode haute résolution (bit=1 → noir) non
 vérifiée contre une capture matérielle réelle ; pas de contention
 DRAM/vidéo modélisée pour l'accès Shifter.
 
-Testé dans `tests/shifter.rs` (8 tests) et `tests/atari_st.rs` (5 tests
-supplémentaires, dont un rendu de trame PAL complète de 313 lignes).
+Testé dans `tests/shifter.rs` (9 tests) et `tests/atari_st.rs` (rendu de
+trame PAL complète de 313 lignes, entre autres tests bout-en-bout).
 
 ---
 
@@ -439,9 +449,11 @@ compteur d'adresse DMA à `0xFF8609`/`0B`/`0D`. `/INTRQ` câblé sur `GPIP5`
 du MFP, relayé par `AtariSt::tick`. Disque inséré via le champ public
 `AtariSt::floppy_a`.
 
-Testé dans `tests/wd1772.rs` (13 tests) et `tests/atari_st.rs` (6 tests
-supplémentaires, dont un aller-retour lecture/écriture secteur bout-en-bout
-via DMA).
+Testé dans `tests/wd1772.rs` (20 tests, dont la latence rotationnelle via
+`bit_position` et l'arrêt au compte réel de secteurs par piste),
+`src/peripherals/atari_st/msa.rs` (8 tests), `src/peripherals/atari_st/stx.rs`
+(9 tests) et `tests/atari_st.rs` (aller-retour lecture/écriture secteur
+bout-en-bout via DMA, entre autres tests bout-en-bout).
 
 ---
 
@@ -449,15 +461,31 @@ via DMA).
 
 `peripherals::atari_st::blitter::Blitter` modélise le coprocesseur de transfert de
 blocs (BitBlt) de l'Atari STE seul : combine un mot source (optionnellement
-décalé bit à bit via `skew`), un motif de demi-teinte, et le contenu
-destination, via une fonction booléenne programmable (`OP`, une des 16
-fonctions à 2 entrées, convention de table de vérité standard partagée par
-de nombreuses puces "raster op"), avec masquage de bord de ligne
+décalé bit à bit via `skew`, registre à décalage 32 bits PERSISTANT sur
+toute la durée de vie de la puce — pas remis à zéro entre deux lignes ni
+entre deux blits logiquement séparés), un motif de demi-teinte, et le
+contenu destination, via une fonction booléenne programmable (`OP`, une des
+16 fonctions à 2 entrées, convention de table de vérité standard partagée
+par de nombreuses puces "raster op"), avec masquage de bord de ligne
 (`ENDMASK1/2/3`) et parcours par incréments X/Y. Mappé dans `AtariSt` à
-`0xFF8A00` (champ public `blitter`) ; `execute()` prend un `Bus` (adapté
-vers la RAM du board via un petit type `RamBus` interne) et exécute le
-blit en entier de façon synchrone, déclenché par l'écriture du bit
-BUSY/START du registre de contrôle.
+`0xFF8A00` (champ public `blitter`). Traité **mot par mot** (traduction
+directe de la machine à états de Hatari, `Blitter_ProcessWord`), pas ligne
+par ligne avec une formule d'avance précalculée, pour reproduire fidèlement
+ce registre à décalage persistant.
+
+En mode HOG (bit 6 de `CONTROL`), `execute()` traite tout le blit en un
+seul appel. En mode non-HOG (le plus courant en pratique), un seul appel ne
+traite que 64 accès bus réels (lecture source, lecture/écriture
+destination, chacun compté séparément — valeur et méthode de comptage
+reprises de Hatari, `BLITTER_NONHOG_BUS_BLITTER`) avant de rendre la main,
+`BUSY` restant posé entre deux tranches — le CPU dispose alors de 256
+cycles (`AtariSt::BLITTER_SLICE_CYCLES`, calibré sur le même `64*4` que
+Hatari) pour s'exécuter en parallèle avant que `AtariSt::tick` ne rappelle
+`execute()` pour la tranche suivante. Le déclenchement initial se fait via
+l'écriture du bit BUSY/START du registre de contrôle ; un déclenchement
+CONTROL accidentel (`TAS.B` dans la boucle de relance logicielle typique)
+n'y ré-exécute PAS tout le blit depuis le début — `execute()` reprend
+exactement où la tranche précédente s'est arrêtée (voir `armed`).
 
 Registres `CONTROL` (`0xFF8A3C` : BUSY/HOG/SMUDGE/numéro de ligne de
 demi-teinte) et `SKEW` (`0xFF8A3D` : FXSR/NFSR/décalage) conformes à
@@ -485,20 +513,27 @@ corrigé) et prenait `HOP=0` pour "tout à zéro" au lieu de "tout à un"
   "numéro de ligne" du registre CONTROL sert uniquement à la sélection
   de demi-teinte ci-dessus.
 
+`skew` gère bien la direction du parcours (`SRC_X_INC` positif/négatif,
+blit "miroir") : le registre à décalage source est alimenté différemment
+selon le signe (`shift_buffer`/`fetch_buffer`, traduction directe de
+`Blitter_SourceShift`/`Blitter_SourceFetch` de Hatari) — une version
+antérieure supposait toujours un parcours croissant.
+
 **Limitations restantes, à prendre avec prudence** (aucune suite
 équivalente à TomHarte n'existe pour ce périphérique) :
-- `skew` : la formule de combinaison du mot précédent/courant suppose un
-  parcours X croissant ; Hatari inverse l'ordre de combinaison quand
-  `SRC_X_INC` est négatif (blit "miroir"), non modélisé ici.
-- Pas de vol de cycles bus au CPU modélisé (bit HOG/STEAL) : le blit
-  s'exécute intégralement de façon synchrone, `BUSY` jamais observable
-  par polling.
+- Le modèle de tranche à 64 accès bus reste une approximation du mode
+  "cycle exact" de Hatari, qui entrelace ces accès AU MILIEU de
+  l'exécution des instructions CPU (pas seulement entre deux instructions
+  complètes) et reproduit un cas de bug documenté du silicium réel où le
+  Blitter s'arrête parfois à 63 accès au lieu de 64 — non modélisé ici.
 
-Testé dans `tests/blitter.rs` (13 tests : table de vérité OP, HOP y
+Testé dans `tests/blitter.rs` (23 tests : table de vérité OP, HOP y
 compris HOP=0, endmask, parcours X/Y, cycle et registre de numéro de
-ligne de demi-teinte, FXSR, NFSR, SMUDGE, skew=0) et `tests/atari_st.rs`
-(3 tests supplémentaires, dont un blit bout-en-bout déclenché via le
-registre de contrôle).
+ligne de demi-teinte, FXSR, NFSR, SMUDGE, skew=0/miroir, tranches non-HOG
+comptées en accès bus réels), `tests/blitter_hatari_diff.rs` (portage
+direct de `Blitter_ProcessWord` comme oracle différentiel) et
+`tests/atari_st.rs` (blit bout-en-bout déclenché via le registre de
+contrôle, entre autres tests bout-en-bout).
 
 ---
 
@@ -550,7 +585,7 @@ contention DRAM/vidéo (`is_contended` reste `false`) ; décodage UDS/LDS
 des adresses paires adjacentes au MFP non modélisé précisément ;
 registres DMA/WD1772 simplifiés (voir section WD1772).
 
-Testé dans `tests/atari_st.rs` (32 tests, dont plusieurs bout-en-bout :
+Testé dans `tests/atari_st.rs` (48 tests, dont plusieurs bout-en-bout :
 interruption GPIP→MFP→IPL, priorité MFP/VBL/HBL, ACIA→GPIP4→MFP,
 WD1772→GPIP5→MFP, rendu vidéo, lecture/écriture disquette via DMA, blit
 déclenché via le registre de contrôle, moniteur couleur persistant après
@@ -614,101 +649,55 @@ minimal reliant tout ça sont en place — tous les composants de la feuille
 de route initiale sont couverts.
 
 Un vrai TOS 1.62 non modifié démarre jusqu'au bureau GEM interactif
-(vidéo couleur basse résolution, clavier, souris, icônes disquette) via le
-binaire de démonstration `atari_st_sdl2` (`cargo run --release --features
-sdl2-frontend --bin atari_st_sdl2 -- <rom.img> [disque.stx|.st]`) — voir
-la section Architecture pour le détail des features Cargo. Le
-raccourci "redémarrage à chaud" (cookies `memvalid`/`memval2`/`memval3`/
-`phystop` pré-remplis, voir le code de `main`) reste le chemin par défaut
-recommandé (rapide, fiable) ; `RUST68_COLD_BOOT=1` force un vrai boot
-froid (détection de RAM réelle par le TOS, plus lente) — fonctionnel
-depuis les correctifs double bus fault + modèle "RAM ST flottante"
-ci-dessus (`phystop` correctement déduit à la taille réelle installée),
-mais moins testé au quotidien que le chemin par défaut.
+(vidéo couleur basse résolution, clavier, souris, icônes disquette, menus
+déroulants) via le binaire de démonstration `atari_st_sdl2` (`cargo run
+--release --features sdl2-frontend --bin atari_st_sdl2 -- <rom.img>
+[disque.st|.stx|.msa]`) — voir la section Architecture pour le détail des
+features Cargo. Le raccourci "redémarrage à chaud" (cookies
+`memvalid`/`memval2`/`memval3`/`phystop` pré-remplis, voir le code de
+`main`) reste le chemin par défaut recommandé (rapide, fiable) ;
+`RUST68_COLD_BOOT=1` force un vrai boot froid (détection de RAM réelle
+par le TOS, plus lente), fonctionnel mais moins testé au quotidien.
+
+**Bugs GEM résolus** :
+- *Clics souris sans effet* (icônes, items de menu) — cause en plusieurs
+  couches : le contrôleur IKBD n'existait pas du tout (commandes TOS
+  jamais interprétées, front GPIP4 starvé entre octets d'une même trame,
+  `$0EE4` non pré-rempli — voir section IKBD), puis un dernier bug plus
+  simple une fois l'IKBD en place : les bits gauche/droit du paquet
+  souris étaient inversés (`queue_mouse_move`, `atari_st_sdl2.rs`). Le
+  mode souris "exclusif" (`Cmd+Shift+F10`) a été ajouté à cette occasion.
+- *Texte corrompu dans les menus déroulants GEM* — `AtariSt::write16`
+  scindait toute écriture `.W` combinée CONTROL+SKEW du Blitter
+  (`$FF8A3C`/`3D`) en deux `write8` séquentiels, CONTROL puis SKEW ; or
+  l'écriture de CONTROL déclenche `Blitter::execute()` de façon
+  synchrone dès que le bit BUSY est posé, donc le Blitter démarrait
+  parfois avec l'ANCIEN SKEW, un instant avant que le nouveau ne soit
+  posé par ce même accès `.W` (cas réel de TOS 1.62 : `MOVE.W D7,(A5)`
+  en `$E11746`, armant les 4 plans d'un blit de restauration de menu
+  avec un SKEW partagé). Corrigé en écrivant SKEW avant de déléguer à
+  `write8` pour CONTROL. Vérifié par comparaison directe avec un vrai
+  Hatari (patch de trace différentiel `RUST68_HATARI_TRACE` sur
+  `blitter.c`) : les deux tournent désormais à l'identique sur ce blit.
+  Outils de diagnostic conservés (coût nul si non activés) :
+  `RUST68_TRACE_BLIT_REGS`/`RUST68_TRACE_BLIT_START`/
+  `RUST68_TRACE_BLITTER_WORDS`, `examples/rd_menu_repro.rs`/
+  `rd_menu_ca6a.rs` (reproduction headless d'un clic-glisser de menu,
+  sans SDL2 ni interaction réelle).
 
 Pistes pour aller plus loin (aucune n'est un blocage, ce sont des
 approfondissements) :
 - Vérification des points documentés comme non confirmés contre une
-  référence matérielle réelle (timing MFP/GLUE, skew du Blitter,
-  polarité haute résolution du Shifter).
+  référence matérielle réelle (timing MFP/GLUE, polarité haute
+  résolution du Shifter, cas limite "63 accès bus au lieu de 64" du
+  Blitter).
 - Contention DRAM/vidéo pour les accès Shifter/Blitter (mécanisme déjà
   générique via `Bus::is_contended`, pas encore branché sur ces deux
   puces).
 - `.stx` : métadonnées de protection par secteur (fuzzy bits, timing)
   volontairement ignorées par le lecteur minimal — de vraies protections
   de jeux resteraient bloquées.
-- **Résolu** : les clics souris (icônes, items de menu) ne sélectionnaient
-  rien. Cause réelle, en plusieurs couches — le contrôleur IKBD n'existait
-  pas du tout (voir section IKBD ci-dessus : commandes TOS jamais
-  interprétées, front GPIP4 starvé entre octets d'une même trame,
-  `$0EE4` non pré-rempli) ; une fois ces couches corrigées, un dernier bug
-  subsistait, plus simple : les bits gauche/droit du paquet souris étaient
-  **inversés** par rapport à la convention attendue par le TOS (constaté
-  empiriquement par l'utilisateur, corrigé dans `queue_mouse_move` —
-  `atari_st_sdl2.rs`). Confirmé résolu : les clics fonctionnent
-  normalement. Le mode souris "exclusif" (curseur hôte caché + confiné à
-  la fenêtre tant qu'elle a le focus, `Cmd+Shift+F10` pour basculer
-  manuellement sans perdre le focus) a aussi été ajouté à cette occasion.
-
-- **Bug ouvert, reproduit et non résolu** : la barre de menu GEM (et
-  parfois les icônes du bureau) affiche un bandeau de bruit/blocs de
-  couleur au lieu d'un texte lisible quand un menu est réellement ouvert
-  (pas juste survolé sans clic). Pour reproduire : `atari_st_sdl2` avec
-  `tos162.img`, cliquer-glisser sur un titre de la barre de menu pour
-  ouvrir son menu déroulant.
-
-  **Définitivement écarté** cette session (donc *indépendant* du
-  correctif clic souris ci-dessus, malgré le lien de cause initialement
-  soupçonné) :
-  - Tout le pipeline souris/IKBD : reset, générations/livraison de
-    paquets, front GPIP4, `$0EE4` — tous vérifiés/corrigés, sans effet
-    sur cette corruption.
-  - Boot chaud vs boot froid réel (`RUST68_COLD_BOOT=1`) : reproduit à
-    l'identique dans les deux cas (un premier test donnant l'illusion du
-    contraire s'est révélé être un faux négatif — le clic-glisser
-    n'avait pas réellement ouvert de menu). Écarte l'hypothèse d'une
-    variable système que le raccourci "redémarrage à chaud" oublierait
-    d'initialiser (contrairement à `$0EE4`, qui lui était bien la cause
-    du problème de clic).
-  - Le Blitter (0 blit tracé), le format/la méthode de texture SDL2, la
-    cadence des paquets souris (tout testé et écarté lors de sessions
-    précédentes).
-
-  Désassemblage complet (via `capstone`) de la routine logicielle de
-  remplissage rectangulaire appelée pendant l'ouverture du menu, ROM TOS
-  1.62, `$E12C1C`-`$E12C9A` : lit un motif dans une table ROM (`A0`),
-  applique un merge masqué `((X XOR D3) AND masque) XOR D3` sur les mots
-  de bord et une écriture directe sur les mots du milieu, bouclé sur les
-  4 plans. Dispatché depuis un dispositif à plusieurs niveaux de tables
-  de fonctions façon VDI (`$E12B1E` → table PC-relative en `$E12B4C` →
-  `$E12C18`/`$E12C7E` selon le nombre de plans). Toutes les valeurs de
-  registres capturées à l'entrée sont individuellement plausibles et
-  cohérentes avec `shifter.video_base()` — aucune valeur "manifestement
-  fausse" trouvée à ce niveau, ni de bug identifié dans les instructions
-  CPU impliquées (`ADDA.W`, `EOR.W`/`AND.W` registre↔mémoire, `DBRA`,
-  `TST.W (An)+`).
-
-  **Piste ouverte pour une reprise future** : le projet compagnon Stay
-  (`/Users/yannmichon/STAY`) dépend de **ce dépôt Rust68 en path
-  dependency** pour son cœur CPU (`crates/core/cpu/src/wrapper.rs` —
-  `rust68::Cpu` utilisé directement, donc strictement le même code que
-  celui testé ici) mais a son **propre** board/périphériques (ACIA/MFP/
-  Shifter/Blitter séparés, `crates/core/memory`). Reproduire l'interaction
-  exacte (ouvrir un menu) sous `stay` (config déjà prête : `stay.toml`
-  pointe sur `assets/tos162.img`, `cargo build --release --bin stay`)
-  permettrait un test différentiel fiable : si Stay ne montre PAS la
-  corruption avec le même TOS et le même CPU partagé, le bug est
-  définitivement dans le board/périphériques ST-spécifiques de Rust68
-  (`systems/atari_st/mod.rs`, `shifter.rs`…), pas dans le cœur CPU. Cette
-  piste a été commencée mais pas menée à terme cette session (Stay a
-  nécessité un petit correctif de compilation pour suivre l'ajout récent
-  de `StepError::DoubleFault`, déjà fait dans
-  `STAY/crates/core/cpu/src/wrapper.rs`) — reprendre en lançant `stay`,
-  en reproduisant la même ouverture de menu, et en comparant visuellement.
-
-  Instrumentation de debug conservée dans `atari_st_sdl2.rs`/
-  `systems/atari_st/mod.rs` (variables d'environnement, coût nul si non
-  activées) : `RUST68_WATCH_VIDEO`, `RUST68_DUMP_VIDEO`,
-  `RUST68_TRACE_FILL`, `RUST68_TRACE_BLITDET`, `RUST68_TRACE_DISPATCH`,
-  `RUST68_TRACE_SIM`, `RUST68_TRACE_IKBD`, `RUST68_TRACE_IKBD_READER`,
-  `RUST68_TRACE_IKBD_DISPATCH`.
+- Résidu de dérive de timing (~60-80 VBL sur un très gros transfert
+  disquette protégé, `Rick_Dangerous.stx`) après le correctif de latence
+  rotationnelle STX (`bit_position`) — cause non identifiée, crash final
+  inchangé (A6=0 au même endroit).
