@@ -81,15 +81,30 @@ fn take_trace_exception_ne_fait_rien_si_rien_n_est_en_attente() {
 }
 
 #[test]
-fn une_instruction_qui_pose_t_elle_meme_se_trace_immediatement() {
-    // ORI #$8000,SR : 0x007C puis l'immédiat.
-    let (mut cpu, mut bus) = setup(&[0x007C, 0x8000]);
+fn une_instruction_qui_pose_t_elle_meme_ne_se_trace_qu_apres_la_suivante() {
+    // ORI #$8000,SR (0x007C + immédiat) puis un NOP. Vérifié empiriquement
+    // contre Hatari (2026-08-04, `Rick_Dangerous.stx` : une routine TOS qui
+    // pose T via ORI to SR pour piloter une boucle de déchiffrement
+    // instruction par instruction) : le silicium réel exécute ENCORE
+    // l'instruction suivante avant que la trace ne devienne effective —
+    // même mécanisme matériel que le délai du masque IPL (voir
+    // `Cpu::sr_write_pending_delay`). L'ancienne hypothèse ("dès la fin de
+    // CETTE instruction") n'avait jamais été vérifiée contre une référence
+    // et causait un double bus fault que Hatari n'a jamais sur ce jeu.
+    let (mut cpu, mut bus) = setup(&[0x007C, 0x8000, 0x4E71]);
     cpu.sr &= !sr::T;
-    cpu.step(&mut bus).unwrap();
+
+    cpu.step(&mut bus).unwrap(); // ORI #$8000,SR
     assert!(cpu.sr & sr::T != 0, "T doit être posé par ORI to SR");
     assert!(
+        !cpu.trace_pending,
+        "pas encore : c'est CETTE instruction qui vient de poser T"
+    );
+
+    cpu.step(&mut bus).unwrap(); // NOP
+    assert!(
         cpu.trace_pending,
-        "la trace doit se déclencher dès la fin de l'instruction qui pose T"
+        "la trace se déclenche après l'instruction SUIVANT celle qui a posé T"
     );
 }
 
@@ -112,17 +127,27 @@ fn trap_n_active_pas_trace_pending_meme_avec_t_initialement_pose() {
 }
 
 #[test]
-fn rte_qui_depile_un_sr_avec_t_pose_declenche_la_trace() {
+fn rte_qui_depile_un_sr_avec_t_pose_ne_declenche_la_trace_qu_apres_la_suivante() {
     let (mut cpu, mut bus) = setup(&[0x4E73]); // RTE
+    bus.write16(0x0800, 0x4E71); // NOP à l'adresse de retour
     // Empile un frame de retour : SR (avec T=1, superviseur) puis PC=0x0800.
     let sp = cpu.sp() - 6;
     cpu.set_sp(sp);
     bus.write16(sp, sr::T | rust68::sr::S);
     bus.write32(sp + 2, 0x0800);
 
-    cpu.step(&mut bus).unwrap();
+    cpu.step(&mut bus).unwrap(); // RTE
 
     assert_eq!(cpu.pc, 0x0800);
     assert!(cpu.sr & sr::T != 0);
-    assert!(cpu.trace_pending, "RTE qui restaure T=1 doit redéclencher la trace");
+    assert!(
+        !cpu.trace_pending,
+        "pas encore : c'est CETTE instruction (RTE) qui vient de restaurer T=1"
+    );
+
+    cpu.step(&mut bus).unwrap(); // NOP
+    assert!(
+        cpu.trace_pending,
+        "la trace se déclenche après l'instruction SUIVANT le RTE qui a restauré T"
+    );
 }

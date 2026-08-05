@@ -590,13 +590,88 @@ fn disque_de_test() -> RawDiskImage {
     RawDiskImage::new(data, 80, 1, 9)
 }
 
+/// Programme le port A du YM2149 pour sélectionner le lecteur A, face 0
+/// (voir `AtariSt::floppy_drive_select`) — sans ça, le port A garde sa
+/// valeur par défaut après reset (0xFF, "aucun lecteur sélectionné"),
+/// exactement comme sur silicium réel avant que TOS ne le programme.
+fn select_drive_a_face_0(st: &mut AtariSt) {
+    st.write8(YM2149_SELECT, ym2149::reg::IO_PORT_A);
+    st.write8(YM2149_DATA, 0b1111_1101); // bit1=0 (lecteur A), bit0=1 (face 0)
+}
+
+/// Fait progresser l'émulation jusqu'à la fin de la commande WD1772 en
+/// cours (voir la doc de `wd1772::Wd1772::tick` — les commandes ne sont
+/// plus synchrones) : par blocs de 50 000 cycles, jusqu'à 3 millions de
+/// cycles au total (large marge même pour une commande Type II complète —
+/// chargement de tête + latence de rotation + transfert).
+fn run_disk_to_completion(st: &mut AtariSt) {
+    let mut total = 0u32;
+    while st.wd1772.busy() && total < 6_000_000 {
+        st.tick(50_000);
+        total += 50_000;
+    }
+    assert!(!st.wd1772.busy(), "la commande n'a pas terminé dans la marge de cycles prévue");
+}
+
 #[test]
 fn fdc_registres_multiplexes_via_dma_mode() {
     let mut st = AtariSt::new(0x1000, vec![]);
-    st.write8(DMA_MODE, wd1772::reg::TRACK);
+    st.write8(DMA_MODE, wd1772::reg::TRACK << 1);
     st.write8(FDC_DATA, 42);
     assert_eq!(st.wd1772.read(wd1772::reg::TRACK), 42);
     assert_eq!(st.read8(FDC_DATA), 42);
+}
+
+#[test]
+fn dma_mode_sur_16_bits_decode_le_selecteur_dans_les_bits_1_2() {
+    // Bug réel corrigé : `DMA_MODE` ($FF8606) est un registre 16 bits sur
+    // silicium réel, avec le sélecteur de registre FDC dans les bits 1-2 de
+    // l'octet bas (confirmé par Hatari, `fdc.c` :
+    // `FDC_reg = (FDC_DMA.Mode & 0x6) >> 1`) — PAS bits 0-1 d'un `write8`
+    // isolé. TOS y accède quasi systématiquement en écriture MOT complète
+    // (`move.w`, comme ici via `write16`), jamais en `write8` isolé : une
+    // version antérieure qui décomposait naïvement cet accès octet par
+    // octet ne voyait jamais que l'octet haut (toujours nul), laissant le
+    // sélecteur bloqué à COMMAND_STATUS en permanence quoi que TOS écrive —
+    // rendant impossible toute sélection réelle de Piste/Secteur/Donnée, et
+    // donc toute lecture de disquette.
+    let mut st = AtariSt::new(0x1000, vec![]);
+
+    // bits1-2 = 01 (TRACK) ; valeur pleine telle qu'un vrai TOS l'écrit.
+    st.write16(DMA_MODE, 0x0082);
+    st.write8(FDC_DATA, 7);
+    assert_eq!(st.wd1772.read(wd1772::reg::TRACK), 7, "bits1-2=01 -> TRACK");
+
+    // bits1-2 = 10 (SECTOR)
+    st.write16(DMA_MODE, 0x0084);
+    st.write8(FDC_DATA, 8);
+    assert_eq!(st.wd1772.read(wd1772::reg::SECTOR), 8, "bits1-2=10 -> SECTOR");
+
+    // bits1-2 = 11 (DATA)
+    st.write16(DMA_MODE, 0x0086);
+    st.write8(FDC_DATA, 9);
+    assert_eq!(st.wd1772.read(wd1772::reg::DATA), 9, "bits1-2=11 -> DATA");
+}
+
+#[test]
+fn fdc_data_sur_16_bits_atteint_bien_le_wd1772() {
+    // Bug réel corrigé : `FDC_DATA` ($FF8604) est lui aussi un registre 16
+    // bits sur silicium réel, avec l'octet WD1772 réel dans l'octet BAS du
+    // mot (confirmé par Hatari, `fdc.c` :
+    // `FDC_DiskController_WriteWord`/`...ReadWord` lisent/écrivent
+    // `0xff8605`) — PAS l'octet haut qu'une composition octet par octet
+    // générique verrait. TOS y accède quasi systématiquement en mot
+    // complet : sans cette interception, toute commande ou valeur de
+    // piste/secteur/donnée écrite ainsi serait silencieusement perdue
+    // (seul l'octet haut, toujours nul, atteindrait le WD1772).
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write16(DMA_MODE, 0x0082); // TRACK (bits1-2=01)
+    st.write16(FDC_DATA, 0x0055); // écriture MOT, comme le fait vraiment TOS
+    assert_eq!(st.wd1772.read(wd1772::reg::TRACK), 0x55, "octet bas du mot attendu, pas l'octet haut");
+
+    // Lecture symétrique : l'octet réel doit apparaître dans l'octet bas du
+    // mot lu, pas l'octet haut.
+    assert_eq!(st.read16(FDC_DATA), 0x0055, "octet WD1772 attendu dans l'octet bas du mot lu");
 }
 
 #[test]
@@ -617,25 +692,142 @@ fn dma_compteur_adresse_round_trip() {
 fn read_sector_bout_en_bout_via_dma() {
     let mut st = AtariSt::new(0x2000, vec![]);
     st.floppy_a = Some(Box::new(disque_de_test()));
+    select_drive_a_face_0(&mut st);
 
     st.write8(DMA_ADDR_HIGH, 0x00);
     st.write8(DMA_ADDR_MID, 0x10);
     st.write8(DMA_ADDR_LOW, 0x00); // adresse DMA = 0x1000
 
-    st.write8(DMA_MODE, wd1772::reg::SECTOR);
+    st.write8(DMA_MODE, wd1772::reg::SECTOR << 1);
     st.write8(FDC_DATA, 1); // secteur 1
 
-    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS << 1);
     st.write8(FDC_DATA, 0b1000_0000); // Read Sector, m=0
+    run_disk_to_completion(&mut st);
 
     assert_eq!(st.read8(0x1000), 0xAB, "le motif du secteur 1 doit être en RAM");
     assert!(st.wd1772.interrupt_requested());
 }
 
 #[test]
+fn compteur_secteurs_dma_limite_le_transfert_multi_secteurs() {
+    // Bug réel corrigé : le bit 4 de `DMA_MODE` bascule `FDC_DATA` vers un
+    // compteur de secteurs DMA séparé (pas un registre du WD1772, voir la
+    // doc de `AtariSt::dma_sector_count`) qui limite RÉELLEMENT le nombre
+    // de secteurs transférés en lecture multiple (bit M) — indépendamment
+    // de ce que le WD1772 continuerait de faire tout seul (il trouve
+    // toujours les secteurs suivants tant qu'ils existent sur la piste).
+    // Sans cette limite, un GEMDOS qui ne demande que quelques secteurs (le
+    // répertoire racine, par exemple) voit son transfert déborder sur la
+    // RAM bien au-delà de ce qu'il attend, dès que la piste physique en a
+    // davantage — le cas des pistes protégées non standard, confirmé sur
+    // une vraie image commerciale (`Rick_Dangerous.stx`, piste 1 : 12
+    // secteurs physiques réels contre 10 attendus par le BPB du disque).
+    let mut data = vec![0u8; 9 * SECTOR_SIZE];
+    for s in 0..9usize {
+        data[s * SECTOR_SIZE] = 0x10 + s as u8; // motif reconnaissable par secteur
+    }
+    let disque = RawDiskImage::new(data, 80, 1, 9);
+
+    let mut st = AtariSt::new(0x4000, vec![]);
+    st.floppy_a = Some(Box::new(disque));
+    select_drive_a_face_0(&mut st);
+
+    // Sentinelle en RAM avant le transfert, pour détecter un débordement.
+    for i in 0..(9 * SECTOR_SIZE as u32) {
+        st.write8(0x1000 + i, 0xEE);
+    }
+
+    st.write8(DMA_ADDR_HIGH, 0x00);
+    st.write8(DMA_ADDR_MID, 0x10);
+    st.write8(DMA_ADDR_LOW, 0x00);
+
+    st.write8(DMA_MODE, wd1772::reg::SECTOR << 1);
+    st.write8(FDC_DATA, 1); // secteur de départ = 1
+
+    // Programme le compteur de secteurs DMA à 2 (bit4 de DMA_MODE posé).
+    st.write8(DMA_MODE, 0x10);
+    st.write8(FDC_DATA, 2);
+
+    // Read Sector MULTIPLE (m=1, bit4 de la commande) : bit4 de DMA_MODE
+    // retombé à 0, donc FDC_DATA redevient le registre commande/statut.
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS << 1);
+    st.write8(FDC_DATA, 0b1001_0000);
+    run_disk_to_completion(&mut st);
+
+    assert_eq!(st.read8(0x1000), 0x10, "secteur 1 doit être transféré");
+    assert_eq!(st.read8(0x1000 + SECTOR_SIZE as u32), 0x11, "secteur 2 doit être transféré");
+    assert_eq!(
+        st.read8(0x1000 + 2 * SECTOR_SIZE as u32),
+        0xEE,
+        "le compteur de secteurs DMA doit arrêter le transfert avant le 3e secteur"
+    );
+}
+
+#[test]
+fn face_disquette_cablee_depuis_le_port_a_du_ym2149() {
+    // Cœur du bug corrigé : `wd1772.side` restait auparavant toujours à 0
+    // quoi que le port A du YM2149 indique, rendant illisible tout contenu
+    // situé sur la face 1 d'une disquette double face (le cas de
+    // pratiquement tout logiciel ST réel au format `.st` 720 Ko).
+    let mut data = vec![0u8; 2 * 9 * SECTOR_SIZE]; // 2 faces, 9 secteurs, piste 0
+    data[0] = 0xAA; // piste 0, face 0, secteur 1
+    data[9 * SECTOR_SIZE] = 0xBB; // piste 0, face 1, secteur 1
+    let disque = RawDiskImage::new(data, 80, 2, 9);
+
+    let mut st = AtariSt::new(0x2000, vec![]);
+    st.floppy_a = Some(Box::new(disque));
+    st.write8(DMA_ADDR_HIGH, 0x00);
+    st.write8(DMA_ADDR_MID, 0x10);
+    st.write8(DMA_ADDR_LOW, 0x00); // adresse DMA = 0x1000
+    st.write8(DMA_MODE, wd1772::reg::SECTOR << 1);
+    st.write8(FDC_DATA, 1); // secteur 1
+
+    // Lecteur A, face 0 (bit0=1) : doit lire le motif de la face 0.
+    st.write8(YM2149_SELECT, ym2149::reg::IO_PORT_A);
+    st.write8(YM2149_DATA, 0b1111_1101);
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS << 1);
+    st.write8(FDC_DATA, 0b1000_0000); // Read Sector, m=0
+    run_disk_to_completion(&mut st);
+    assert_eq!(st.read8(0x1000), 0xAA, "face 0 attendue");
+
+    // Lecteur A, face 1 (bit0=0) : doit maintenant lire le motif de la face 1.
+    st.write8(DMA_ADDR_MID, 0x10); // ré-armer l'adresse DMA (avancée par la lecture précédente)
+    st.write8(DMA_ADDR_LOW, 0x00);
+    st.write8(YM2149_SELECT, ym2149::reg::IO_PORT_A);
+    st.write8(YM2149_DATA, 0b1111_1100);
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS << 1);
+    st.write8(FDC_DATA, 0b1000_0000); // Read Sector, m=0
+    run_disk_to_completion(&mut st);
+    assert_eq!(st.read8(0x1000), 0xBB, "face 1 attendue après changement du port A");
+}
+
+#[test]
+fn lecteur_non_selectionne_repond_not_ready() {
+    // Si le port A désélectionne le lecteur A (bit1=1) — par exemple parce
+    // que le port A n'a pas encore été programmé par TOS (valeur par défaut
+    // après reset, voir `Ym2149::new`) — le FDC ne doit pas silencieusement
+    // utiliser `floppy_a` quand même : il doit répondre NOT_READY, comme un
+    // vrai contrôleur qui ne voit aucun lecteur actif sur le bus.
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.floppy_a = Some(Box::new(disque_de_test()));
+    // Port A jamais programmé : reste à sa valeur par défaut (0xFF).
+
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS << 1);
+    st.write8(FDC_DATA, 0b1000_0000); // Read Sector, m=0
+
+    assert_eq!(
+        st.wd1772.read(wd1772::reg::COMMAND_STATUS) & wd1772::status::NOT_READY,
+        wd1772::status::NOT_READY,
+        "aucun lecteur sélectionné -> NOT_READY, pas une lecture silencieuse de floppy_a"
+    );
+}
+
+#[test]
 fn write_sector_bout_en_bout_via_dma() {
     let mut st = AtariSt::new(0x2000, vec![]);
     st.floppy_a = Some(Box::new(disque_de_test()));
+    select_drive_a_face_0(&mut st);
 
     // Prépare 512 octets à 0x55 en RAM à partir de 0x1000.
     for i in 0..SECTOR_SIZE as u32 {
@@ -645,11 +837,12 @@ fn write_sector_bout_en_bout_via_dma() {
     st.write8(DMA_ADDR_MID, 0x10);
     st.write8(DMA_ADDR_LOW, 0x00);
 
-    st.write8(DMA_MODE, wd1772::reg::SECTOR);
+    st.write8(DMA_MODE, wd1772::reg::SECTOR << 1);
     st.write8(FDC_DATA, 2); // secteur 2
 
-    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS << 1);
     st.write8(FDC_DATA, 0b1010_0000); // Write Sector, m=0
+    run_disk_to_completion(&mut st);
 
     let secteur_2 = st.floppy_a.as_ref().unwrap().read_sector(0, 0, 2).unwrap();
     assert!(secteur_2.iter().all(|&b| b == 0x55));
@@ -668,7 +861,7 @@ fn irq_wd1772_relayee_via_gpip5_du_mfp() {
     st.mfp.write(reg::IMRB, 1 << channel::GPIP5);
 
     assert_eq!(st.irq_level(), 0);
-    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS << 1);
     st.write8(FDC_DATA, 0b0000_0000); // Restore
 
     st.tick(4); // relaie /INTRQ vers GPIP5
@@ -679,7 +872,7 @@ fn irq_wd1772_relayee_via_gpip5_du_mfp() {
 fn reset_bus_reinitialise_le_wd1772() {
     let mut st = AtariSt::new(0x1000, vec![]);
     st.floppy_a = Some(Box::new(disque_de_test()));
-    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS);
+    st.write8(DMA_MODE, wd1772::reg::COMMAND_STATUS << 1);
     st.write8(FDC_DATA, 0b0000_0000); // Restore -> lève /INTRQ
     assert!(st.wd1772.interrupt_requested());
 
@@ -782,4 +975,72 @@ fn mirroring_mmu_intra_banque_ste_quand_memconf_surestime_la_ram_reelle() {
         "MEMCONF correct : plus de mirroring, la banque 1 est indépendante"
     );
     assert_eq!(st.read32(0x10 + 0x80000), 0xDEADBEEF);
+}
+
+/// Configure un blit trivial (20 mots, 1 par ligne — `X_COUNT=1`,
+/// `Y_COUNT=20`), sans dépendance à la source (`OP=0x0F` : sortie toujours
+/// à 1, donc `HOP=0` ignore la source) — seule la progression (tranchage,
+/// `BUSY`) nous intéresse ici, pas le contenu écrit. `DST_ADDR` doit
+/// pointer dans la RAM allouée par l'appelant.
+fn setup_blit_20_mots(st: &mut AtariSt, dst_addr: u32, control: u8) {
+    st.write8(BLITTER_BASE + blitter_reg::HOP, 0);
+    st.write8(BLITTER_BASE + blitter_reg::OP, 0x0F);
+    st.write16(BLITTER_BASE + blitter_reg::DST_X_INC, 0);
+    st.write16(BLITTER_BASE + blitter_reg::DST_Y_INC, 2);
+    st.write16(BLITTER_BASE + blitter_reg::X_COUNT, 1);
+    st.write16(BLITTER_BASE + blitter_reg::Y_COUNT, 20);
+    st.write16(BLITTER_BASE + blitter_reg::ENDMASK_1, 0xFFFF);
+    st.write16(BLITTER_BASE + blitter_reg::ENDMASK_2, 0xFFFF);
+    st.write16(BLITTER_BASE + blitter_reg::ENDMASK_3, 0xFFFF);
+    st.write32(BLITTER_BASE + blitter_reg::DST_ADDR, dst_addr);
+    // Déclenche : la toute première tranche s'exécute de façon synchrone,
+    // dès cette écriture (voir `AtariSt::write8`, branche CONTROL).
+    st.write8(BLITTER_BASE + blitter_reg::CONTROL, control);
+}
+
+fn blit_y_count(st: &mut AtariSt) -> u16 {
+    ((st.read8(BLITTER_BASE + blitter_reg::Y_COUNT) as u16) << 8)
+        | st.read8(BLITTER_BASE + blitter_reg::Y_COUNT1) as u16
+}
+
+#[test]
+fn blit_non_hog_progresse_par_tranches_de_16_mots_au_rythme_du_cpu() {
+    // Limitation historique corrigée (voir la doc du module blitter) : le
+    // Blitter en mode partagé (non-HOG) doit rendre la main au CPU toutes
+    // les 16 mots (`WORDS_PER_SLICE`), pas exécuter le blit entier d'un
+    // coup — et la reprise doit être pilotée par `AtariSt::tick` au rythme
+    // réel du CPU (`BLITTER_SLICE_CYCLES` = 256 cycles entre deux
+    // tranches, calibré contre Hatari `src/blitter.c`), pas par une
+    // simple réécriture logicielle de CONTROL.
+    let mut st = AtariSt::new(0x1_0000, vec![]);
+    setup_blit_20_mots(&mut st, 0x2000, 0x80); // BUSY=1, HOG=0
+
+    // Première tranche déjà traitée par l'écriture CONTROL elle-même :
+    // 16 des 20 mots (20 lignes, 1 mot/ligne) sont faits, 4 restent.
+    assert_eq!(blit_y_count(&mut st), 4, "16 lignes traitées par la première tranche");
+    assert!(st.blitter.busy(), "blit pas fini : BUSY doit rester observable par polling");
+
+    // Moins de 256 cycles écoulés : aucune tranche supplémentaire.
+    st.tick(255);
+    assert_eq!(blit_y_count(&mut st), 4, "pas encore assez de cycles CPU pour une nouvelle tranche");
+    assert!(st.blitter.busy());
+
+    // Le cycle 256e déclenche la tranche suivante, qui termine le blit
+    // (il ne reste que 4 mots, sous le budget de 16).
+    st.tick(1);
+    assert_eq!(blit_y_count(&mut st), 0, "blit terminé après la deuxième tranche");
+    assert!(!st.blitter.busy(), "BUSY retombe une fois le blit réellement fini");
+}
+
+#[test]
+fn blit_hog_se_termine_en_une_seule_tranche() {
+    // À l'inverse : en mode HOG (bit 6 de CONTROL), le silicium réel garde
+    // le bus jusqu'à la fin complète, sans jamais le rendre au CPU — donc
+    // un seul appel (celui déclenché par l'écriture CONTROL) doit suffire,
+    // quelle que soit la taille du blit.
+    let mut st = AtariSt::new(0x1_0000, vec![]);
+    setup_blit_20_mots(&mut st, 0x2000, 0xC0); // BUSY=1, HOG=1
+
+    assert_eq!(blit_y_count(&mut st), 0, "mode HOG : tout traité en un seul appel");
+    assert!(!st.blitter.busy());
 }

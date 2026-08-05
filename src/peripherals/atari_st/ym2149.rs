@@ -270,9 +270,19 @@ impl Default for Ym2149 {
 
 impl Ym2149 {
     pub fn new() -> Self {
+        let mut regs = [0u8; 16];
+        // Port A : lignes de sélection lecteur/face du lecteur de
+        // disquette (bits 0-2, voir `port_a_output`) tirées au niveau haut
+        // par des résistances de rappel réelles tant que TOS n'a pas
+        // programmé le port — "aucun lecteur sélectionné + face 0" (0xFF),
+        // confirmé par Hatari (`psg.c` : commentaire explicite sur l'état
+        // après reset). Sans ça, avant que TOS ne programme ce port très
+        // tôt au boot, la face lue par défaut serait la face 1 (bit0=0)
+        // plutôt que 0.
+        regs[reg::IO_PORT_A as usize] = 0xFF;
         Ym2149 {
             selected: 0,
-            regs: [0; 16],
+            regs,
             cpu_cycle_acc: 0,
             tone: Default::default(),
             noise: NoiseGenerator::new(),
@@ -335,6 +345,19 @@ impl Ym2149 {
     /// (DDR = 0 sur les bits correspondants de `MIXER`).
     pub fn set_port_a_input(&mut self, value: u8) {
         self.port_a_in = value;
+    }
+
+    /// Registre de sortie BRUT du port A (bascule interne, pas ce qu'une
+    /// relecture bus verrait via [`Self::read`] — celle-ci dépend de la
+    /// direction DDR programmée dans `MIXER`). Sur ST/STE réel, ce registre
+    /// pilote directement (indépendamment de la direction lue par le CPU)
+    /// les lignes de sélection lecteur/face du connecteur disquette :
+    /// bit0 (inversé) = face (0 après négation = face 1, 1 = face 0),
+    /// bit1 = 0 → lecteur A sélectionné, bit2 = 0 → lecteur B — confirmé
+    /// par Hatari (`psg.c`/`fdc.c`, `FDC_SetDriveSide`). À charge du board
+    /// de décoder ces bits (voir `AtariSt::tick`/écriture `FDC_DATA`).
+    pub fn port_a_output(&self) -> u8 {
+        self.regs[reg::IO_PORT_A as usize]
     }
 
     /// Applique un niveau au port B pour les bits configurés en entrée.

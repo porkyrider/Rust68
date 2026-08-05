@@ -95,6 +95,16 @@ pub mod addr {
     pub const VIDEO_BASE_HIGH: u32 = 0xFF8201;
     /// Adresse de base vidéo, octet médian (bits 15-8).
     pub const VIDEO_BASE_MID: u32 = 0xFF8203;
+    /// Adresse de base vidéo, octet bas (bits 7-0) — STE uniquement (permet
+    /// un alignement plus fin que les 256 octets du ST d'origine, qui n'a
+    /// pas ce registre). Absent du match précédent : une lecture y
+    /// retombait sur le `0xFF` par défaut de fin de bus plutôt que la vraie
+    /// valeur du registre — trouvé en retraçant un DoubleFault tardif de
+    /// Rick_Dangerous.stx jusqu'à du code qui reconstruit l'adresse de
+    /// base vidéo à partir de ces trois registres pour calculer une cible
+    /// de saut : `0xFF` au lieu de `0x00` y rendait l'adresse finale
+    /// impaire et désalignée.
+    pub const VIDEO_BASE_LOW: u32 = 0xFF820D;
     /// Compteur vidéo courant, octet haut.
     pub const VIDEO_COUNTER_HIGH: u32 = 0xFF8205;
     /// Compteur vidéo courant, octet médian.
@@ -192,6 +202,7 @@ impl Shifter {
         match bus_addr {
             addr::VIDEO_BASE_HIGH => (self.video_base >> 16) as u8,
             addr::VIDEO_BASE_MID => (self.video_base >> 8) as u8,
+            addr::VIDEO_BASE_LOW => self.video_base as u8,
             addr::VIDEO_COUNTER_HIGH => (self.video_counter >> 16) as u8,
             addr::VIDEO_COUNTER_MID => (self.video_counter >> 8) as u8,
             addr::VIDEO_COUNTER_LOW => self.video_counter as u8,
@@ -218,6 +229,7 @@ impl Shifter {
             addr::VIDEO_BASE_MID => {
                 self.video_base = (self.video_base & 0xFF00FF) | ((value as u32) << 8)
             }
+            addr::VIDEO_BASE_LOW => self.video_base = (self.video_base & 0xFFFF00) | value as u32,
             addr::VIDEO_COUNTER_HIGH => {
                 self.video_counter = (self.video_counter & 0x00FFFF) | ((value as u32) << 16)
             }

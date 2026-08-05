@@ -70,7 +70,7 @@ use crate::peripherals::atari_st::glue::{Glue, VideoMode};
 use crate::peripherals::atari_st::ikbd::Ikbd;
 use crate::peripherals::atari_st::mfp::Mfp;
 use crate::peripherals::atari_st::shifter::{self, Shifter};
-use crate::peripherals::atari_st::wd1772::{self, DmaChannel, FloppyDisk, Wd1772};
+use crate::peripherals::atari_st::wd1772::{self, DmaChannel, FloppyDisk, SECTOR_SIZE, Wd1772};
 use crate::peripherals::atari_st::ym2149::{self, Ym2149};
 use crate::{ADDR_MASK, Bus};
 
@@ -99,8 +99,16 @@ pub const YM2149_DATA: u32 = 0xFF8802;
 /// WD1772 : registre multiplexé (Commande/Statut/Piste/Secteur/Donnée
 /// selon le sélecteur `DMA_MODE`), sur ST/STE réel.
 pub const FDC_DATA: u32 = 0xFF8604;
-/// Contrôleur DMA : sélecteur de registre FDC (bits 0-1, voir
-/// limitations — modèle simplifié).
+/// Contrôleur DMA : sélecteur de registre FDC — registre 16 bits sur
+/// silicium réel (bits 0, 9-15 inutilisés ; bits 1-2 = sélecteur de
+/// registre FDC A1-A0, voir [`AtariSt::write16`]), confirmé par Hatari
+/// (`fdc.c` : `FDC_reg = (FDC_DMA.Mode & 0x6) >> 1`). PAS bits 0-1 comme un
+/// registre 8 bits classique — un accès mot (l'usage réel de TOS) place le
+/// sélecteur dans l'octet BAS du mot, ce que seule une prise en charge
+/// explicite de l'accès 16 bits complet peut voir (un `write8` naïf décomposé
+/// octet par octet, comme le reste du bus, ne verrait que l'octet haut,
+/// toujours nul pour ces petites valeurs — le sélecteur resterait alors
+/// bloqué à 0 en permanence quoi que TOS écrive).
 pub const DMA_MODE: u32 = 0xFF8606;
 /// Compteur d'adresse DMA, octet haut.
 pub const DMA_ADDR_HIGH: u32 = 0xFF8609;
@@ -177,12 +185,26 @@ pub const MEMORY_CONF: u32 = 0xFF8001;
 /// le type d'accès (CPU direct vs DMA).
 const ST_RAM_ADDRESS_SPACE: u32 = 4 * 1024 * 1024;
 
-/// Cycles de bus qu'une tranche de blit non-HOG (16 mots, voir
-/// `Blitter::execute`) occupe avant de rendre la main au CPU sur silicium
-/// réel, en mode partagé. Utilisé pour cadencer la reprise autonome du
-/// Blitter dans [`AtariSt::tick`] au même rythme que le vrai matériel,
-/// plutôt qu'une tranche entière par instruction CPU (bien trop rapide).
-const BLITTER_SLICE_CYCLES: u32 = 64;
+/// Cycles CPU accordés au CPU entre deux tranches de blit non-HOG (16 mots,
+/// voir `Blitter::execute`), c'est-à-dire le temps que le CPU a pour
+/// s'exécuter en parallèle avant que le Blitter ne reprenne la main —
+/// PAS le temps que le Blitter lui-même met à traiter sa tranche (aucun
+/// rapport direct avec `WORDS_PER_SLICE`, qui approxime plutôt les 64
+/// accès bus que le silicium réel accorde au Blitter à chaque tour).
+/// Utilisé pour cadencer la reprise autonome du Blitter dans
+/// [`AtariSt::tick`] au même rythme que le vrai matériel, plutôt qu'une
+/// tranche entière par instruction CPU (bien trop rapide).
+///
+/// Valeur reprise de Hatari (`src/blitter.c`, `Blitter_Start`, mode non
+/// "cycle exact" — celui qui correspond à notre propre modèle, sans
+/// comptage d'accès bus individuel) : le commentaire y est explicite —
+/// "In non cycle exact mode, the blitter will have 64 bus accesses and the
+/// cpu will run during 64*4 = 256 cpu cycles" — implémenté via
+/// `CycInt_AddRelativeInterrupt(BLITTER_NONHOG_BUS_CPU*4, ...)` avec
+/// `BLITTER_NONHOG_BUS_CPU = 64`, donc bien 256, pas 64 (bug de calibration
+/// corrigé ici : une valeur de 64 laissait le Blitter reprendre la main
+/// 4× plus souvent que sur le matériel de référence).
+const BLITTER_SLICE_CYCLES: u32 = 256;
 
 /// Broche GPIP du MFP câblée sur le signal "MONO DETECT" du connecteur
 /// moniteur, sur ST/STE réel : un moniteur monochrome met ce signal à la
@@ -216,7 +238,8 @@ pub struct AtariSt {
     /// une nouvelle tranche est autorisée. Sans ce throttling, un blit
     /// repris à CHAQUE tick() (donc à chaque instruction CPU) se termine en
     /// une poignée d'instructions au lieu du temps réel que prend le
-    /// silicium (~64 cycles de bus par tranche de 16 mots en mode partagé).
+    /// silicium (256 cycles CPU laissés au CPU entre deux tranches en mode
+    /// partagé — voir la doc de [`BLITTER_SLICE_CYCLES`] pour la source).
     blitter_slice_cycle_acc: u32,
     /// Registres DMA son STE (`$FF8900`-`$FF893F`) — pas de véritable
     /// émulation audio DMA (le son STE reste silencieux), mais un simple
@@ -303,6 +326,28 @@ pub struct AtariSt {
     pub floppy_a: Option<Box<dyn FloppyDisk>>,
     dma_register_select: u8,
     dma_address: u32,
+    /// Bit 4 de `DMA_MODE` : bascule `FDC_DATA` entre accès aux registres du
+    /// WD1772 (0) et écriture/lecture du compteur de secteurs DMA (1) — un
+    /// mécanisme séparé, PAS un registre du contrôleur de disquette lui-même
+    /// (confirmé par Hatari, `fdc.c` : "Set DMA sector count if ff8606 bit
+    /// 4 == 1"). Voir `dma_sector_count`.
+    dma_sector_count_mode: bool,
+    /// Nombre de secteurs restant à transférer, programmé via `FDC_DATA` en
+    /// mode compteur de secteurs (voir `dma_sector_count_mode`) — `None`
+    /// tant qu'aucun compteur n'a jamais été programmé (simplification :
+    /// sur silicium réel il vaut 0 après reset, ce qui bloquerait tout
+    /// transfert tant que le logiciel ne l'a pas armé ; en pratique TOS le
+    /// fait toujours avant la moindre commande Type II, donc traiter
+    /// "jamais programmé" comme "illimité" est sans conséquence pratique et
+    /// évite de faire échouer un transfert délibérément déclenché "à la
+    /// main", sans ce préambule, par un test/outil). Limite RÉELLEMENT le
+    /// nombre de secteurs transférés côté DMA, indépendamment de ce que le
+    /// WD1772 lui-même ferait naturellement (qui continuerait de trouver
+    /// les secteurs suivants sur la piste) — sans cette limite, une lecture
+    /// multi-secteurs (bit M) déborde sur la RAM bien au-delà de ce que le
+    /// logiciel attend dès que la piste physique a plus de secteurs que ce
+    /// qui a été demandé (le cas des pistes protégées non standard).
+    dma_sector_count: Option<u16>,
     /// Blitter (STE). Champ public surtout pour la lecture directe des
     /// registres ; le déclenchement se fait en écrivant le bit BUSY/START
     /// du registre de contrôle (voir `Bus::write8` sur `BLITTER_BASE +
@@ -387,9 +432,33 @@ const RESET_VECTOR_ROM_SIZE: u32 = 8;
 /// Canal DMA reliant le WD1772 à la RAM du board à l'adresse DMA courante
 /// (voir `peripherals::atari_st::wd1772::DmaChannel`) : le WD1772 ne connaît pas la
 /// RAM, seulement ce canal.
+///
+/// Fait aussi respecter `dma_sector_count` (voir sa doc) : au-delà du
+/// nombre de secteurs programmé, les octets sont silencieusement perdus
+/// (lecture : RAM inchangée : écriture : `0` renvoyé au WD1772) plutôt que
+/// transférés — comportement du vrai contrôleur DMA, indépendant de ce que
+/// le WD1772 continuerait de faire tout seul.
 struct RamDmaChannel<'a> {
     ram: &'a mut [u8],
     address: &'a mut u32,
+    sector_count: &'a mut Option<u16>,
+    bytes_in_sector: u32,
+}
+
+impl<'a> RamDmaChannel<'a> {
+    fn transfer_allowed(&self) -> bool {
+        !matches!(self.sector_count, Some(0))
+    }
+
+    fn advance(&mut self) {
+        self.bytes_in_sector += 1;
+        if self.bytes_in_sector >= SECTOR_SIZE as u32 {
+            self.bytes_in_sector = 0;
+            if let Some(count) = self.sector_count.as_mut() {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
 }
 
 /// Vue `Bus` d'une tranche de RAM, pour donner au Blitter (qui prend un
@@ -439,16 +508,24 @@ impl<'a> Bus for RamBus<'a> {
 
 impl<'a> DmaChannel for RamDmaChannel<'a> {
     fn pull(&mut self) -> u8 {
-        let byte = self.ram.get(*self.address as usize).copied().unwrap_or(0);
+        let byte = if self.transfer_allowed() {
+            self.ram.get(*self.address as usize).copied().unwrap_or(0)
+        } else {
+            0
+        };
         *self.address = self.address.wrapping_add(1);
+        self.advance();
         byte
     }
 
     fn push(&mut self, byte: u8) {
-        if let Some(slot) = self.ram.get_mut(*self.address as usize) {
-            *slot = byte;
+        if self.transfer_allowed() {
+            if let Some(slot) = self.ram.get_mut(*self.address as usize) {
+                *slot = byte;
+            }
         }
         *self.address = self.address.wrapping_add(1);
+        self.advance();
     }
 }
 
@@ -532,6 +609,8 @@ impl AtariSt {
             floppy_a: None,
             dma_register_select: 0,
             dma_address: 0,
+            dma_sector_count_mode: false,
+            dma_sector_count: None,
             blitter: Blitter::new(),
             overlay: true,
             memory_conf: 0,
@@ -683,6 +762,26 @@ impl AtariSt {
         // sans cette inversion, le bit ne descend jamais à 0 et le TOS
         // conclut à tort qu'aucun lecteur n'est présent (`_nflops` reste à
         // 0, aucune icône A: sur le bureau).
+        // Fait progresser une commande WD1772 en cours (voir la doc de
+        // `wd1772::Wd1772::tick` — vitesse de pas, latence de rotation,
+        // débit de transfert réels, plutôt que l'exécution instantanée
+        // d'une version précédente qui rendait toute la disquette bien
+        // trop rapide). Câblage face/lecteur : voir `floppy_drive_select`,
+        // relu ici aussi (pas seulement à l'écriture de commande) car une
+        // commande multi-secteurs peut s'étaler sur plusieurs `tick()`.
+        {
+            let (drive_a_selected, side) = self.floppy_drive_select();
+            self.wd1772.side = side;
+            let disk = if drive_a_selected { self.floppy_a.as_deref_mut() } else { None };
+            let mut channel = RamDmaChannel {
+                ram: &mut self.ram,
+                address: &mut self.dma_address,
+                sector_count: &mut self.dma_sector_count,
+                bytes_in_sector: 0,
+            };
+            self.wd1772.tick(cpu_cycles, disk, &mut channel);
+        }
+
         let acia_irq = self.acia_keyboard.irq_requested() || self.acia_midi.irq_requested();
         self.mfp.set_gpip_input(4, !acia_irq);
         self.mfp.set_gpip_input(5, !self.wd1772.interrupt_requested());
@@ -935,6 +1034,7 @@ impl AtariSt {
             addr,
             shifter::addr::VIDEO_BASE_HIGH
                 | shifter::addr::VIDEO_BASE_MID
+                | shifter::addr::VIDEO_BASE_LOW
                 | shifter::addr::VIDEO_COUNTER_HIGH
                 | shifter::addr::VIDEO_COUNTER_MID
                 | shifter::addr::VIDEO_COUNTER_LOW
@@ -944,6 +1044,20 @@ impl AtariSt {
 
     fn is_blitter_addr(&self, addr: u32) -> bool {
         self.blitter_present && (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&addr)
+    }
+
+    /// Décode les lignes de sélection lecteur/face du connecteur disquette,
+    /// portées par le port A du YM2149 (voir la doc de
+    /// [`ym2149::Ym2149::port_a_output`]) — renvoie `(lecteur A sélectionné,
+    /// face)`. Sans ce câblage, `self.wd1772.side` resterait toujours à sa
+    /// valeur par défaut (0) quoi que TOS programme, rendant illisible tout
+    /// contenu situé sur la face 1 d'une disquette double face (le cas de
+    /// pratiquement tout logiciel ST réel au format `.st` 720 Ko).
+    fn floppy_drive_select(&self) -> (bool, u8) {
+        let port_a = self.ym2149.port_a_output();
+        let drive_a_selected = port_a & 0x02 == 0;
+        let side = !port_a & 0x01;
+        (drive_a_selected, side)
     }
 
     /// Vrai si `off` (offset relatif à [`STE_DMA_SOUND_BASE`]) correspond à
@@ -1162,8 +1276,51 @@ impl Bus for AtariSt {
                 return;
             }
         }
+        // `DMA_MODE` ($FF8606) : registre 16 bits réel (voir sa doc) — le
+        // sélecteur de registre FDC vit dans l'octet BAS du mot. TOS y
+        // accède quasi systématiquement en mot complet ; une composition
+        // octet par octet naïve (comme la voie générique ci-dessous) ne
+        // verrait que l'octet HAUT (toujours nul pour ces petites valeurs),
+        // laissant le sélecteur bloqué à 0 en permanence — d'où la
+        // sélection FDC entièrement cassée que cette interception corrige.
+        if masked == DMA_MODE {
+            // Délègue à `write8` (pas de logique dupliquée ici) : évite que
+            // les deux chemins divergent, comme cela avait déjà causé un
+            // oubli du bit 4 (mode compteur de secteurs DMA) la première
+            // fois que ce cas a été traité séparément ici.
+            self.write8(DMA_MODE, value as u8);
+            return;
+        }
+        // `FDC_DATA` ($FF8604) : registre 16 bits réel lui aussi (même
+        // remarque que `DMA_MODE` ci-dessus) — l'octet du registre WD1772
+        // réellement sélectionné (commande/statut/piste/secteur/donnée)
+        // vit dans l'octet BAS du mot, confirmé par Hatari (`fdc.c`,
+        // `FDC_DiskController_WriteWord` : `IoMem_ReadByte(0xff8605)`).
+        // TOS y accède quasi systématiquement en mot complet ; sans cette
+        // interception, la composition octet par octet générique ne
+        // verrait que l'octet HAUT (toujours nul), et TOUTE commande/
+        // valeur de piste/secteur/donnée écrite ainsi serait perdue —
+        // rendant toute lecture de disquette impossible.
+        if masked == FDC_DATA {
+            self.write8(FDC_DATA, value as u8);
+            return;
+        }
         self.write8(addr, (value >> 8) as u8);
         self.write8(addr.wrapping_add(1), value as u8);
+    }
+
+    /// Voir la doc de [`Self::write16`] sur `FDC_DATA` — même interception
+    /// symétrique en lecture (l'octet WD1772 réel vit dans l'octet BAS du
+    /// mot, la composition générique par défaut le mettrait dans l'octet
+    /// HAUT).
+    fn read16(&mut self, addr: u32) -> u16 {
+        let masked = addr & ADDR_MASK;
+        if masked == FDC_DATA {
+            return self.read8(FDC_DATA) as u16;
+        }
+        let hi = self.read8(addr) as u16;
+        let lo = self.read8(addr.wrapping_add(1)) as u16;
+        (hi << 8) | lo
     }
 
     fn write32(&mut self, addr: u32, value: u32) {
@@ -1256,20 +1413,30 @@ impl Bus for AtariSt {
                 return;
             }
             FDC_DATA => {
+                if self.dma_sector_count_mode {
+                    // Bit 4 de DMA_MODE posé : ce n'est PAS un registre du
+                    // WD1772, voir la doc de `dma_sector_count`.
+                    self.dma_sector_count = Some(value as u16);
+                    return;
+                }
                 if self.dma_register_select == wd1772::reg::COMMAND_STATUS {
-                    let mut channel = RamDmaChannel {
-                        ram: &mut self.ram,
-                        address: &mut self.dma_address,
-                    };
-                    self.wd1772
-                        .execute_command(value, self.floppy_a.as_deref_mut(), &mut channel);
+                    let (drive_a_selected, side) = self.floppy_drive_select();
+                    self.wd1772.side = side;
+                    let disk = if drive_a_selected { self.floppy_a.as_deref_mut() } else { None };
+                    // Ne fait plus que DÉMARRER la commande (positionne
+                    // BUSY) : c'est `AtariSt::tick` qui la fait progresser
+                    // et la termine réellement, voir la doc de
+                    // `Wd1772::execute_command`/`Wd1772::tick`.
+                    self.wd1772.execute_command(value, disk);
                 } else {
                     self.wd1772.write_simple_register(self.dma_register_select, value);
                 }
                 return;
             }
             DMA_MODE => {
-                self.dma_register_select = value & 0x03;
+                // Bits 1-2 (A1-A0), pas 0-1 — voir la doc de `DMA_MODE`.
+                self.dma_register_select = (value & 0x6) >> 1;
+                self.dma_sector_count_mode = value & 0x10 != 0;
                 return;
             }
             DMA_ADDR_HIGH => {
@@ -1441,6 +1608,8 @@ impl Bus for AtariSt {
         self.wd1772 = Wd1772::new();
         self.dma_register_select = 0;
         self.dma_address = 0;
+        self.dma_sector_count_mode = false;
+        self.dma_sector_count = None;
         self.blitter = Blitter::new();
         self.overlay = true;
         self.memory_conf = 0;
@@ -1456,6 +1625,10 @@ impl Bus for AtariSt {
 
     fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
         self.bus_fault.take()
+    }
+
+    fn has_pending_bus_fault(&self) -> bool {
+        self.bus_fault.is_some()
     }
 
     fn irq_level(&self) -> u8 {

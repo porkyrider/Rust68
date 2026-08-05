@@ -2,24 +2,37 @@
 
 use crate::addressing::{Operand, Size};
 use crate::bus::Bus;
-use crate::cpu::{ADDR_MASK, Cpu, ccr, sr};
+use crate::cpu::{ADDR_MASK, Cpu, CpuType, ccr, sr};
 
 /// Erreur d'exécution non gérée.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepError {
-    /// Opcode non encore implémenté.
+    /// Opcode ne correspondant à aucune instruction implémentée par les
+    /// `op_line_*`. Renvoyé en interne par [`Cpu::execute`] ; [`Cpu::step`]
+    /// ne le laisse PAS remonter à l'appelant — il dispatche l'exception
+    /// illegal instruction (vecteur 4) à la place, comme le silicium réel
+    /// (aucune distinction matérielle entre "réservé" et "pas encore codé
+    /// par ce projet") — voir le commentaire au site d'interception dans
+    /// `Cpu::step`. Cette variante ne reste donc visible que dans le code
+    /// interne, jamais observable via l'API publique.
     Unimplemented(u16),
-    /// Encodage d'adresse effective invalide.
+    /// Encodage d'adresse effective structurellement invalide pour
+    /// l'instruction par ailleurs reconnue (ex : mode d'adressage hors
+    /// périmètre, taille réservée). Même traitement qu'[`Self::Unimplemented`]
+    /// dans [`Cpu::step`] : dispatch vecteur 4 plutôt que de remonter à
+    /// l'appelant — même raisonnement (aucune distinction matérielle entre
+    /// les deux cas sur silicium réel).
     IllegalAddressing,
     /// Accès word/long à une adresse impaire : address error (vecteur 3).
     /// Champs : (adresse_impaire, is_write, pc_au_moment_de_l_acces)
     AddressError(u32, bool, u32),
     /// Double bus fault : un bus/address error est survenu en empilant le
     /// frame d'un précédent bus/address error (typiquement un pointeur de
-    /// pile hors de toute zone mappée). Sur 68000 réel, le CPU s'arrête
-    /// alors définitivement — voir [`crate::cpu::Cpu::halted`]. Renvoyé en
-    /// boucle par [`Cpu::step`] tant que ce champ reste vrai (seul un
-    /// `Cpu::reset` matériel le réinitialise).
+    /// pile hors de toute zone mappée). Sur 68000 réel (et sur Hatari,
+    /// vérifié) le CPU s'arrête alors définitivement — voir
+    /// [`crate::cpu::Cpu::halted`]. Renvoyé en boucle par [`Cpu::step`]
+    /// tant que ce champ reste vrai (seul un `Cpu::reset` matériel le
+    /// réinitialise).
     DoubleFault,
 }
 
@@ -372,6 +385,23 @@ impl Cpu {
         }
     }
 
+    /// Lit `Dn` ou `An` selon `is_addr` — utilisé par MOVEC (68010+), dont
+    /// le registre général source/dest est sélectionné par un bit A/D dans
+    /// le mot d'extension plutôt que par le champ mode/reg habituel de
+    /// `resolve_ea`.
+    fn d_or_a(&self, is_addr: bool, reg: usize) -> u32 {
+        if is_addr { self.a[reg] } else { self.d[reg] }
+    }
+
+    /// Écrit `value` dans `Dn` ou `An` selon `is_addr` — voir [`Self::d_or_a`].
+    fn set_d_or_a(&mut self, is_addr: bool, reg: usize, value: u32) {
+        if is_addr {
+            self.a[reg] = value;
+        } else {
+            self.d[reg] = value;
+        }
+    }
+
     pub fn step(&mut self, bus: &mut impl Bus) -> Result<u32, StepError> {
         // Double bus fault (voir `Cpu::halted`) : le 68000 réel reste figé
         // jusqu'à un /RESET matériel externe, il ne reprend jamais tout
@@ -388,6 +418,9 @@ impl Cpu {
             self.cycles = self.cycles.wrapping_add(cycles as u64);
             return Ok(cycles);
         }
+        // Bit T au tout début de CETTE instruction (avant exécution) — voir
+        // l'usage à la fin de cette fonction, doc de `Cpu::trace_pending`.
+        let trace_armed_before = self.sr & sr::T != 0;
         self.pending_address_error = None;
         self.fault_prefix = 4;
         // Enveloppe le bus pour appliquer les wait-states DRAM/vidéo (Steem
@@ -484,12 +517,24 @@ impl Cpu {
                 // entrant dans SON propre frame, donc self.sr.T ne peut
                 // être encore posé ici que si l'instruction s'est vraiment
                 // terminée normalement), le 68000 déclenche l'exception
-                // vecteur 9 avant l'instruction suivante. Le bit T est
-                // relu APRÈS l'instruction (pas celui du début) : une
-                // instruction qui pose T elle-même (MOVE/ANDI/ORI to SR,
-                // RTE qui dépile un SR avec T=1) déclenche donc la trace
-                // dès la fin de CETTE instruction — comportement réel
-                // documenté du 68000, pas une approximation.
+                // vecteur 9 avant l'instruction suivante — MAIS PAS si
+                // c'est CETTE instruction elle-même qui vient de poser T
+                // (MOVE/ANDI/ORI/EORI to SR, RTE qui dépile un SR avec
+                // T=1) : le silicium réel retarde alors d'une instruction
+                // supplémentaire, exactement comme pour le masque IPL (cf.
+                // `Cpu::sr_write_pending_delay`) — c'est le MÊME
+                // mécanisme matériel de bas niveau (le SR mis à jour ne
+                // devient pleinement effectif, T compris, qu'au prochain
+                // cycle d'instruction). Contre-vérifié en 2026-08-04 par
+                // exécution comparée pas à pas sous Hatari (breakpoints +
+                // dump registres) sur `Rick_Dangerous.stx` : une routine
+                // TOS pose T via `ORI #$a71f,SR` puis exécute ENCORE
+                // l'instruction suivante avant que la trace ne se
+                // déclenche (elle s'en sert pour piloter, instruction par
+                // instruction, une boucle de déchiffrement) — l'ancienne
+                // hypothèse "dès la fin de CETTE instruction" (non vérifiée
+                // à l'époque) causait un double bus fault que Hatari
+                // n'a jamais.
                 //
                 // La suite TomHarte capture volontairement l'effet d'UNE
                 // instruction sans enchaîner sur la trace même quand T=1
@@ -499,7 +544,7 @@ impl Cpu {
                 // vrai — c'est à l'appelant (une vraie boucle d'émulation,
                 // pas le harnais de conformité) d'appeler
                 // `take_trace_exception` s'il veut l'effet réel.
-                self.trace_pending = self.sr & sr::T != 0;
+                self.trace_pending = trace_armed_before && (self.sr & sr::T != 0);
                 Ok(self.finalize_cycles(&timed, cycles))
             }
             Err(StepError::AddressError(fault_addr, is_write, pc_at_fault)) => {
@@ -522,6 +567,37 @@ impl Cpu {
                 // tracked separately.
                 let table_cost = self.fault_prefix + self.ea_extra_cycles + 50;
                 Ok(self.finalize_cycles(&timed, table_cost))
+            }
+            // Opcode ne correspondant à aucune instruction implémentée. Sur
+            // silicium réel, TOUT motif de bits qui ne correspond à aucune
+            // instruction valide (qu'il soit officiellement "réservé" comme
+            // 0x4AFC, ou simplement un motif que ce projet n'a pas encore
+            // codé) déclenche l'exception illegal instruction (vecteur 4) —
+            // il n'y a pas de distinction matérielle entre les deux cas.
+            // Vérifié contre Hatari (son désassembleur, `w w <addr> <mot>`
+            // puis `d <addr>`, classe explicitement 0x4545 "illegal") :
+            // `Rick_Dangerous.stx` exécute délibérément un opcode réservé
+            // en jeu, probablement une astuce anti-piratage/anti-débogueur
+            // du même genre que le déclencheur "supervisor via ILLEGAL"
+            // déjà rencontré (0x4AFC) — sans ce dispatch, tout programme
+            // s'appuyant sur cette technique arrête net l'émulateur au lieu
+            // de continuer normalement comme sur le vrai matériel. La suite
+            // TomHarte continue de détecter toute vraie régression sur un
+            // opcode réellement valide (elle vérifie l'effet précis de
+            // chaque opcode couvert, pas seulement l'absence de crash).
+            // `IllegalAddressing` : même principe qu'`Unimplemented`
+            // ci-dessus, mais pour un opcode par ailleurs reconnu dont le
+            // mode d'adressage encodé est structurellement invalide pour
+            // CETTE instruction (ex: taille "11" réservée d'ORI combinée à
+            // un EA qui ne correspond à aucune des formes CCR/SR
+            // spéciales — 0x00E0, rencontré en jeu dans Rick_Dangerous.stx
+            // et vérifié "illegal" de la même façon contre Hatari). Même
+            // traitement : vecteur 4, pas de distinction avec le cas
+            // ci-dessus sur silicium réel.
+            Err(StepError::Unimplemented(_)) | Err(StepError::IllegalAddressing) => {
+                let pc_push = pc_after_opcode;
+                self.take_exception(&mut timed, 4, pc_push);
+                Ok(self.finalize_cycles(&timed, 34))
             }
             Err(e) => Err(e),
         }
@@ -582,6 +658,20 @@ impl Cpu {
         // MOVEP : 0000 ddd 1 0z 001 rrr (bit 8=1, mode=001, bit7=dir, bit6=size)
         if opcode & 0x0100 != 0 && mode == 0b001 {
             return self.op_movep(bus, opcode);
+        }
+
+        // MOVES (68010+ uniquement) : 0000 1110 ss mmm rrr — octet haut fixe
+        // 0x0E, disjoint de MOVEP/BTST-family ci-dessus/dessous (qui exigent
+        // tous bit8=1, alors que 0x0E00 l'a à 0). Sur un vrai MC68000 cet
+        // opcode n'existe pas : exception "illegal instruction" vecteur 4,
+        // même sonde de détection de CPU que MOVEC/RTD/MOVE from CCR.
+        if opcode & 0xFF00 == 0x0E00 {
+            if self.cpu_type == CpuType::M68000 {
+                let pc_push = self.pc.wrapping_sub(2);
+                self.take_exception(bus, 4, pc_push);
+                return Ok(34);
+            }
+            return self.op_moves(bus, opcode, mode, reg);
         }
 
         // BTST/BCHG/BCLR/BSET Dn,<ea> : 0000 rrr 1 tt mmm rrr
@@ -980,6 +1070,46 @@ impl Cpu {
         Ok(if long { 24 } else { 16 })
     }
 
+    /// MOVES (68010+) : `0000 1110 ss mmm rrr` + mot d'extension (bit 15 =
+    /// direction, 1=`Rn,<ea>` avec DFC / 0=`<ea>,Rn` avec SFC ; bit 11 =
+    /// A/D ; bits 14-12 = registre général). Privilégiée.
+    ///
+    /// Simplification assumée et documentée : `sfc`/`dfc` sont acceptés et
+    /// mémorisés (voir MOVEC) mais n'altèrent pas réellement l'espace
+    /// d'adressage accédé — le trait `Bus` actuel n'a pas de notion de
+    /// function code. Comportement fonctionnellement équivalent à MOVE pour
+    /// un espace d'adressage unique, exact tant qu'aucune MMU multi-espace
+    /// n'existe (à revisiter avec la PMMU NeXT). Coût en cycles non
+    /// calibré (aucun vecteur SingleStepTests disponible pour 68010) :
+    /// valeur plausible reprise du même ordre de grandeur qu'un MOVE
+    /// mémoire↔registre, PAS vérifiée contre une référence matérielle.
+    fn op_moves(&mut self, bus: &mut impl Bus, opcode: u16, mode: u16, reg: u16) -> Result<u32, StepError> {
+        if let Some(c) = self.check_privilege(bus) {
+            return Ok(c);
+        }
+        let size = Size::from_bits(opcode >> 6).ok_or(StepError::IllegalAddressing)?;
+        let ext = self.fetch_word(bus);
+        let to_memory = ext & 0x8000 != 0; // bit 15 : 1 = Rn -> <ea>, 0 = <ea> -> Rn
+        let is_addr = ext & 0x0800 != 0; // bit 11 : A/D
+        let greg = ((ext >> 12) & 0b111) as usize;
+        let greg_operand = if is_addr { Operand::AddrReg(greg) } else { Operand::DataReg(greg) };
+        let ea = self
+            .resolve_ea(bus, mode, reg, size)
+            .ok_or(StepError::IllegalAddressing)?;
+        let ea_extra = self.ea_extra_cycles;
+        if !matches!(ea, Operand::Memory(_)) {
+            return Err(StepError::IllegalAddressing);
+        }
+        if to_memory {
+            let val = ae_read(greg_operand.read(self, bus, size))?;
+            ae_write(ea.write(self, bus, size, val))?;
+        } else {
+            let val = ae_read(ea.read(self, bus, size))?;
+            ae_write(greg_operand.write(self, bus, size, val))?;
+        }
+        Ok(16 + ea_extra)
+    }
+
     fn op_move(&mut self, bus: &mut impl Bus, opcode: u16) -> Result<u32, StepError> {
         let size = match opcode >> 12 {
             0b0001 => Size::Byte,
@@ -1205,6 +1335,20 @@ impl Cpu {
                 return Ok(132);
             }
             0x4E75 => return self.op_rts(bus),
+            0x4E74 => {
+                // RTD (68010+ uniquement) : comme RTS, mais dépile ensuite
+                // un déplacement immédiat de la pile — libère les
+                // paramètres d'appel sans un ADD séparé côté appelant. Non
+                // privilégiée. Sur un vrai MC68000 cet opcode n'existe pas :
+                // exception "illegal instruction" vecteur 4, même sonde de
+                // détection de CPU que MOVEC/MOVE from CCR ci-dessus/dessous.
+                if self.cpu_type == CpuType::M68000 {
+                    let pc_push = self.pc.wrapping_sub(2);
+                    self.take_exception(bus, 4, pc_push);
+                    return Ok(34);
+                }
+                return self.op_rtd(bus);
+            }
             0x4E73 => {
                 // RTE (privilégié)
                 if let Some(c) = self.check_privilege(bus) {
@@ -1227,9 +1371,68 @@ impl Cpu {
                 // CPU au boot) exploite délibérément : installer un
                 // gestionnaire temporaire au vecteur 4 puis exécuter MOVEC
                 // pour le déclencher sur un 68000.
-                let pc_push = self.pc.wrapping_sub(2);
-                self.take_exception(bus, 4, pc_push);
-                return Ok(34);
+                if self.cpu_type == CpuType::M68000 {
+                    let pc_push = self.pc.wrapping_sub(2);
+                    self.take_exception(bus, 4, pc_push);
+                    return Ok(34);
+                }
+                if let Some(c) = self.check_privilege(bus) {
+                    return Ok(c);
+                }
+                // to_control : true = registre général → registre de
+                // contrôle (0x4E7B), false = l'inverse (0x4E7A).
+                let to_control = opcode == 0x4E7B;
+                let ext = self.fetch_word(bus);
+                let is_addr = ext & 0x8000 != 0; // bit 15 : A/D
+                let greg = ((ext >> 12) & 0b111) as usize;
+                let rc = ext & 0x0FFF;
+                // Sous-ensemble 68010 : SFC/DFC/USP/VBR. Les autres
+                // sélecteurs (CACR/CAAR 68020+...) restent "illegal
+                // instruction", comme un Rc réservé sur silicium réel.
+                // `greg_val` (valeur du registre général source, si
+                // to_control) est calculée AVANT toute référence mutable
+                // vers un registre de contrôle, pour ne pas garder cette
+                // dernière en vie à travers un nouvel appel à `self...`
+                // (emprunts disjoints impossibles à travers une méthode).
+                let greg_val = self.d_or_a(is_addr, greg);
+                match rc {
+                    0x000 => {
+                        if to_control {
+                            self.sfc = (greg_val & 0b111) as u8;
+                        } else {
+                            let v = self.sfc as u32;
+                            self.set_d_or_a(is_addr, greg, v);
+                        }
+                    }
+                    0x001 => {
+                        if to_control {
+                            self.dfc = (greg_val & 0b111) as u8;
+                        } else {
+                            let v = self.dfc as u32;
+                            self.set_d_or_a(is_addr, greg, v);
+                        }
+                    }
+                    0x800 => {
+                        if to_control {
+                            self.usp = greg_val;
+                        } else {
+                            self.set_d_or_a(is_addr, greg, self.usp);
+                        }
+                    }
+                    0x801 => {
+                        if to_control {
+                            self.vbr = greg_val;
+                        } else {
+                            self.set_d_or_a(is_addr, greg, self.vbr);
+                        }
+                    }
+                    _ => {
+                        let pc_push = self.pc.wrapping_sub(2);
+                        self.take_exception(bus, 4, pc_push);
+                        return Ok(34);
+                    }
+                }
+                return Ok(12);
             }
             0x4E76 => {
                 // TRAPV : exception vecteur 7 si V=1
@@ -1292,6 +1495,27 @@ impl Cpu {
         if opcode & 0b1111_1111_1100_0000 == 0b0100_1110_1100_0000 {
             return self.op_jmp(bus, mode, reg);
         }
+        // EXTB.L (68020+ uniquement) : 0100 1001 1100 0 rrr — étend
+        // directement un octet en long (le 68000/68010 n'ont que EXT.W et
+        // EXT.L, pas de forme octet→long directe). DOIT précéder LEA
+        // ci-dessous : le masque plus large de LEA (0100 aaa 111 mmm rrr,
+        // "aaa" wildcard) matche accidentellement ce même motif de bits en
+        // le lisant comme "LEA D0,A4" — un encodage LEA invalide (mode Dn
+        // direct n'est pas une adresse mémoire) qui échouerait sinon en
+        // `IllegalAddressing` avant même d'atteindre ce test-ci (trouvé en
+        // exécutant `tests/cpu68020.rs` : EXTB.L retournait bien cette
+        // erreur avec le check placé après CHK/EXT, plus loin).
+        if opcode & 0b1111_1111_1111_1000 == 0b0100_1001_1100_0000 {
+            if self.cpu_type != CpuType::M68020 {
+                let pc_push = self.pc.wrapping_sub(2);
+                self.take_exception(bus, 4, pc_push);
+                return Ok(34);
+            }
+            let r = reg as usize;
+            self.d[r] = self.d[r] as u8 as i8 as i32 as u32;
+            self.set_logic_flags(self.d[r], Size::Long);
+            return Ok(4);
+        }
         // LEA : 0100 aaa 111 mmm rrr
         if opcode & 0b1111_0001_1100_0000 == 0b0100_0001_1100_0000 {
             return self.op_lea(bus, opcode);
@@ -1344,6 +1568,129 @@ impl Cpu {
             // Dans la plage : effacer N,V,Z,C (comportement MAME)
             self.sr &= !0x000F;
             return Ok(10 + ea_extra);
+        }
+        // MULU.L/MULS.L (68020+ uniquement) : 0100 1100 00 mmm rrr + mot
+        // d'extension. Contrairement à MULU/MULS 16×16→32 ci-dessus
+        // (`op_line_c`), la forme .L est 32×32→32 (résultat tronqué,
+        // recherche de dépassement) ou 32×32→64 (paire Dh:Dl, jamais de
+        // dépassement) selon le mot d'extension : bits14-12=Dh, bit11=signé,
+        // bit10=résultat 64 bits (paire) si posé sinon 32 bits (Dl seul),
+        // bits2-0=Dl. Coûts en cycles non calibrés (aucun vecteur de
+        // conformité 68020 disponible) : valeur Motorola publiée reprise
+        // telle quelle, non vérifiée contre une référence matérielle.
+        if opcode & 0b1111_1111_1100_0000 == 0b0100_1100_0000_0000 {
+            if self.cpu_type != CpuType::M68020 {
+                let pc_push = self.pc.wrapping_sub(2);
+                self.take_exception(bus, 4, pc_push);
+                return Ok(34);
+            }
+            let src = self
+                .resolve_ea(bus, mode, reg, Size::Long)
+                .ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let src_val = ae_read(src.read(self, bus, Size::Long))?;
+            let ext = self.fetch_word(bus);
+            let dh = ((ext >> 12) & 0b111) as usize;
+            let signed = ext & 0x0800 != 0;
+            let result_64 = ext & 0x0400 != 0;
+            let dl = (ext & 0b111) as usize;
+            self.set_flag(ccr::C, false);
+            if signed {
+                let product = (self.d[dl] as i32 as i64) * (src_val as i32 as i64);
+                if result_64 {
+                    self.d[dh] = (product >> 32) as u32;
+                    self.d[dl] = product as u32;
+                    self.set_flag(ccr::N, product < 0);
+                    self.set_flag(ccr::Z, product == 0);
+                    self.set_flag(ccr::V, false);
+                } else {
+                    let truncated = product as i32;
+                    self.d[dl] = truncated as u32;
+                    self.set_flag(ccr::N, truncated < 0);
+                    self.set_flag(ccr::Z, truncated == 0);
+                    self.set_flag(ccr::V, product != truncated as i64);
+                }
+            } else {
+                let product = (self.d[dl] as u64) * (src_val as u64);
+                if result_64 {
+                    self.d[dh] = (product >> 32) as u32;
+                    self.d[dl] = product as u32;
+                    self.set_flag(ccr::N, product & 0x8000_0000_0000_0000 != 0);
+                    self.set_flag(ccr::Z, product == 0);
+                    self.set_flag(ccr::V, false);
+                } else {
+                    let truncated = product as u32;
+                    self.d[dl] = truncated;
+                    self.set_flag(ccr::N, truncated & 0x8000_0000 != 0);
+                    self.set_flag(ccr::Z, truncated == 0);
+                    self.set_flag(ccr::V, product != truncated as u64);
+                }
+            }
+            return Ok(if result_64 { 44 } else { 42 } + ea_extra);
+        }
+        // DIVU.L/DIVS.L (68020+ uniquement) : 0100 1100 01 mmm rrr + mot
+        // d'extension. bits14-12=Dr (reste), bit11=signé, bit10=dividende 64
+        // bits (paire Dr:Dq, Dr=poids fort) si posé sinon dividende 32 bits
+        // (Dq seul, Dr reçoit quand même le reste), bits2-0=Dq (quotient).
+        // Coûts en cycles non calibrés — mêmes réserves que MULU.L/MULS.L.
+        if opcode & 0b1111_1111_1100_0000 == 0b0100_1100_0100_0000 {
+            if self.cpu_type != CpuType::M68020 {
+                let pc_push = self.pc.wrapping_sub(2);
+                self.take_exception(bus, 4, pc_push);
+                return Ok(34);
+            }
+            let src = self
+                .resolve_ea(bus, mode, reg, Size::Long)
+                .ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let divisor = ae_read(src.read(self, bus, Size::Long))?;
+            if divisor == 0 {
+                // Voir la doc de DIVU/DIVS (op_line_8) : trap post-instruction.
+                self.take_exception(bus, 5, self.pc);
+                return Ok(ea_extra + 10);
+            }
+            let ext = self.fetch_word(bus);
+            let dr = ((ext >> 12) & 0b111) as usize;
+            let signed = ext & 0x0800 != 0;
+            let dividend_64 = ext & 0x0400 != 0;
+            let dq = (ext & 0b111) as usize;
+            self.set_flag(ccr::C, false);
+            if signed {
+                let dividend: i64 = if dividend_64 {
+                    ((self.d[dr] as i64) << 32) | (self.d[dq] as u32 as i64)
+                } else {
+                    self.d[dq] as i32 as i64
+                };
+                let divisor = divisor as i32 as i64;
+                let quotient = dividend / divisor;
+                let remainder = dividend % divisor;
+                let overflow = quotient > i32::MAX as i64 || quotient < i32::MIN as i64;
+                if !overflow {
+                    self.d[dr] = remainder as u32;
+                    self.d[dq] = quotient as u32;
+                    self.set_flag(ccr::N, quotient < 0);
+                    self.set_flag(ccr::Z, quotient == 0);
+                }
+                self.set_flag(ccr::V, overflow);
+            } else {
+                let dividend: u64 = if dividend_64 {
+                    ((self.d[dr] as u64) << 32) | (self.d[dq] as u64)
+                } else {
+                    self.d[dq] as u64
+                };
+                let divisor = divisor as u64;
+                let quotient = dividend / divisor;
+                let remainder = dividend % divisor;
+                let overflow = quotient > u32::MAX as u64;
+                if !overflow {
+                    self.d[dr] = remainder as u32;
+                    self.d[dq] = quotient as u32;
+                    self.set_flag(ccr::N, quotient & 0x8000_0000 != 0);
+                    self.set_flag(ccr::Z, quotient == 0);
+                }
+                self.set_flag(ccr::V, overflow);
+            }
+            return Ok(if dividend_64 { 84 } else { 44 } + ea_extra);
         }
         // EXT : 0100 1000 1 sz 000 rrr — doit précéder MOVEM (même zone de bits)
         if opcode & 0b1111_1111_1011_1000 == 0b0100_1000_1000_0000 {
@@ -1405,12 +1752,26 @@ impl Cpu {
         // ci-dessous (son masque plus large, 0xFF00, matcherait sinon aussi
         // cette plage et tenterait — à tort — un `Size::from_bits` invalide).
         // Sur un vrai MC68000 cet opcode n'existe pas : exception "illegal
-        // instruction" vecteur 4, comme MOVEC ci-dessus (même genre de sonde
-        // de détection de CPU par du logiciel, TOS y compris).
+        // instruction" vecteur 4, comme MOVEC ci-dessous (même genre de
+        // sonde de détection de CPU par du logiciel, TOS y compris).
         if opcode & 0b1111_1111_1100_0000 == 0b0100_0010_1100_0000 {
-            let pc_push = self.pc.wrapping_sub(2);
-            self.take_exception(bus, 4, pc_push);
-            return Ok(34);
+            if self.cpu_type == CpuType::M68000 {
+                let pc_push = self.pc.wrapping_sub(2);
+                self.take_exception(bus, 4, pc_push);
+                return Ok(34);
+            }
+            // Non privilégiée (contrairement à MOVE from SR) : lit le CCR
+            // (octet bas du SR, 5 bits significatifs), octet haut à 0 —
+            // même patron RMW que MOVE from SR ci-dessus.
+            let ccr = (self.sr & 0x00FF) as u32;
+            let ea = self
+                .resolve_ea(bus, mode, reg, Size::Word)
+                .ok_or(StepError::IllegalAddressing)?;
+            let ea_extra = self.ea_extra_cycles;
+            let is_dn = mode == 0b000;
+            ae_read(ea.read(self, bus, Size::Word))?;
+            ae_write(ea.write(self, bus, Size::Word, ccr))?;
+            return Ok(if is_dn { 6 } else { 8 + ea_extra });
         }
         // CLR : 0100 0010 SS mmm rrr
         if opcode & 0b1111_1111_0000_0000 == 0b0100_0010_0000_0000 {
@@ -1552,6 +1913,17 @@ impl Cpu {
         Ok(16)
     }
 
+    /// RTD (68010+) : `0100 1110 0111 0100` suivi d'un déplacement 16 bits
+    /// signé — dépile PC comme RTS, puis ajoute le déplacement à SP.
+    fn op_rtd(&mut self, bus: &mut impl Bus) -> Result<u32, StepError> {
+        let addr = bus.read32(self.sp() & ADDR_MASK);
+        self.set_sp(self.sp().wrapping_add(4));
+        let disp = self.fetch_word(bus) as i16 as i32;
+        self.set_sp((self.sp() as i32).wrapping_add(disp) as u32);
+        self.pc = addr;
+        Ok(16)
+    }
+
     fn op_rte(&mut self, bus: &mut impl Bus) -> Result<u32, StepError> {
         let new_sr = bus.read16(self.sp() & ADDR_MASK);
         self.set_sp(self.sp().wrapping_add(2));
@@ -1680,6 +2052,18 @@ impl Cpu {
                     } else {
                         bus.read16(addr & ADDR_MASK) as i16 as i32 as u32
                     };
+                    // Silicium réel : le CPU avorte au PREMIER accès fautif,
+                    // il ne continue pas sur les registres suivants (sinon la
+                    // vérification générique post-instruction de `Cpu::step`
+                    // ne verrait que le DERNIER échec, pas le premier, et
+                    // l'instruction se comporterait comme si elle avait
+                    // pleinement réussi). Ne PAS consommer l'indicateur ici
+                    // (`has_pending_bus_fault`, pas `take_bus_fault`) : cette
+                    // vérification générique doit encore le voir pour
+                    // déclencher l'exception.
+                    if bus.has_pending_bus_fault() {
+                        break;
+                    }
                     if i < 8 {
                         new_d[i] = val;
                     } else {
@@ -1738,6 +2122,12 @@ impl Cpu {
                         } else {
                             bus.write16(addr & ADDR_MASK, val as u16);
                         }
+                        // Voir le commentaire équivalent côté mem→registres :
+                        // avorte au premier accès fautif plutôt que de
+                        // continuer sur les registres suivants.
+                        if bus.has_pending_bus_fault() {
+                            break;
+                        }
                     }
                 }
                 self.a[reg as usize] = addr;
@@ -1764,6 +2154,12 @@ impl Cpu {
                             bus.write32(addr & ADDR_MASK, val);
                         } else {
                             bus.write16(addr & ADDR_MASK, val as u16);
+                        }
+                        // Voir le commentaire équivalent côté mem→registres :
+                        // avorte au premier accès fautif plutôt que de
+                        // continuer sur les registres suivants.
+                        if bus.has_pending_bus_fault() {
+                            break;
                         }
                         addr = addr.wrapping_add(size.bytes());
                     }

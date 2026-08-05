@@ -1,7 +1,9 @@
-//! Tailles d'opération et modes d'adressage effectifs (EA) du 68000.
+//! Tailles d'opération et modes d'adressage effectifs (EA) du 68000, étendus
+//! au sous-ensemble 68020 du mot d'extension "complet" (voir
+//! [`Cpu::resolve_indexed_full`]).
 
 use crate::bus::Bus;
-use crate::cpu::{ADDR_MASK, Cpu};
+use crate::cpu::{ADDR_MASK, CpuType, Cpu};
 
 /// Taille d'une opération.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,9 +311,10 @@ impl Cpu {
                 let addr = (self.a[reg] as i32).wrapping_add(disp) as u32;
                 Some(Operand::Memory(addr))
             }
-            // (d8,An,Xn) : adressage indexé avec déplacement 8 bits
+            // (d8,An,Xn) : adressage indexé avec déplacement 8 bits (ou mot
+            // d'extension "complet" 68020, voir `resolve_indexed`).
             0b110 => {
-                let addr = self.resolve_indexed(bus, self.a[reg]);
+                let addr = self.resolve_indexed(bus, self.a[reg])?;
                 Some(Operand::Memory(addr))
             }
             // Modes 0b111 : la sélection se fait sur `reg`.
@@ -340,7 +343,7 @@ impl Cpu {
                 // (d8,PC,Xn) : indexé relatif au PC — espace programme (FC=2/6)
                 0b011 => {
                     let base = self.pc;
-                    let addr = self.resolve_indexed(bus, base);
+                    let addr = self.resolve_indexed(bus, base)?;
                     self.ea_is_pc_relative = true;
                     Some(Operand::Memory(addr))
                 }
@@ -360,9 +363,24 @@ impl Cpu {
     }
 
     /// Résout un mode indexé `(d8,base,Xn)` : un mot d'extension fournit le
-    /// registre d'index, sa taille (W/L), et un déplacement signé sur 8 bits.
-    fn resolve_indexed(&mut self, bus: &mut impl Bus, base: u32) -> u32 {
+    /// registre d'index, sa taille (W/L), et un déplacement signé sur 8
+    /// bits — le format "bref", seul existant sur 68000/68010. Sur 68020,
+    /// si le bit 8 du mot d'extension est posé, délègue au format "complet"
+    /// ([`Self::resolve_indexed_full`]) : silicium 68000/68010 réel
+    /// n'inspecte jamais ce bit, donc le gate est sur `cpu_type`, pas
+    /// seulement sur le bit lui-même — un programme 68000 qui produirait
+    /// accidentellement un mot avec ce bit posé serait quand même décodé en
+    /// bref, comme sur le vrai matériel.
+    ///
+    /// Renvoie `None` si le mot d'extension complet désigne une indirection
+    /// mémoire (`I/IS != 000`, pré/post-indexée) — non implémentée (voir
+    /// [`Self::resolve_indexed_full`]) ; l'appelant (`resolve_ea`) propage
+    /// ce `None` comme n'importe quel encodage d'EA invalide.
+    fn resolve_indexed(&mut self, bus: &mut impl Bus, base: u32) -> Option<u32> {
         let ext = self.fetch_word(bus);
+        if ext & 0x0100 != 0 && self.cpu_type == CpuType::M68020 {
+            return self.resolve_indexed_full(bus, base, ext);
+        }
         let is_addr = ext & 0x8000 != 0; // bit 15 : A/D
         let xreg = ((ext >> 12) & 0b111) as usize;
         let long = ext & 0x0800 != 0; // bit 11 : W/L
@@ -375,6 +393,63 @@ impl Cpu {
             index_full as u16 as i16 as i32
         };
 
-        (base as i32).wrapping_add(disp).wrapping_add(index) as u32
+        Some((base as i32).wrapping_add(disp).wrapping_add(index) as u32)
+    }
+
+    /// Résout le mot d'extension "complet" du 68020 (bit 8 posé), sous-
+    /// ensemble sans indirection mémoire (`I/IS == 000` uniquement — voir
+    /// la doc de [`Self::resolve_indexed`]) :
+    /// - bits 15/14-12/11 : D/A, Xn, W/L — identiques au format bref.
+    /// - bits 10-9 : SCALE (×1/×2/×4/×8), appliqué à l'index une fois
+    ///   étendu en signe selon W/L (`index << scale`, PAS l'inverse — le
+    ///   68020 étend le signe d'abord, puis met à l'échelle).
+    /// - bit 7 : BS (Base register Suppress) — le registre de base (`base`,
+    ///   passé par l'appelant : An ou PC) est ignoré si posé.
+    /// - bit 6 : IS (Index Suppress) — le terme d'index (registre ET
+    ///   échelle) est ignoré si posé.
+    /// - bits 5-4 : taille du déplacement de base (00 réservé, traité
+    ///   défensivement comme nul ; 01 nul ; 10 mot signé ; 11 long),
+    ///   mots d'extension supplémentaires consommés via `fetch_word`/
+    ///   `fetch_long` (même mécanisme que `(d16,An)`/`(xxx).L` ailleurs
+    ///   dans ce fichier).
+    /// - bits 2-0 : I/IS — sélection d'indirection mémoire. Seul `000`
+    ///   (aucune indirection, adressage indexé "complet" direct) est géré
+    ///   ici ; toute autre valeur (pré/post-indexée) renvoie `None` — hors
+    ///   périmètre pour l'instant (rare en pratique, lecture mémoire
+    ///   intermédiaire + déplacement externe propre à ajouter dans un
+    ///   passage ultérieur).
+    fn resolve_indexed_full(&mut self, bus: &mut impl Bus, base: u32, ext: u16) -> Option<u32> {
+        if ext & 0b111 != 0 {
+            return None; // indirection mémoire : non implémentée
+        }
+        let is_addr = ext & 0x8000 != 0;
+        let xreg = ((ext >> 12) & 0b111) as usize;
+        let long = ext & 0x0800 != 0;
+        let scale = (ext >> 9) & 0b11;
+        let base_suppress = ext & 0x0080 != 0;
+        let index_suppress = ext & 0x0040 != 0;
+        let bd_size = (ext >> 4) & 0b11;
+
+        let base_disp: i32 = match bd_size {
+            0b10 => self.fetch_word(bus) as i16 as i32,
+            0b11 => self.fetch_long(bus) as i32,
+            // 00 (réservé) et 01 (nul) : aucun mot supplémentaire, terme nul.
+            _ => 0,
+        };
+
+        let base_term: i32 = if base_suppress { 0 } else { base as i32 };
+        let index_term: i32 = if index_suppress {
+            0
+        } else {
+            let index_full = if is_addr { self.a[xreg] } else { self.d[xreg] };
+            let index = if long {
+                index_full as i32
+            } else {
+                index_full as u16 as i16 as i32
+            };
+            index << scale
+        };
+
+        Some(base_term.wrapping_add(base_disp).wrapping_add(index_term) as u32)
     }
 }

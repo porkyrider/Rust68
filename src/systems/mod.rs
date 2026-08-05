@@ -7,3 +7,6 @@
 
 #[cfg(feature = "atari-st")]
 pub mod atari_st;
+
+#[cfg(feature = "next")]
+pub mod next;

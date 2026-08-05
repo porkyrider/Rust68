@@ -415,9 +415,14 @@ Step-Out), Type II (Read/Write Sector, mono et multi-secteur) et Type IV
   accepter plusieurs formats sans coupler le board à l'un d'eux :
   `RawDiskImage` pour le `.st` brut (secteurs linéaires), `stx::StxImage`
   pour un lecteur `.stx` (Pasti) minimal — reverse-engineé par inspection
-  directe de fichiers réels (aucune spec officielle consultée), ignore
-  volontairement toute la métadonnée de protection (fuzzy bits, timing),
-  extrait juste le contenu brut des secteurs.
+  directe de fichiers réels puis recoupé avec la doc publique du format et
+  Hatari, expose désormais `bit_position` (position réelle du champ ID sur
+  la piste physique, utilisée par `Wd1772::cycles_to_target_sector` pour un
+  calcul de latence rotationnelle fidèle même sur une piste au formatage
+  non standard) — et `msa::parse` pour `.msa` (Magic Shadow Archiver,
+  simple conteneur compressé RLE piste par piste, décompressé en mémoire
+  vers une `RawDiskImage` équivalente, aucune métadonnée de protection dans
+  ce format).
 - Transfert Type II via le trait `DmaChannel` (`pull`/`push` un octet à la
   fois) : le WD1772 ne connaît pas la RAM, seulement le disque et ce
   canal — c'est au board de l'implémenter avec accès à sa RAM.

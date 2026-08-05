@@ -81,6 +81,21 @@ pub trait Bus {
         None
     }
 
+    /// Comme [`Self::take_bus_fault`], mais sans consommer l'indicateur —
+    /// pour les instructions à accès multiples (MOVEM) qui doivent
+    /// s'arrêter au PREMIER accès fautif (silicium réel : le CPU avorte
+    /// immédiatement, il ne continue pas à essayer les registres suivants
+    /// de la liste) tout en laissant [`Self::take_bus_fault`] intact pour
+    /// que la vérification générique post-instruction de `Cpu::step`
+    /// déclenche l'exception normalement, avec l'adresse du PREMIER accès
+    /// fautif plutôt que du dernier.
+    ///
+    /// Implémentation par défaut : jamais de fault en attente (cohérent
+    /// avec [`Self::take_bus_fault`] par défaut).
+    fn has_pending_bus_fault(&self) -> bool {
+        false
+    }
+
     /// Niveau d'interruption (IPL2-0) actuellement demandé par les
     /// périphériques au CPU : 0 = aucune demande, 1-6 = niveau normal,
     /// 7 = non masquable (NMI). Consulté par [`crate::cpu::Cpu::step`] avant
@@ -201,6 +216,10 @@ impl<'b, B: Bus> Bus for TracingBus<'b, B> {
         self.inner.take_bus_fault()
     }
 
+    fn has_pending_bus_fault(&self) -> bool {
+        self.inner.has_pending_bus_fault()
+    }
+
     fn irq_level(&self) -> u8 {
         self.inner.irq_level()
     }
@@ -287,6 +306,10 @@ impl<'b, B: Bus> Bus for TimedBus<'b, B> {
 
     fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
         self.inner.take_bus_fault()
+    }
+
+    fn has_pending_bus_fault(&self) -> bool {
+        self.inner.has_pending_bus_fault()
     }
 
     fn irq_level(&self) -> u8 {

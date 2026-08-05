@@ -44,7 +44,7 @@ pub mod trace;
 
 pub use addressing::{Operand, Size};
 pub use bus::{Bus, TimedBus, TraceSink, TracingBus};
-pub use cpu::{ADDR_MASK, Cpu, ccr, sr};
+pub use cpu::{ADDR_MASK, Cpu, CpuType, ccr, sr};
 pub use execute::StepError;
 
 /// Bus mémoire plat de 16 Mo (tout l'espace d'adressage du 68000).

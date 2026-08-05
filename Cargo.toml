@@ -24,6 +24,9 @@ serde_json = "1"
 # `cargo build --features atari-st` pour rapatrier/compiler l'Atari ST.
 atari-st = []
 sdl2-frontend = ["dep:sdl2", "atari-st"]
+# Échafaudage NeXT (`src/systems/next/`) — pas encore un système fonctionnel,
+# voir la doc du module.
+next = []
 
 [[bin]]
 name = "atari_st_sdl2"

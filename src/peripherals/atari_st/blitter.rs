@@ -7,12 +7,23 @@
 //! bord de ligne (`ENDMASK1/2/3`) et parcours par incréments X/Y.
 //!
 //! Ce module modélise la puce **seule** : [`Blitter::execute`] prend un
-//! `Bus` (pour lire/écrire la RAM aux adresses source/destination) et
-//! exécute le blit dans son intégralité en un seul appel (modèle
-//! synchrone "instantané", comme le WD1772 — `BUSY` n'est jamais
-//! observable par polling). C'est au board de mapper
-//! [`Blitter::read`]/[`Blitter::write`] dans son `Bus` et de déclencher
-//! `execute` quand le bit START du registre de contrôle est écrit.
+//! `Bus` (pour lire/écrire la RAM aux adresses source/destination) et fait
+//! progresser le blit — en mode HOG (bit 6 de CONTROL posé), il s'exécute
+//! intégralement en un seul appel ; en mode partagé (non-HOG, le cas le
+//! plus courant en pratique), un seul appel ne traite qu'une tranche de 16
+//! mots avant de rendre la main (voir [`Self::execute`] et sa doc pour le
+//! détail), `BUSY` restant posé entre deux tranches — donc bien observable
+//! par polling dans ce mode, contrairement à une version antérieure de ce
+//! module entièrement synchrone. C'est au board de mapper
+//! [`Blitter::read`]/[`Blitter::write`] dans son `Bus`, de déclencher un
+//! premier appel à `execute` quand le bit START du registre de contrôle
+//! est écrit, ET de rappeler `execute` périodiquement pour faire progresser
+//! un blit non-HOG en pause — voir `systems::atari_st::AtariSt::tick`, qui
+//! le fait de façon autonome au rythme du CPU (accès bus partagés avec le
+//! CPU, comme sur silicium réel), plutôt que de dépendre uniquement d'une
+//! réécriture logicielle de CONTROL (ce qui fonctionnait par coïncidence
+//! avec la boucle `TAS.B` de TOS mais pas avec un simple `BTST.B` de
+//! scrutation).
 //!
 //! Registres et sémantique des bits `FXSR`/`NFSR`/`SMUDGE`/HOP/numéro de
 //! ligne de demi-teinte croisés contre plusieurs sources indépendantes :
@@ -25,9 +36,13 @@
 //! le mot de demi-teinte courant (modélisé ci-dessous).
 //!
 //! ## Limitations connues (v1) — à prendre avec prudence
-//! - Pas de vol de cycles bus au CPU modélisé (mode "hog"/"steal" du bit
-//!   de contrôle) : le blit s'exécute intégralement de façon synchrone,
-//!   indépendamment de ce bit.
+//! - Le vol de cycles bus au CPU (mode "hog"/"steal") EST modélisé (voir
+//!   ci-dessus et `systems::atari_st::AtariSt::tick`/`BLITTER_SLICE_CYCLES`),
+//!   mais par une approximation à gros grain : une tranche fixe de 16 mots
+//!   entre deux passages de bus (`WORDS_PER_SLICE` dans [`Self::execute`]),
+//!   pas un décompte exact des accès bus individuels comme le fait Hatari
+//!   en mode "cycle exact" (64 accès bus précis, potentiellement 63 dans
+//!   un cas de bug documenté du silicium réel — non reproduit ici).
 //! - Aucune suite de test équivalente à TomHarte n'existe pour le
 //!   Blitter : la logique est vérifiée par recoupement documentaire
 //!   (datasheet, BLIT_FAQ.TXT, code source de Hatari) plutôt que contre
@@ -168,10 +183,14 @@ impl Blitter {
         }
     }
 
-    /// Vrai si le bit BUSY du registre de contrôle est actif. Dans ce
-    /// modèle synchrone, toujours faux juste après [`Self::execute`] (voir
-    /// limitations du module) : exposé surtout pour cohérence avec le
-    /// registre réel.
+    /// Vrai si le bit BUSY du registre de contrôle est actif. En mode HOG,
+    /// toujours faux juste après [`Self::execute`] (le blit s'y termine en
+    /// un seul appel). En mode non-HOG, peut rester vrai entre deux
+    /// tranches d'un blit encore en cours — voir la doc du module — donc
+    /// bien observable par polling dans ce mode, contrairement à un modèle
+    /// entièrement synchrone. Consulté par
+    /// `systems::atari_st::AtariSt::tick` pour savoir s'il faut continuer à
+    /// faire progresser le blit.
     pub fn busy(&self) -> bool {
         self.control & CONTROL_BUSY != 0
     }

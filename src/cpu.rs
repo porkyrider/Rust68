@@ -1,8 +1,11 @@
 //! Cœur du CPU Motorola 68000.
 //!
-//! Cette première version cible le **MC68000** d'origine (Atari ST, Amiga 500…).
-//! Les variantes ultérieures (68010, 68020…) s'appuieront sur le même modèle de
-//! registres, étendu au besoin.
+//! Cible d'abord le **MC68000** d'origine (Atari ST, Amiga 500…), étendu
+//! depuis à un sous-ensemble du **68010** (voir [`CpuType`]) — première
+//! étape vers 68020/68030/68040 en vue d'émuler les ordinateurs NeXT. Le
+//! 68000 reste le comportement par défaut ([`Cpu::new`]) : aucune
+//! différence de comportement pour un appelant qui ne touche jamais
+//! `cpu_type`.
 
 use crate::bus::Bus;
 
@@ -35,6 +38,27 @@ pub mod sr {
 
 /// Indice du pointeur de pile dans le banc de registres d'adresse (A7).
 const SP: usize = 7;
+
+/// Variante du cœur 68k émulée par un [`Cpu`] donné.
+///
+/// Choisie à l'exécution (pas une feature Cargo) — un même binaire peut
+/// faire tourner un système 68000 et un système 68010+ selon la valeur de
+/// [`Cpu::cpu_type`], sur le même modèle que `AtariModel`/`MachineProfile`
+/// (voir `systems::atari_st::model`). Réservé pour l'instant à 68000/68010/
+/// 68020 (sous-ensemble, voir `addressing::resolve_indexed_full` et
+/// `execute::op_line_4` pour ce qui est couvert) : 68030/68040 viendront
+/// s'ajouter ici au fur et à mesure, pas avant d'être réellement
+/// implémentés (pas de variante "stub" non testée).
+///
+/// Variantes déclarées dans l'ordre de capacité croissante : `PartialOrd`/
+/// `Ord` permettent des gates `cpu_type >= CpuType::M68020` qui restent
+/// valables telles quelles à l'ajout d'une variante suivante.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CpuType {
+    M68000,
+    M68010,
+    M68020,
+}
 
 /// État complet d'un cœur 68000.
 ///
@@ -107,9 +131,14 @@ pub struct Cpu {
     /// sans instrumenter chaque site d'appel séparément.
     pub exception_log: std::collections::VecDeque<(u8, u32, u32, bool, u32, u64)>,
     /// Vrai si la dernière instruction s'est terminée normalement (aucune
-    /// exception interne) avec le bit T du SR posé : le 68000 réel
-    /// déclencherait l'exception trace (vecteur 9) avant l'instruction
-    /// suivante. `step` ne la prend PAS lui-même (la suite de conformité
+    /// exception interne) avec le bit T du SR posé — MAIS seulement s'il
+    /// était déjà posé AVANT cette instruction : si c'est l'instruction
+    /// elle-même qui vient de le poser (MOVE/ANDI/ORI/EORI to SR, RTE),
+    /// le 68000 réel exécute encore une instruction de plus avant que la
+    /// trace ne devienne effective (même mécanisme matériel que le délai
+    /// du masque IPL, voir [`Cpu::sr_write_pending_delay`]) — vérifié
+    /// empiriquement contre Hatari en 2026-08-04 (voir `Cpu::step`).
+    /// `step` ne prend PAS la trace elle-même (la suite de conformité
     /// TomHarte capture volontairement l'effet d'une seule instruction
     /// sans enchaîner sur la trace, même quand T=1 en entrée) : c'est à
     /// l'appelant de vérifier ce champ après chaque `step` et d'appeler
@@ -136,10 +165,38 @@ pub struct Cpu {
     /// select. Sur silicium 68000 réel, le CPU s'arrête alors
     /// définitivement (HALT) : seul un `/RESET` matériel externe peut
     /// l'en sortir — il ne "rebondit" pas indéfiniment sur le vecteur.
+    ///
+    /// Vérifié contre Hatari (`src/cpu/newcpu.c`, `Exception()` :
+    /// `if ((m68k_areg(regs,7) & 1) || exception_in_exception < 0)
+    /// cpu_halt(CPU_HALT_DOUBLE_FAULT);`) : c'est le même arrêt immédiat,
+    /// pas un rebond — un temps envisagé sur la foi du code de CLK
+    /// (github.com/TomHarte/CLK), qui rebondit indéfiniment faute d'avoir
+    /// jamais codé ce cas (TODO reconnu par son auteur), mais CLK n'est
+    /// pas la référence faisant autorité ici, Hatari si (`Rick_Dangerous.
+    /// stx` boote sous Hatari, confirmé sans aucun bus/address error dans
+    /// tout son démarrage via `--trace cpu_exception` — la divergence était
+    /// donc en amont, dans notre propre émulation, pas dans ce mécanisme).
     /// [`Cpu::step`] renvoie [`crate::execute::StepError::DoubleFault`]
     /// tant que ce champ reste vrai, plutôt que de continuer à exécuter
     /// des instructions dans un état indéfini.
     pub halted: bool,
+    /// Variante 68k émulée — voir [`CpuType`]. Détermine notamment la forme
+    /// des frames d'exception (mot de format sur 68010+) et la
+    /// disponibilité de MOVEC/MOVES/RTD.
+    pub cpu_type: CpuType,
+    /// Vector Base Register (68010+ uniquement) : décale la table de
+    /// vecteurs d'exception de `vbr` octets au lieu de la fixer à l'adresse
+    /// 0 — voir [`Cpu::take_exception`]/[`Cpu::take_interrupt`]. Vaut 0 par
+    /// défaut, ce qui reproduit exactement l'adressage fixe du 68000 même
+    /// quand ce champ est lu sans condition sur `cpu_type` (voir ces
+    /// méthodes). Non affecté par [`Cpu::reset`] : sur silicium réel, le
+    /// vecteur de reset lui-même est toujours lu à l'adresse physique 0,
+    /// VBR n'étant pas encore initialisé à ce stade.
+    pub vbr: u32,
+    /// Source Function Code (68010+, MOVEC/MOVES). 3 bits utiles.
+    pub sfc: u8,
+    /// Destination Function Code (68010+, MOVEC/MOVES). 3 bits utiles.
+    pub dfc: u8,
 }
 
 /// Taille max de `Cpu::exception_log` — assez pour couvrir plusieurs frames
@@ -177,6 +234,10 @@ impl Cpu {
             trace_pending: false,
             sr_write_pending_delay: false,
             halted: false,
+            cpu_type: CpuType::M68000,
+            vbr: 0,
+            sfc: 0,
+            dfc: 0,
         }
     }
 
@@ -261,8 +322,18 @@ impl Cpu {
     /// Déclenche une exception : empile SR + PC sur la pile superviseur,
     /// passe en superviseur, désactive la trace, saute au vecteur.
     ///
-    /// `vector` est le numéro de vecteur (0–255). L'adresse du vecteur = vector*4.
-    /// `pc_to_push` est le PC à empiler (adresse de retour ou adresse de l'instruction).
+    /// `vector` est le numéro de vecteur (0–255). L'adresse du vecteur =
+    /// `vbr + vector*4` (sur 68000, `vbr` vaut toujours 0 : adressage fixe
+    /// identique à avant).
+    ///
+    /// Frame "courte" : sur 68000, SR (mot) + PC (mot long), 6 octets. Sur
+    /// 68010+, un 3ᵉ mot de format est ajouté après le PC — nibble de
+    /// format à 0 (frame standard) suivi du numéro de vecteur sur 12 bits
+    /// (`(vector << 2) & 0x0FFF`) — voir le M68000 Family Programmer's
+    /// Reference Manual, addendum 68010. Gate explicite sur `cpu_type`
+    /// plutôt qu'une réduction "no-op" comme pour `vbr` : ce mot
+    /// supplémentaire est réellement 2 octets de pile en plus que le 68000
+    /// n'a jamais écrits.
     pub fn take_exception(&mut self, bus: &mut impl Bus, vector: u32, pc_to_push: u32) {
         // Passer en mode superviseur sans changer les flags CCR
         let saved_sr = self.sr;
@@ -273,20 +344,33 @@ impl Cpu {
         self.sr = (saved_sr | sr::S) & !sr::T;
         self.sr &= 0xA71F; // masque bits réservés
 
-        // Empiler SR puis PC (format: SR word, PC longword)
-        let sp = self.a[SP].wrapping_sub(6);
+        let is_68010 = self.cpu_type == CpuType::M68010;
+        // Empiler SR puis PC (format: SR word, PC longword), plus le mot de
+        // format sur 68010+.
+        let frame_size = if is_68010 { 8 } else { 6 };
+        let sp = self.a[SP].wrapping_sub(frame_size);
         self.a[SP] = sp;
         bus.write16(sp & ADDR_MASK, saved_sr);
         bus.write32((sp + 2) & ADDR_MASK, pc_to_push);
+        if is_68010 {
+            let format_word = (vector << 2) & 0x0FFF; // format 0 (nibble haut) + offset de vecteur
+            bus.write16((sp + 6) & ADDR_MASK, format_word as u16);
+        }
         // Un bus/address error ici (pile hors de toute zone mappée) est un
-        // double bus fault — voir la doc de `Cpu::halted`.
+        // double bus fault — voir la doc de `Cpu::halted`. Vérifié contre
+        // Hatari (`src/cpu/newcpu.c`, `Exception()`) : c'est exactement son
+        // comportement aussi (`cpu_halt(CPU_HALT_DOUBLE_FAULT)`, arrêt
+        // immédiat, PAS de rebond/nouvelle tentative) — Hatari ne diffère
+        // de nous qu'en amont, sur le modèle mémoire (RAM "flottante" en
+        // dessous de 4 Mo qui ne déclenche quasiment jamais ce cas en
+        // pratique), pas sur la réaction une fois le cas atteint.
         if bus.take_bus_fault().is_some() {
             self.halted = true;
             return;
         }
 
         // Lire l'adresse du vecteur
-        let vec_addr = (vector * 4) & ADDR_MASK;
+        let vec_addr = self.vbr.wrapping_add(vector * 4) & ADDR_MASK;
         let new_pc = bus.read32(vec_addr);
         if bus.take_bus_fault().is_some() {
             self.halted = true;
@@ -360,6 +444,18 @@ impl Cpu {
         explicit_pc: Option<u32>,
         is_instruction_fetch: bool,
     ) {
+        // 68010+ : le frame bus/address error change de forme (frame "long"
+        // de 29 mots, format $8 — capture l'état interne complet du CPU pour
+        // permettre de relancer l'instruction fautive après correction par
+        // le gestionnaire, la base de la pagination à la demande avec une
+        // MMU). Non implémenté : aucun système 68010+ ne déclenche encore de
+        // bus/address error dans ce projet (pas de MMU), donc échec bruyant
+        // plutôt qu'un frame 68000 silencieusement faux — à reprendre quand
+        // le travail PMMU (NeXT) le justifiera.
+        assert!(
+            self.cpu_type == CpuType::M68000,
+            "frame bus/address error 68010+ (format long) non implémentée"
+        );
         let saved_sr = self.sr;
         // Sur le 68000 réel, le pipeline effectue un préfetch avant tout write cycle,
         // avançant le PC de 2 supplémentaires par rapport aux read cycles.
@@ -407,15 +503,17 @@ impl Cpu {
         bus.write16(sp.wrapping_add(8) & ADDR_MASK, saved_sr);
         bus.write32(sp.wrapping_add(10) & ADDR_MASK, pc_at_access);
         // Un bus/address error en empilant CE frame (pile hors de toute zone
-        // mappée) est un double bus fault — voir la doc de `Cpu::halted`.
-        // Sur silicium réel le CPU s'arrête alors définitivement au lieu de
-        // rebondir indéfiniment sur le vecteur avec un frame corrompu.
+        // mappée) est un double bus fault — voir la doc de `Cpu::halted` :
+        // vérifié contre Hatari (`src/cpu/newcpu.c`, `Exception()`,
+        // `m68k_areg(regs,7) & 1 || exception_in_exception < 0` →
+        // `cpu_halt(CPU_HALT_DOUBLE_FAULT)`), c'est un arrêt immédiat chez
+        // lui aussi, jamais un rebond.
         if bus.take_bus_fault().is_some() {
             self.halted = true;
             return;
         }
 
-        let new_pc = bus.read32(vector * 4);
+        let new_pc = bus.read32(self.vbr.wrapping_add(vector * 4) & ADDR_MASK);
         if bus.take_bus_fault().is_some() {
             self.halted = true;
             return;
@@ -475,13 +573,23 @@ impl Cpu {
         self.sr = (self.sr & !sr::IPL_MASK) | ((level as u16) << 8);
         self.sr &= 0xA71F;
 
-        let sp = self.a[SP].wrapping_sub(6);
+        // Frame courte : voir la doc de `Cpu::take_exception` pour le mot de
+        // format 68010+ (identique ici, juste dupliqué car la prise
+        // d'interruption a son propre empilement — le vecteur, nécessaire
+        // au mot de format, n'est connu qu'après le cycle d'acquittement).
+        let is_68010 = self.cpu_type == CpuType::M68010;
+        let frame_size = if is_68010 { 8 } else { 6 };
+        let sp = self.a[SP].wrapping_sub(frame_size);
         self.a[SP] = sp;
         bus.write16(sp & ADDR_MASK, saved_sr);
         bus.write32(sp.wrapping_add(2) & ADDR_MASK, self.pc);
 
         let vector = bus.irq_ack(level) as u32;
-        let vec_addr = (vector * 4) & ADDR_MASK;
+        if is_68010 {
+            let format_word = (vector << 2) & 0x0FFF;
+            bus.write16(sp.wrapping_add(6) & ADDR_MASK, format_word as u16);
+        }
+        let vec_addr = self.vbr.wrapping_add(vector * 4) & ADDR_MASK;
         let new_pc = bus.read32(vec_addr);
         self.log_exception(vector, self.pc, 0, false, new_pc);
         self.pc = new_pc;

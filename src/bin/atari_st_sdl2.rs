@@ -6,7 +6,7 @@
 //! ST), pas à être un émulateur ST "complet" (pas de configuration GUI, pas
 //! de sauvegarde d'état, pas de support disquette en écriture persistante).
 //!
-//! Usage : `atari_st_sdl2 [--model <nom>] <rom.img> [disque.stx|disque.st]`
+//! Usage : `atari_st_sdl2 [--model <nom>] <rom.img> [disque.stx|disque.msa|disque.st]`
 //!
 //! `--model` sélectionne un profil de machine du lexique
 //! `systems::atari_st::model` (RAM, présence du Blitter — voir sa doc pour
@@ -39,6 +39,8 @@
 //!   des évènements synthétiques parasites selon la plateforme/le backend) :
 //!   le curseur hôte reste donc visible, en plus de celui dessiné par GEM.
 
+use rust68::peripherals::atari_st::drive_sound::{wav, DriveSound, Slot};
+use rust68::peripherals::atari_st::msa;
 use rust68::peripherals::atari_st::stx::StxImage;
 use rust68::peripherals::atari_st::wd1772::{FloppyDisk, RawDiskImage};
 use rust68::systems::atari_st::AtariSt;
@@ -86,7 +88,7 @@ const DEFAULT_MODEL: &str = "1040ste";
 
 fn usage(program: &str) -> ! {
     eprintln!(
-        "Usage : {program} [--model <nom>] [--ntsc] <rom.img> [disque.stx|disque.st]\n\n\
+        "Usage : {program} [--model <nom>] [--ntsc] <rom.img> [disque.stx|disque.msa|disque.st]\n\n\
          Modèles disponibles (--model, casse indifférente) : 520st, 1040st, megast, \
          520ste, 1040ste (défaut), megaste — voir `systems::atari_st::model` pour le \
          détail de chaque profil (RAM, Blitter…).\n\
@@ -335,6 +337,7 @@ fn main() {
     // Lecture démarrée seulement une fois `AUDIO_QUEUE_PRIME_WATERMARK`
     // atteint (voir sa doc) — pas de `resume()` ici.
     let mut audio_started = false;
+    let mut drive_sound = load_drive_sound(AUDIO_SAMPLE_RATE as u32);
 
     let mut event_pump = sdl_context.event_pump().expect("event pump");
     let mut mouse_left = false;
@@ -1000,6 +1003,24 @@ fn main() {
             }
 
             st.tick(cycles);
+            // `Cpu::step` ne prend jamais lui-même l'exception trace
+            // (vecteur 9, bit T du SR) — voir sa doc : c'est à l'appelant de
+            // vérifier `trace_pending` et d'appeler `take_trace_exception`
+            // avant le step suivant. Ce binaire ne le faisait pas du tout
+            // jusqu'ici : un programme qui pose T=1 (technique de
+            // protection anti-copie/anti-débogueur courante — trouvé en
+            // creusant pourquoi Rick_Dangerous.stx ne démarre jamais)
+            // continuait alors à s'exécuter normalement au lieu de
+            // déclencher un trap après CHAQUE instruction comme le
+            // silicium réel, dérivant rapidement vers un flux d'exécution
+            // qui n'a plus rien à voir avec le programme réel.
+            if cpu.trace_pending {
+                cpu.take_trace_exception(&mut st);
+            }
+            let drive_sound_events = st.wd1772.take_sound_events();
+            if !drive_sound_events.is_empty() {
+                drive_sound.handle_events(&drive_sound_events);
+            }
             step_count += 1;
 
             if watch_video {
@@ -1105,6 +1126,14 @@ fn main() {
                 let dma_lr = st.next_dma_sample(AUDIO_SAMPLE_RATE as u32);
                 let ym_levels = st.ym2149.take_averaged_levels();
                 let (raw_left, raw_right) = mix_sample(ym_levels, dma_lr);
+                // Bruitage mécanique du lecteur : ambiance de fond mono,
+                // mélangée telle quelle sur les deux canaux (pas de
+                // filtre DC ni de gain Microwire — c'est un bruit
+                // d'origine mécanique, pas un signal issu du LMC1992).
+                let mut drive_sample = [0i32];
+                drive_sound.mix_into(&mut drive_sample);
+                let raw_left = raw_left + drive_sample[0] as f32;
+                let raw_right = raw_right + drive_sample[0] as f32;
                 // DC retiré AVANT le gain (artefact de notre mixage PSG, pas
                 // un phénomène physique que le volume devrait mettre à
                 // l'échelle) ; gain lissé APRÈS (voir sa doc plus haut).
@@ -1344,13 +1373,19 @@ fn render_frame(st: &AtariSt, texture: &mut sdl2::render::Texture) {
     });
 }
 
-/// Charge un fichier disquette, `.stx` (détecté par sa signature `"RSY\0"`)
-/// ou `.st` brut (géométrie devinée à partir de la taille du fichier — les
-/// formats les plus courants sont testés dans l'ordre).
+/// Charge un fichier disquette, `.stx` (détecté par sa signature `"RSY\0"`),
+/// `.msa` (détecté par sa signature `$0E0F`) ou `.st` brut (géométrie
+/// devinée à partir de la taille du fichier — les formats les plus courants
+/// sont testés dans l'ordre).
 fn load_floppy(path: &str) -> Result<Box<dyn FloppyDisk>, String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     if data.len() >= 4 && &data[0..4] == b"RSY\0" {
         return StxImage::parse(&data)
+            .map(|img| Box::new(img) as Box<dyn FloppyDisk>)
+            .map_err(|e| format!("{e:?}"));
+    }
+    if data.len() >= 2 && data[0] == 0x0E && data[1] == 0x0F {
+        return msa::parse(&data)
             .map(|img| Box::new(img) as Box<dyn FloppyDisk>)
             .map_err(|e| format!("{e:?}"));
     }
@@ -1380,6 +1415,56 @@ fn load_floppy(path: &str) -> Result<Box<dyn FloppyDisk>, String> {
     Ok(Box::new(RawDiskImage::new(
         data, geometry.0, geometry.1, geometry.2,
     )))
+}
+
+/// Charge le bruitage mécanique du lecteur de disquette (démarrage moteur,
+/// bourdonnement, clic de pas, bourdonnement de recherche) depuis un
+/// dossier contenant les 4 fichiers `.wav` du jeu Steem SSE
+/// `3rdparty/DriveSound` (même jeu que celui utilisé par le projet
+/// compagnon Stay). Chemin par défaut : `ressources (local)/drivesound`
+/// (dossier local non versionné, voir `.gitignore`), surchargeable via
+/// `RUST68_DRIVE_SOUND_DIR`. Chaque fichier manquant ou invalide dégrade
+/// silencieusement vers un slot muet plutôt que d'empêcher le démarrage —
+/// ce bruitage n'est qu'une ambiance, pas une fonctionnalité requise.
+fn load_drive_sound(sample_rate: u32) -> DriveSound {
+    let dir = std::env::var("RUST68_DRIVE_SOUND_DIR")
+        .unwrap_or_else(|_| "ressources (local)/drivesound".to_string());
+    let mut drive_sound = DriveSound::new(sample_rate);
+    for (slot, filename) in [
+        (Slot::Start, "drive_startup.wav"),
+        (Slot::Motor, "drive_spin.wav"),
+        (Slot::Step, "drive_click.wav"),
+        (Slot::Seek, "drive_seek.wav"),
+    ] {
+        let path = format!("{dir}/{filename}");
+        match std::fs::read(&path) {
+            Ok(data) => match wav::load_wav_mono_i16(&data) {
+                Ok((mut samples, native_rate)) => {
+                    if slot == Slot::Step {
+                        // `drive_click.wav` (jeu Steem SSE 3rdparty/DriveSound)
+                        // a une longue traîne de résonance (~200 ms au total,
+                        // encore ~15 % de l'amplitude crête à 80 ms) — mesuré
+                        // par analyse d'enveloppe. Sur une piste protégée
+                        // relisant piste par piste (Rick_Dangerous.stx), les
+                        // commandes Step séparées arrivent toutes les 6-7 ms :
+                        // sans rognage, chaque nouveau clic coupe net la
+                        // traîne encore forte du précédent, ce qui sonne comme
+                        // un magma continu plutôt qu'un train de clics
+                        // distincts et réguliers. On ne garde donc que les
+                        // ~60 premières ms (attaque + rebond mécanique
+                        // secondaire vers 40-55 ms), qui suffisent seules à
+                        // rendre le clic reconnaissable.
+                        let keep = (native_rate as usize * 60) / 1000;
+                        samples.truncate(keep);
+                    }
+                    drive_sound.set_sample(slot, samples, native_rate);
+                }
+                Err(e) => eprintln!("Bruitage disquette : {path} illisible ({e}), slot muet"),
+            },
+            Err(e) => eprintln!("Bruitage disquette : {path} absent ({e}), slot muet"),
+        }
+    }
+    drive_sound
 }
 
 /// Traduit un `Scancode` SDL2 en scancode ST (make code, bit 7 = 0 — voir
