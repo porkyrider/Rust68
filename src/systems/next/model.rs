@@ -1,30 +1,30 @@
-//! Lexique des modèles NeXT visés à terme — même principe que
-//! `systems::atari_st::model` (une machine réelle précise, pas une taille
-//! de RAM choisie au hasard), mais ici purement déclaratif pour l'instant :
-//! voir la doc de [`super`] pour ce qui manque avant qu'un [`NextModel`]
-//! puisse réellement démarrer quoi que ce soit.
+//! Lexicon of NeXT models targeted eventually — same principle as
+//! `systems::atari_st::model` (a specific real machine, not a randomly
+//! chosen RAM size), but here purely declarative for now: see the doc of
+//! [`super`] for what is missing before a [`NextModel`] can actually boot
+//! anything.
 
-/// Un modèle connu de la gamme NeXT.
+/// A known model in the NeXT lineup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextModel {
-    /// 1988 : le "Cube" d'origine, 68030 + FPU 68882 + PMMU 68851 externe.
+    /// 1988: the original "Cube", 68030 + 68882 FPU + external 68851 PMMU.
     Cube,
-    /// 1990 : boîtier pizza-box, même cœur 68030 que le Cube.
+    /// 1990: pizza-box case, same 68030 core as the Cube.
     Station,
-    /// 1991 : Cube avec carte "Turbo", 68040 (MMU/FPU intégrés).
+    /// 1991: Cube with "Turbo" board, 68040 (integrated MMU/FPU).
     CubeTurbo,
-    /// 1991 : Station avec carte "Turbo", 68040.
+    /// 1991: Station with "Turbo" board, 68040.
     StationTurbo,
 }
 
 impl NextModel {
-    /// Variante de cœur 68k correspondante — seule caractéristique câblée
-    /// pour l'instant (voir la doc de [`super`]). `M68010` est un jalon
-    /// intermédiaire : ni 68030 (PMMU intégrée) ni 68040 (MMU+FPU intégrés)
-    /// ne sont encore implémentés dans [`crate::cpu`], donc aucune variante
-    /// ne peut aujourd'hui représenter fidèlement un vrai NeXT — cette
-    /// méthode existe pour que le câblage futur (RAM, ROM, ...) ait déjà un
-    /// point d'accroche cohérent avec `systems::atari_st::model`.
+    /// Corresponding 68k core variant — the only characteristic wired up
+    /// for now (see the doc of [`super`]). `M68010` is an intermediate
+    /// milestone: neither 68030 (integrated PMMU) nor 68040 (integrated
+    /// MMU+FPU) are implemented yet in [`crate::cpu`], so no variant can
+    /// today faithfully represent a real NeXT — this method exists so that
+    /// future wiring (RAM, ROM, ...) already has a consistent hook point
+    /// with `systems::atari_st::model`.
     pub fn cpu_type(self) -> crate::CpuType {
         crate::CpuType::M68010
     }

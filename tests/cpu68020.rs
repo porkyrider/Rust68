@@ -1,20 +1,20 @@
-//! Tests unitaires ciblés du sous-ensemble 68020 (`CpuType::M68020`).
+//! Targeted unit tests for the 68020 subset (`CpuType::M68020`).
 //!
-//! Comme pour `tests/cpu68010.rs`, aucun vecteur SingleStepTests n'existe
-//! pour le 68020 (vérifié auprès de github.com/SingleStepTests/680x0 : seul
-//! `68000/` y est publié) — tests écrits à la main. La partie adressage
-//! (mot d'extension "complet", voir `Cpu::resolve_indexed_full`) est la
-//! plus risquée (aucun filet de conformité automatique, beaucoup de
-//! combinaisons SCALE/BS/IS/BD SIZE) : couverte par une matrice
-//! systématique plutôt que 2-3 sondages ponctuels.
+//! As with `tests/cpu68010.rs`, no SingleStepTests vectors exist for the
+//! 68020 (verified against github.com/SingleStepTests/680x0: only
+//! `68000/` is published there) — tests written by hand. The addressing
+//! part (the "full" extension word, see `Cpu::resolve_indexed_full`) is the
+//! riskiest part (no automated conformance safety net, many
+//! SCALE/BS/IS/BD SIZE combinations): covered by a systematic matrix
+//! rather than 2-3 spot checks.
 //!
-//! Toutes les adresses effectives sont observées via LEA (aucun accès
-//! mémoire réel nécessaire pour vérifier le calcul d'adresse lui-même).
+//! All effective addresses are observed via LEA (no actual memory access
+//! needed to verify the address computation itself).
 
 use rust68::{Bus, Cpu, CpuType, FlatBus};
 
-/// Construit un CPU + bus, place un vecteur de reset (SSP=0x2000, PC=0x0400)
-/// puis charge `words` à partir de 0x0400 — même convention que
+/// Builds a CPU + bus, sets up a reset vector (SSP=0x2000, PC=0x0400)
+/// then loads `words` starting at 0x0400 — same convention as
 /// `tests/cpu68010.rs`/`tests/instructions.rs`.
 fn setup(words: &[u16]) -> (Cpu, FlatBus) {
     let mut bus = FlatBus::new();
@@ -31,12 +31,12 @@ fn setup(words: &[u16]) -> (Cpu, FlatBus) {
     (cpu, bus)
 }
 
-// --- Adressage : mot d'extension complet, LEA (d8,A0,Xn),A1 = 0x43F0 -------
-// (aaa=001=A1, opmode=111, mode=110, base An=000=A0 — voir la doc du fichier)
+// --- Addressing: full extension word, LEA (d8,A0,Xn),A1 = 0x43F0 -------
+// (aaa=001=A1, opmode=111, mode=110, base An=000=A0 — see this file's doc)
 
 #[test]
 fn full_format_scale_x1_x2_x4_x8() {
-    // bit11=1(long) bit8=1(complet) bits5-4=01(BD nul) — seul SCALE varie.
+    // bit11=1(long) bit8=1(full) bits5-4=01(BD null) — only SCALE varies.
     let cases = [(0x0910u16, 1u32), (0x0B10, 2), (0x0D10, 4), (0x0F10, 8)];
     for (ext, expected_shift) in cases {
         let (mut cpu, mut bus) = setup(&[0x43F0, ext]);
@@ -49,56 +49,56 @@ fn full_format_scale_x1_x2_x4_x8() {
 
 #[test]
 fn full_format_base_suppress() {
-    // IS=1 (index supprimé) fixe ; BD=$0050 (mot) ; BS varie.
+    // IS=1 (index suppressed) fixed; BD=$0050 (word); BS varies.
     let (mut cpu, mut bus) = setup(&[0x43F0, 0x0960, 0x0050]); // BS=0
     cpu.a[0] = 0x0000_2000;
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 0x0000_2050, "BS=0 : base incluse");
+    assert_eq!(cpu.a[1], 0x0000_2050, "BS=0: base included");
 
     let (mut cpu, mut bus) = setup(&[0x43F0, 0x09E0, 0x0050]); // BS=1
     cpu.a[0] = 0x0000_2000;
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 0x0000_0050, "BS=1 : base supprimée, ignorée même non nulle");
+    assert_eq!(cpu.a[1], 0x0000_0050, "BS=1: base suppressed, ignored even when non-zero");
 }
 
 #[test]
 fn full_format_index_suppress() {
-    // BS=1 (base supprimée) fixe, BD nul ; index D0=3 (long, ×1) ; IS varie.
+    // BS=1 (base suppressed) fixed, BD null; index D0=3 (long, x1); IS varies.
     let (mut cpu, mut bus) = setup(&[0x43F0, 0x0990]); // IS=0
     cpu.a[0] = 0x9999_0000;
     cpu.d[0] = 3;
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 3, "IS=0 : index inclus");
+    assert_eq!(cpu.a[1], 3, "IS=0: index included");
 
     let (mut cpu, mut bus) = setup(&[0x43F0, 0x09D0]); // IS=1
     cpu.a[0] = 0x9999_0000;
     cpu.d[0] = 3;
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 0, "IS=1 : index supprimé, ignoré même non nul");
+    assert_eq!(cpu.a[1], 0, "IS=1: index suppressed, ignored even when non-zero");
 }
 
 #[test]
-fn full_format_bd_size_nul_mot_long() {
-    // BS=1 et IS=1 fixes (adresse = BD seul).
-    let (mut cpu, mut bus) = setup(&[0x43F0, 0x01D0]); // BD nul
+fn full_format_bd_size_null_word_long() {
+    // BS=1 and IS=1 fixed (address = BD alone).
+    let (mut cpu, mut bus) = setup(&[0x43F0, 0x01D0]); // BD null
     cpu.a[0] = 0x1234_5678;
     cpu.d[0] = 0xFFFF_FFFF;
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 0, "BD nul");
+    assert_eq!(cpu.a[1], 0, "BD null");
 
-    let (mut cpu, mut bus) = setup(&[0x43F0, 0x01E0, 0xFFF0]); // BD mot, négatif
+    let (mut cpu, mut bus) = setup(&[0x43F0, 0x01E0, 0xFFF0]); // BD word, negative
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 0xFFFF_FFF0, "BD mot : extension de signe (-16)");
+    assert_eq!(cpu.a[1], 0xFFFF_FFF0, "BD word: sign-extended (-16)");
 
     let (mut cpu, mut bus) = setup(&[0x43F0, 0x01F0, 0x0001, 0x2345]); // BD long
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 0x0001_2345, "BD long : 32 bits complets");
+    assert_eq!(cpu.a[1], 0x0001_2345, "BD long: full 32 bits");
 }
 
 #[test]
-fn full_format_tous_les_termes_non_nuls() {
-    // BS=0, IS=0, SCALE=×4, BD=$0100 (mot) — détecte une erreur
-    // d'accumulation/de signe qui ne se verrait pas si un terme était nul.
+fn full_format_all_terms_nonzero() {
+    // BS=0, IS=0, SCALE=x4, BD=$0100 (word) — catches an accumulation/
+    // sign error that wouldn't show up if a term were zero.
     let (mut cpu, mut bus) = setup(&[0x43F0, 0x0D20, 0x0100]);
     cpu.a[0] = 0x0001_0000;
     cpu.d[0] = 5;
@@ -108,46 +108,46 @@ fn full_format_tous_les_termes_non_nuls() {
 }
 
 #[test]
-fn full_format_index_long_vs_mot() {
-    // D0 = 0x0001_FFF0 : en mot (bits bas $FFF0 = -16 signé) vs en long
-    // (0x0001FFF0, positif) — deux résultats très différents, détecte un
-    // mauvais traitement du bit W/L de l'index.
-    let (mut cpu, mut bus) = setup(&[0x43F0, 0x0190]); // bit11=0 (mot)
+fn full_format_index_long_vs_word() {
+    // D0 = 0x0001_FFF0: as a word (low bits $FFF0 = -16 signed) vs as a
+    // long (0x0001FFF0, positive) — two very different results, catches a
+    // mishandled W/L index bit.
+    let (mut cpu, mut bus) = setup(&[0x43F0, 0x0190]); // bit11=0 (word)
     cpu.a[0] = 0;
     cpu.d[0] = 0x0001_FFF0;
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 0xFFFF_FFF0, "index mot : signe étendu depuis les 16 bits bas");
+    assert_eq!(cpu.a[1], 0xFFFF_FFF0, "word index: sign-extended from the low 16 bits");
 
     let (mut cpu, mut bus) = setup(&[0x43F0, 0x0990]); // bit11=1 (long)
     cpu.a[0] = 0;
     cpu.d[0] = 0x0001_FFF0;
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.a[1], 0x0001_FFF0, "index long : valeur 32 bits complète");
+    assert_eq!(cpu.a[1], 0x0001_FFF0, "long index: full 32-bit value");
 }
 
 #[test]
-fn full_format_via_pc_relatif() {
-    // LEA (d8,PC,Xn),A1 = 0x43FB (mode=111,reg=011) — `resolve_indexed` est
-    // partagée par les deux appelants, vérifie que le format complet
-    // fonctionne aussi via ce second chemin.
-    let (mut cpu, mut bus) = setup(&[0x43FB, 0x0160, 0x0010]); // IS=1, BD=$0010 mot
+fn full_format_via_pc_relative() {
+    // LEA (d8,PC,Xn),A1 = 0x43FB (mode=111,reg=011) — `resolve_indexed` is
+    // shared by both callers; verifies that the full format also works
+    // through this second path.
+    let (mut cpu, mut bus) = setup(&[0x43FB, 0x0160, 0x0010]); // IS=1, BD=$0010 word
     cpu.step(&mut bus).unwrap();
-    // base = PC juste après l'opcode = 0x0402 (avant tout mot d'extension).
+    // base = PC right after the opcode = 0x0402 (before any extension word).
     assert_eq!(cpu.a[1], 0x0402 + 0x0010);
 }
 
 #[test]
-fn full_format_indirection_memoire_non_geree() {
-    // I/IS=001 (bits2-0) : indirection mémoire, hors périmètre — ne doit
-    // pas calculer une adresse silencieusement fausse. En interne,
-    // `execute` échoue explicitement (`StepError::IllegalAddressing`),
-    // mais `step` ne le laisse pas remonter : comme le silicium réel (et
-    // vérifié contre Hatari), il dispatche l'exception illegal instruction
-    // (vecteur 4) plutôt que de planter — voir le commentaire au site
-    // d'interception dans `Cpu::step`.
+fn full_format_memory_indirection_not_supported() {
+    // I/IS=001 (bits2-0): memory indirection, out of scope — must not
+    // silently compute a wrong address. Internally, `execute` fails
+    // explicitly (`StepError::IllegalAddressing`), but `step` does not let
+    // it propagate: like real silicon (and verified against Hatari), it
+    // dispatches the illegal instruction exception (vector 4) instead of
+    // panicking — see the comment at the interception site in
+    // `Cpu::step`.
     let (mut cpu, mut bus) = setup(&[0x43F0, 0x0911]);
     cpu.a[0] = 0x1000;
-    bus.write32(0x10, 0x0000_0600); // vecteur 4
+    bus.write32(0x10, 0x0000_0600); // vector 4
     cpu.step(&mut bus).unwrap();
     assert_eq!(cpu.pc, 0x0600);
 }
@@ -155,14 +155,14 @@ fn full_format_indirection_memoire_non_geree() {
 // --- EXTB.L ------------------------------------------------------------------
 
 #[test]
-fn extb_l_octet_positif_et_negatif() {
+fn extb_l_positive_and_negative_byte() {
     let (mut cpu, mut bus) = setup(&[0x49C0]); // EXTB.L D0
-    cpu.d[0] = 0x1234_5642; // octet bas = 0x42 (positif)
+    cpu.d[0] = 0x1234_5642; // low byte = 0x42 (positive)
     cpu.step(&mut bus).unwrap();
     assert_eq!(cpu.d[0], 0x0000_0042);
 
     let (mut cpu, mut bus) = setup(&[0x49C0]);
-    cpu.d[0] = 0x1234_56F0; // octet bas = 0xF0 (négatif, -16)
+    cpu.d[0] = 0x1234_56F0; // low byte = 0xF0 (negative, -16)
     cpu.step(&mut bus).unwrap();
     assert_eq!(cpu.d[0], 0xFFFF_FFF0);
 }
@@ -170,7 +170,7 @@ fn extb_l_octet_positif_et_negatif() {
 // --- MULU.L / MULS.L -----------------------------------------------------
 
 #[test]
-fn mulu_l_32x32_vers_32() {
+fn mulu_l_32x32_to_32() {
     let (mut cpu, mut bus) = setup(&[0x4C01, 0x0000]); // MULU.L D1,D0
     cpu.d[0] = 1000;
     cpu.d[1] = 2000;
@@ -179,7 +179,7 @@ fn mulu_l_32x32_vers_32() {
 }
 
 #[test]
-fn muls_l_operande_negatif() {
+fn muls_l_negative_operand() {
     let (mut cpu, mut bus) = setup(&[0x4C01, 0x0800]); // MULS.L D1,D0 (bit11=1)
     cpu.d[0] = 0xFFFF_FFFB; // -5
     cpu.d[1] = 3;
@@ -188,54 +188,54 @@ fn muls_l_operande_negatif() {
 }
 
 #[test]
-fn mulu_l_resultat_64_bits() {
-    // MULU.L D1,D2:D0 (Dh=D2, Dl=D0, résultat 64 bits)
+fn mulu_l_64_bit_result() {
+    // MULU.L D1,D2:D0 (Dh=D2, Dl=D0, 64-bit result)
     let (mut cpu, mut bus) = setup(&[0x4C01, 0x2400]);
     cpu.d[0] = 0x0001_0000;
     cpu.d[1] = 0x0001_0000;
     cpu.step(&mut bus).unwrap();
-    assert_eq!(cpu.d[2], 1, "poids fort");
-    assert_eq!(cpu.d[0], 0, "poids faible");
+    assert_eq!(cpu.d[2], 1, "high word");
+    assert_eq!(cpu.d[0], 0, "low word");
 }
 
 // --- DIVU.L / DIVS.L -----------------------------------------------------
 
 #[test]
-fn divu_l_32_sur_32_avec_reste() {
-    // DIVU.L D1,D2:D0 (Dr=D2, Dq=D0, dividende 32 bits)
+fn divu_l_32_over_32_with_remainder() {
+    // DIVU.L D1,D2:D0 (Dr=D2, Dq=D0, 32-bit dividend)
     let (mut cpu, mut bus) = setup(&[0x4C41, 0x2000]);
     cpu.d[0] = 100;
     cpu.d[1] = 7;
     cpu.step(&mut bus).unwrap();
     assert_eq!(cpu.d[0], 14, "quotient");
-    assert_eq!(cpu.d[2], 2, "reste");
+    assert_eq!(cpu.d[2], 2, "remainder");
 }
 
 #[test]
-fn divu_l_64_sur_32() {
-    // DIVU.L D1,D2:D0 avec bit10=1 (dividende 64 bits, Dr:Dq = D2:D0 = 10)
+fn divu_l_64_over_32() {
+    // DIVU.L D1,D2:D0 with bit10=1 (64-bit dividend, Dr:Dq = D2:D0 = 10)
     let (mut cpu, mut bus) = setup(&[0x4C41, 0x2400]);
     cpu.d[0] = 10;
     cpu.d[2] = 0;
     cpu.d[1] = 3;
     cpu.step(&mut bus).unwrap();
     assert_eq!(cpu.d[0], 3, "quotient");
-    assert_eq!(cpu.d[2], 1, "reste");
+    assert_eq!(cpu.d[2], 1, "remainder");
 }
 
 #[test]
-fn divu_l_par_zero_leve_vecteur_5() {
+fn divu_l_by_zero_raises_vector_5() {
     let (mut cpu, mut bus) = setup(&[0x4C41, 0x2000]);
-    cpu.d[1] = 0; // diviseur nul
-    bus.write32(0x14, 0x0000_0600); // vecteur 5
+    cpu.d[1] = 0; // zero divisor
+    bus.write32(0x14, 0x0000_0600); // vector 5
     cpu.step(&mut bus).unwrap();
     assert_eq!(cpu.pc, 0x0600);
 }
 
-// --- Régression 68000/68010 ------------------------------------------------
+// --- 68000/68010 regression ------------------------------------------------
 
 #[test]
-fn nouvelles_instructions_illegal_sur_68000_et_68010() {
+fn new_instructions_illegal_on_68000_and_68010() {
     for cpu_type in [CpuType::M68000, CpuType::M68010] {
         for words in [
             [0x49C0u16, 0].as_slice(),           // EXTB.L
@@ -244,7 +244,7 @@ fn nouvelles_instructions_illegal_sur_68000_et_68010() {
         ] {
             let (mut cpu, mut bus) = setup(words);
             cpu.cpu_type = cpu_type;
-            bus.write32(0x10, 0x0000_0600); // vecteur 4
+            bus.write32(0x10, 0x0000_0600); // vector 4
             cpu.step(&mut bus).unwrap();
             assert_eq!(cpu.pc, 0x0600, "cpu_type={cpu_type:?} words={words:?}");
         }
@@ -252,15 +252,15 @@ fn nouvelles_instructions_illegal_sur_68000_et_68010() {
 }
 
 #[test]
-fn mot_d_extension_complet_ignore_sur_68010_decode_en_bref() {
-    // Sous 68010, le bit 8 du mot d'extension n'est jamais inspecté : LEA
-    // (d8,A0,Xn),A1 avec un mot qui SERAIT un format complet sous 68020 doit
-    // être décodé comme format bref (déplacement 8 bits signé = octet bas).
-    let (mut cpu, mut bus) = setup(&[0x43F0, 0x0910]); // octet bas = 0x10
+fn full_extension_word_ignored_on_68010_decodes_as_brief() {
+    // On the 68010, bit 8 of the extension word is never inspected: LEA
+    // (d8,A0,Xn),A1 with a word that WOULD be a full format under 68020 must
+    // be decoded as a brief format (8-bit signed displacement = low byte).
+    let (mut cpu, mut bus) = setup(&[0x43F0, 0x0910]); // low byte = 0x10
     cpu.cpu_type = CpuType::M68010;
     cpu.a[0] = 0x0000_1000;
-    cpu.d[0] = 1; // index bref : ajouté tel quel (word, non étendu ici car =1)
+    cpu.d[0] = 1; // brief index: added as-is (word, not extended here since =1)
     cpu.step(&mut bus).unwrap();
-    // Format bref : addr = A0 + index(D0, mot signé) + déplacement 8 bits ($10).
+    // Brief format: addr = A0 + index(D0, signed word) + 8-bit displacement ($10).
     assert_eq!(cpu.a[1], 0x0000_1000 + 1 + 0x10);
 }

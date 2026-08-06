@@ -1,89 +1,88 @@
-//! Lexique des modèles de la gamme Atari ST/STE/Mega ST/Mega STE.
+//! Lexicon of models in the Atari ST/STE/Mega ST/Mega STE lineup.
 //!
-//! Principe général (valable pour n'importe quelle machine qu'on émule,
-//! pas seulement celle-ci) : émuler UNE machine réelle précise, ce n'est
-//! pas choisir une taille de RAM au hasard puis espérer que ça marche —
-//! c'est un ensemble de caractéristiques qui vont ensemble (vitesse CPU,
-//! RAM d'origine, ROM/BIOS attendue, options matérielles comme le
-//! Blitter ici). Ce module rassemble ces caractéristiques pour la gamme
-//! ST/STE sous une forme consultable ([`AtariModel::profile`]), plutôt que
-//! de les laisser éparpillées en constantes magiques dans le binaire de
-//! démonstration.
+//! General principle (valid for any machine being emulated, not just this
+//! one): emulating ONE specific real machine is not about picking a random
+//! RAM size and hoping it works — it's a set of characteristics that go
+//! together (CPU speed, original RAM, expected ROM/BIOS, hardware options
+//! such as the Blitter here). This module gathers these characteristics for
+//! the ST/STE lineup in a queryable form ([`AtariModel::profile`]), rather
+//! than leaving them scattered as magic constants throughout the demo
+//! binary.
 //!
-//! ## Ce qui est modélisé, et ce qui ne l'est pas (encore)
-//! - `ram_size` et `has_blitter` sont pleinement pris en compte par
-//!   [`crate::systems::atari_st::AtariSt::from_model`] (RAM installée,
-//!   présence effective du Blitter sur le bus).
-//! - `cpu_hz` est **informatif seulement** pour l'instant : le rythme
-//!   MFP (`peripherals::atari_st::mfp`, ratio horloge fixe 192/625) et le
-//!   pacing audio du binaire `atari_st_sdl2` supposent tous les deux un
-//!   CPU à 8 MHz. Choisir un modèle Mega STE ne fait donc PAS tourner
-//!   l'émulation à 16 MHz — le champ existe pour documenter la vraie
-//!   caractéristique matérielle sans prétendre à une précision qu'on n'a
-//!   pas encore implémentée (plutôt que de l'omettre en silence).
-//! - `tos_version` est une **suggestion** (le TOS d'origine du modèle,
-//!   informatif) : la base ROM réelle (`0xFC0000` vs `0xE00000`) dépend de
-//!   la version de TOS effectivement chargée, pas du modèle de machine —
-//!   voir `os_version` dans l'en-tête TOS et
-//!   [`crate::systems::atari_st::AtariSt::set_rom_base`], déjà auto-détecté
-//!   indépendamment de ce lexique. Un ST réel peut très bien tourner avec
-//!   un TOS plus récent que celui d'origine (mise à jour EPROM courante).
+//! ## What is modeled, and what isn't (yet)
+//! - `ram_size` and `has_blitter` are fully taken into account by
+//!   [`crate::systems::atari_st::AtariSt::from_model`] (installed RAM,
+//!   effective presence of the Blitter on the bus).
+//! - `cpu_hz` is **informational only** for now: the MFP pacing
+//!   (`peripherals::atari_st::mfp`, fixed 192/625 clock ratio) and the
+//!   audio pacing of the `atari_st_sdl2` binary both assume an 8 MHz CPU.
+//!   Choosing a Mega STE model therefore does NOT run the emulation at
+//!   16 MHz — the field exists to document the real hardware
+//!   characteristic without claiming a precision that hasn't been
+//!   implemented yet (rather than silently omitting it).
+//! - `tos_version` is a **suggestion** (the model's original TOS,
+//!   informational): the real ROM base (`0xFC0000` vs `0xE00000`) depends
+//!   on the version of TOS actually loaded, not on the machine model —
+//!   see `os_version` in the TOS header and
+//!   [`crate::systems::atari_st::AtariSt::set_rom_base`], already
+//!   auto-detected independently of this lexicon. A real ST can very well
+//!   run with a TOS more recent than its original one (a common EPROM
+//!   upgrade).
 //!
 //! ## Sources
-//! Caractéristiques croisées depuis plusieurs références publiques
-//! (Wikipedia "Atari MEGA STE", old-computers.com, atari-wiki.com,
-//! atari-forum.com) — voir le commentaire de chaque variante pour le
-//! détail contesté (Mega ST : le Blitter était sur un support PLCC, pas
-//! toujours peuplé en usine).
+//! Characteristics cross-checked from several public references (Wikipedia
+//! "Atari MEGA STE", old-computers.com, atari-wiki.com, atari-forum.com) —
+//! see each variant's comment for disputed details (Mega ST: the Blitter
+//! was on a PLCC socket, not always populated at the factory).
 
-/// Un modèle connu de la gamme Atari ST/STE/Mega ST/Mega STE.
+/// A known model in the Atari ST/STE/Mega ST/Mega STE lineup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtariModel {
-    /// 1985 : premier modèle, 512 Ko, TOS 1.00/1.02, pas de Blitter.
+    /// 1985: first model, 512 KB, TOS 1.00/1.02, no Blitter.
     St520,
-    /// 1986 : 1 Mo, TOS 1.02/1.04, pas de Blitter.
+    /// 1986: 1 MB, TOS 1.02/1.04, no Blitter.
     St1040,
-    /// 1987 : boîtier bureautique + clavier séparé, 1/2/4 Mo, TOS 1.02/1.04.
-    /// Support PLCC pour le Blitter présent sur toutes les cartes mères,
-    /// mais pas systématiquement peuplé en usine sur les premières séries
-    /// — modélisé ici comme présent (cas le plus courant sur les machines
-    /// qui ont survécu/sont émulées), à ajuster via
+    /// 1987: desktop case + separate keyboard, 1/2/4 MB, TOS 1.02/1.04.
+    /// A PLCC socket for the Blitter is present on all motherboards, but
+    /// not always populated at the factory on early batches — modeled here
+    /// as present (the most common case among surviving/emulated
+    /// machines), adjustable via
     /// [`MachineProfile`]/[`crate::systems::atari_st::AtariSt::from_model`]
-    /// suivi d'une désactivation manuelle si besoin d'un Mega ST sans
-    /// Blitter précis.
+    /// followed by a manual disable if a precise Blitter-less Mega ST is
+    /// needed.
     MegaSt,
-    /// 1989 : 512 Ko, TOS 1.06/1.62, Blitter et palette 4096 couleurs de
-    /// série.
+    /// 1989: 512 KB, TOS 1.06/1.62, Blitter and 4096-color palette as
+    /// standard.
     Ste520,
-    /// 1989 : 1 Mo, TOS 1.62 (1.06 sur les tout premiers exemplaires),
-    /// Blitter de série.
+    /// 1989: 1 MB, TOS 1.62 (1.06 on the very first units), Blitter as
+    /// standard.
     Ste1040,
-    /// 1991 : boîtier TT, 1/2/4 Mo, TOS 2.05/2.06, Blitter de série, CPU
-    /// commutable logiciellement 8/16 MHz avec cache 16 Ko (16 MHz non
-    /// modélisé, voir la doc de module).
+    /// 1991: TT case, 1/2/4 MB, TOS 2.05/2.06, Blitter as standard, CPU
+    /// software-switchable 8/16 MHz with 16 KB cache (16 MHz not modeled,
+    /// see module doc).
     MegaSte,
 }
 
-/// Caractéristiques d'un modèle — voir la doc de module pour ce qui est
-/// effectivement pris en compte par l'émulation aujourd'hui.
+/// Characteristics of a model — see the module doc for what is actually
+/// taken into account by the emulation today.
 #[derive(Debug, Clone, Copy)]
 pub struct MachineProfile {
     pub name: &'static str,
-    /// Fréquence CPU d'origine, en Hz (informatif, voir doc de module).
+    /// Original CPU frequency, in Hz (informational, see module doc).
     pub cpu_hz: u32,
-    /// RAM installée d'origine, en octets.
+    /// Original installed RAM, in bytes.
     pub ram_size: usize,
-    /// Version de TOS d'origine (informatif, voir doc de module).
+    /// Original TOS version (informational, see module doc).
     pub tos_version: &'static str,
-    /// Blitter présent de série sur ce modèle.
+    /// Blitter present as standard on this model.
     pub has_blitter: bool,
-    /// Palette Shifter étendue STE (12 bits, 4 bits par composante) au lieu
-    /// du format ST d'origine (9 bits, 3 bits par composante).
+    /// STE extended Shifter palette (12 bits, 4 bits per component) instead
+    /// of the original ST format (9 bits, 3 bits per component).
     pub ste_palette: bool,
 }
 
 impl AtariModel {
-    /// Renvoie les caractéristiques du modèle.
+    /// Returns the model's characteristics.
     pub fn profile(self) -> MachineProfile {
         match self {
             AtariModel::St520 => MachineProfile {
@@ -128,7 +127,7 @@ impl AtariModel {
             },
             AtariModel::MegaSte => MachineProfile {
                 name: "Atari Mega STE",
-                cpu_hz: 8_000_000, // 16 MHz disponible sur le matériel réel, non modélisé
+                cpu_hz: 8_000_000, // 16 MHz available on real hardware, not modeled
                 ram_size: 4 * 1024 * 1024,
                 tos_version: "2.06",
                 has_blitter: true,
@@ -137,8 +136,8 @@ impl AtariModel {
         }
     }
 
-    /// Cherche un modèle par nom insensible à la casse, acceptant les
-    /// formes usuelles (`"1040ste"`, `"1040STE"`, `"mega-ste"`, `"megaste"`…).
+    /// Looks up a model by case-insensitive name, accepting common forms
+    /// (`"1040ste"`, `"1040STE"`, `"mega-ste"`, `"megaste"`…).
     pub fn parse(name: &str) -> Option<Self> {
         let normalized: String = name
             .chars()
@@ -162,7 +161,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_accepte_plusieurs_formes() {
+    fn parse_accepts_several_forms() {
         assert_eq!(AtariModel::parse("1040ste"), Some(AtariModel::Ste1040));
         assert_eq!(AtariModel::parse("1040STE"), Some(AtariModel::Ste1040));
         assert_eq!(AtariModel::parse("Mega-STE"), Some(AtariModel::MegaSte));
@@ -171,9 +170,9 @@ mod tests {
     }
 
     #[test]
-    fn profil_1040ste_correspond_a_l_exemple_courant() {
-        // 1 Mo de RAM, Blitter présent, TOS 1.62 — l'exemple donné pour
-        // justifier ce lexique.
+    fn profile_1040ste_matches_common_example() {
+        // 1 MB of RAM, Blitter present, TOS 1.62 — the example given to
+        // justify this lexicon.
         let p = AtariModel::Ste1040.profile();
         assert_eq!(p.ram_size, 1024 * 1024);
         assert!(p.has_blitter);
@@ -181,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn st520_et_st1040_n_ont_pas_de_blitter() {
+    fn st520_and_st1040_have_no_blitter() {
         assert!(!AtariModel::St520.profile().has_blitter);
         assert!(!AtariModel::St1040.profile().has_blitter);
     }

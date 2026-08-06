@@ -1,55 +1,53 @@
-//! Microwire — interface série vers le mixeur externe LMC1992 (STE), qui
-//! contrôle en aval le volume maître, le volume gauche/droite, la balance
-//! graves/aigus et le mode de mixage, sur le **signal de sortie final**
-//! (PSG *et* son DMA mélangés) — pas un registre de la puce DMA Sound
-//! elle-même, mais un circuit séparé piloté par les mêmes deux registres
-//! série (`$FF8922` DATA, `$FF8924` MASK).
+//! Microwire — serial interface to the external LMC1992 mixer (STE), which
+//! downstream controls master volume, left/right volume, bass/treble
+//! balance, and the mixing mode, on the **final output signal** (PSG
+//! *and* DMA sound mixed together) — not a register of the DMA Sound chip
+//! itself, but a separate circuit driven by the same two serial registers
+//! (`$FF8922` DATA, `$FF8924` MASK).
 //!
-//! Le volume maître, le volume gauche/droite ET le filtre graves/aigus sont
-//! modélisés ([`Self::filter_left`]/[`Self::filter_right`]) ; le mode de
-//! mixage n'a pas d'effet audible avec une seule source de sortie hôte —
-//! seul celui-ci reste un raffinement non demandé à ce stade.
+//! Master volume, left/right volume AND the bass/treble filter are
+//! modeled ([`Self::filter_left`]/[`Self::filter_right`]); the mixing mode
+//! has no audible effect with a single host output source — it alone
+//! remains a refinement not requested at this stage.
 //!
-//! Décodage du mot de commande : reproduit l'algorithme du LMC1992 tel que
-//! vérifié dans Hatari (`dmaSnd.c`, `DmaSnd_InterruptHandler_Microwire`) —
-//! transmission série MSB-first, un préfixe d'adresse `10` (2 bits) suivi
-//! d'un sélecteur de commande (3 bits) puis d'une valeur, le tout repéré en
-//! ne gardant que les bits de DATA dont le bit MASK correspondant est à 1.
-//! On saute la temporisation série réelle (16 décalages à 1 MHz) et on
-//! décode instantanément dès que MASK et DATA ont chacun été écrits en
-//! entier : sans conséquence fonctionnelle, puisque le logiciel de toute
-//! façon boucle en relisant DATA jusqu'à ce qu'il retombe à zéro (déjà le
-//! cas immédiatement, voir le commentaire dédié dans
-//! `AtariSt::read8`) avant de continuer.
+//! Command word decoding: reproduces the LMC1992 algorithm as verified in
+//! Hatari (`dmaSnd.c`, `DmaSnd_InterruptHandler_Microwire`) — MSB-first
+//! serial transmission, a 2-bit `10` address prefix followed by a 3-bit
+//! command selector then a value, the whole thing picked out by keeping
+//! only the DATA bits whose corresponding MASK bit is 1. We skip the real
+//! serial timing (16 shifts at 1 MHz) and decode instantly as soon as
+//! MASK and DATA have each been written in full: no functional
+//! consequence, since the software loops rereading DATA until it drops
+//! back to zero anyway (already immediately the case, see the dedicated
+//! comment in `AtariSt::read8`) before continuing.
 //!
-//! ## Filtre graves/aigus (façon Hatari)
-//! [`Self::filter_left`]/[`Self::filter_right`] appliquent gain ET filtre
-//! graves/aigus en une seule passe par échantillon — reproduit fidèlement
-//! de Hatari (`dmaSnd.c`, `DmaSnd_Bass_Shelf`/`DmaSnd_Treble_Shelf`/
-//! `DmaSnd_Set_Tone_Level`/`DmaSnd_IIRfilterL`/`DmaSnd_IIRfilterR`) : deux
-//! filtres "plateau" (shelf) du premier ordre — un pour les graves (coude à
-//! 118.2763 Hz), un pour les aigus (coude à 8438.756 Hz), valeurs mesurées
-//! sur le vrai circuit LMC1992 — combinés algébriquement en un seul filtre
-//! biquad (2nd ordre), appliqué en forme directe II. 13 paliers de gain
-//! (-12dB à +12dB par pas de 2dB) précalculés une fois pour la fréquence de
-//! sortie FIXE de Rust68 (44100 Hz, voir `AUDIO_SAMPLE_RATE` dans
-//! `atari_st_sdl2.rs`) — contrairement à Hatari, qui recalcule ces tables
-//! si la fréquence de sortie hôte change en cours de route, Rust68 n'en a
-//! qu'une seule possible.
+//! ## Bass/treble filter (Hatari-style)
+//! [`Self::filter_left`]/[`Self::filter_right`] apply gain AND the
+//! bass/treble filter in a single pass per sample — faithfully reproduced
+//! from Hatari (`dmaSnd.c`, `DmaSnd_Bass_Shelf`/`DmaSnd_Treble_Shelf`/
+//! `DmaSnd_Set_Tone_Level`/`DmaSnd_IIRfilterL`/`DmaSnd_IIRfilterR`): two
+//! first-order shelf filters — one for bass (corner at 118.2763 Hz), one
+//! for treble (corner at 8438.756 Hz), values measured on the real
+//! LMC1992 chip — algebraically combined into a single biquad (2nd order)
+//! filter, applied in direct form II. 13 gain steps (-12dB to +12dB in
+//! 2dB steps) precomputed once for Rust68's FIXED output rate (44100 Hz,
+//! see `AUDIO_SAMPLE_RATE` in `atari_st_sdl2.rs`) — unlike Hatari, which
+//! recomputes these tables if the host output rate changes at runtime,
+//! Rust68 only ever has one possible rate.
 //!
-//! Le gain (volume) est un paramètre EXTERNE de `filter_left`/`filter_right`
-//! (pas lu depuis [`Self::left_gain`]/[`Self::right_gain`] en interne) :
-//! l'appelant reste libre de lisser les variations de volume dans le temps
-//! (évite un "clic" de zipper noise sur un changement brutal) avant de
-//! l'injecter dans le filtre — exactement ce que fait `atari_st_sdl2.rs`.
-//! Ce filtre s'applique en aval du mixage PSG+DMA Sound (comme chez
-//! Hatari, `DmaSnd_Apply_LMC`, appelé après le mixage et le rééchantillonnage
-//! vers la fréquence hôte), pas par source individuelle.
+//! The gain (volume) is an EXTERNAL parameter of
+//! `filter_left`/`filter_right` (not read internally from
+//! [`Self::left_gain`]/[`Self::right_gain`]): the caller remains free to
+//! smooth volume changes over time (avoiding a "zipper noise" click on an
+//! abrupt change) before feeding it into the filter — exactly what
+//! `atari_st_sdl2.rs` does. This filter applies downstream of the
+//! PSG+DMA Sound mix (as in Hatari, `DmaSnd_Apply_LMC`, called after
+//! mixing and resampling to the host rate), not per individual source.
 
-/// `(int)(powf(10.0, dB/20.0) * 65536.0 + 0.5)`, pas de 2dB — table du
-/// volume maître (6 bits), reprise telle quelle de Hatari (`dmaSnd.c`,
-/// `LMC1992_Master_Volume_Table`) : whatever la commande, `65535` représente
-/// un gain unité (0dB, pas d'atténuation).
+/// `(int)(powf(10.0, dB/20.0) * 65536.0 + 0.5)`, 2dB steps — master volume
+/// table (6 bits), taken as-is from Hatari (`dmaSnd.c`,
+/// `LMC1992_Master_Volume_Table`): whatever the command, `65535`
+/// represents unity gain (0dB, no attenuation).
 const MASTER_VOLUME_TABLE: [u16; 64] = [
     7, 8, 10, 13, 16, 21, 26, 33, 41, 52, // -80dB
     66, 83, 104, 131, 165, 207, 261, 328, 414, 521, // -60dB
@@ -60,7 +58,7 @@ const MASTER_VOLUME_TABLE: [u16; 64] = [
     65535, 65535, 65535, 65535, // 0dB
 ];
 
-/// Table du volume gauche/droite (5 bits) — reprise de Hatari
+/// Left/right volume table (5 bits) — taken from Hatari
 /// (`LMC1992_LeftRight_Volume_Table`).
 const LEFT_RIGHT_VOLUME_TABLE: [u16; 32] = [
     655, 825, 1039, 1308, 1646, 2072, 2609, 3285, 4135, 5206, // -40dB
@@ -69,27 +67,27 @@ const LEFT_RIGHT_VOLUME_TABLE: [u16; 32] = [
     65535, 65535, // 0dB
 ];
 
-/// Nombre de paliers de gain graves/aigus précalculés (-12dB à +12dB par
-/// pas de 2dB) — reprise de Hatari (`dmaSnd.c`, `TONE_STEPS`).
+/// Number of precomputed bass/treble gain steps (-12dB to +12dB in 2dB
+/// steps) — taken from Hatari (`dmaSnd.c`, `TONE_STEPS`).
 const TONE_STEPS: usize = 13;
 
-/// Mappe la valeur brute 4 bits d'une commande graves/aigus (0-15) sur
-/// l'indice 0-12 dans les tables précalculées — reprise telle quelle de
-/// Hatari (`LMC1992_Bass_Treble_Table`, `dmaSnd.c`).
+/// Maps the raw 4-bit value of a bass/treble command (0-15) onto index
+/// 0-12 in the precomputed tables — taken as-is from Hatari
+/// (`LMC1992_Bass_Treble_Table`, `dmaSnd.c`).
 const BASS_TREBLE_INDEX: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, 12];
 
-/// Fréquence de coude des graves (Hz) — LMC1992 réel, valeur mesurée (voir
-/// Hatari, `dmaSnd.c`, `DmaSnd_Init_Bass_and_Treble_Tables`).
+/// Bass corner frequency (Hz) — real LMC1992, measured value (see Hatari,
+/// `dmaSnd.c`, `DmaSnd_Init_Bass_and_Treble_Tables`).
 const BASS_CORNER_HZ: f32 = 118.2763;
-/// Fréquence de coude des aigus (Hz) — idem.
+/// Treble corner frequency (Hz) — likewise.
 const TREBLE_CORNER_HZ: f32 = 8438.756;
-/// Fréquence de sortie Rust68, FIXE (voir `AUDIO_SAMPLE_RATE` dans
-/// `atari_st_sdl2.rs`) — les tables ci-dessous sont calculées une seule
-/// fois pour cette fréquence (Hatari les recalcule si sa fréquence de
-/// sortie change, ce qui n'arrive jamais ici).
+/// Rust68's FIXED output rate (see `AUDIO_SAMPLE_RATE` in
+/// `atari_st_sdl2.rs`) — the tables below are computed once for this
+/// frequency (Hatari recomputes them if its output frequency changes,
+/// which never happens here).
 const OUTPUT_RATE_HZ: f32 = 44100.0;
 
-/// Coefficients d'un filtre "plateau" (shelf) du premier ordre — voir
+/// Coefficients of a first-order "shelf" filter — see
 /// [`bass_shelf`]/[`treble_shelf`].
 #[derive(Debug, Clone, Copy, Default)]
 struct FirstOrderShelf {
@@ -98,9 +96,9 @@ struct FirstOrderShelf {
     b1: f32,
 }
 
-/// Coefficients du filtre plateau des GRAVES pour un gain linéaire `g`
-/// (pas en dB) à la fréquence de coude `fc`, échantillonné à `fs` — reprise
-/// telle quelle de Hatari (`DmaSnd_Bass_Shelf`, `dmaSnd.c`).
+/// Coefficients of the BASS shelf filter for a linear gain `g` (not in
+/// dB) at corner frequency `fc`, sampled at `fs` — taken as-is from Hatari
+/// (`DmaSnd_Bass_Shelf`, `dmaSnd.c`).
 fn bass_shelf(g: f32, fc: f32, fs: f32) -> FirstOrderShelf {
     let tan_fc = (std::f32::consts::PI * fc / fs).tan();
     let a1 = if g < 1.0 { (tan_fc - g) / (tan_fc + g) } else { (tan_fc - 1.0) / (tan_fc + 1.0) };
@@ -109,8 +107,8 @@ fn bass_shelf(g: f32, fc: f32, fs: f32) -> FirstOrderShelf {
     FirstOrderShelf { a1, b0, b1 }
 }
 
-/// Équivalent de [`bass_shelf`] pour les AIGUS — reprise telle quelle de
-/// Hatari (`DmaSnd_Treble_Shelf`, `dmaSnd.c`).
+/// Equivalent of [`bass_shelf`] for TREBLE — taken as-is from Hatari
+/// (`DmaSnd_Treble_Shelf`, `dmaSnd.c`).
 fn treble_shelf(g: f32, fc: f32, fs: f32) -> FirstOrderShelf {
     let tan_fc = (std::f32::consts::PI * fc / fs).tan();
     let a1 = if g < 1.0 { (g * tan_fc - 1.0) / (g * tan_fc + 1.0) } else { (tan_fc - 1.0) / (tan_fc + 1.0) };
@@ -119,16 +117,16 @@ fn treble_shelf(g: f32, fc: f32, fs: f32) -> FirstOrderShelf {
     FirstOrderShelf { a1, b0, b1 }
 }
 
-/// Précalcule les 13 paliers de gain des graves (+12dB à -12dB, pas de
-/// 2dB) — reprise de la boucle graves de Hatari
+/// Precomputes the 13 bass gain steps (+12dB to -12dB, in 2dB steps) —
+/// taken from Hatari's bass loop
 /// (`DmaSnd_Init_Bass_and_Treble_Tables`).
 fn build_bass_table() -> [FirstOrderShelf; TONE_STEPS] {
-    // Indice 12 = +12dB (boost max), indice 0 = -12dB (coupe max) — sens
-    // fixé par Hatari (boucle C `for(n=TONE_STEPS; n--; ...)`, qui remplit
-    // n=TONE_STEPS-1 EN PREMIER avec dB=+12 avant tout décrément), pas
-    // arbitraire : c'est aussi le sens attendu par `BASS_TREBLE_INDEX`
-    // (valeur brute de commande croissante -> indice croissant -> plus de
-    // graves), donc l'ordre ici doit correspondre exactement.
+    // Index 12 = +12dB (max boost), index 0 = -12dB (max cut) — direction
+    // set by Hatari (C loop `for(n=TONE_STEPS; n--; ...)`, which fills
+    // n=TONE_STEPS-1 FIRST with dB=+12 before any decrement), not
+    // arbitrary: it's also the direction expected by `BASS_TREBLE_INDEX`
+    // (increasing raw command value -> increasing index -> more bass), so
+    // the order here must match exactly.
     let mut table = [FirstOrderShelf::default(); TONE_STEPS];
     let mut db = 12.0f32;
     for entry in table.iter_mut().rev() {
@@ -139,10 +137,10 @@ fn build_bass_table() -> [FirstOrderShelf; TONE_STEPS] {
     table
 }
 
-/// Précalcule les 13 paliers de gain des aigus — reprise de la boucle
-/// aigus de Hatari, y compris le plafonnement de la fréquence de coude à
-/// 80% de Nyquist si nécessaire (sans effet à 44100 Hz : 8438.756 Hz <
-/// 0.4×44100=17640 Hz — gardé pour rester fidèle à la formule complète).
+/// Precomputes the 13 treble gain steps — taken from Hatari's treble
+/// loop, including capping the corner frequency at 80% of Nyquist if
+/// needed (no effect at 44100 Hz: 8438.756 Hz < 0.4×44100=17640 Hz — kept
+/// to stay faithful to the complete formula).
 fn build_treble_table() -> [FirstOrderShelf; TONE_STEPS] {
     let nyquist_80pct = 0.5 * 0.8 * OUTPUT_RATE_HZ;
     let (fc, db_step) = if TREBLE_CORNER_HZ > nyquist_80pct {
@@ -150,8 +148,8 @@ fn build_treble_table() -> [FirstOrderShelf; TONE_STEPS] {
     } else {
         (TREBLE_CORNER_HZ, 2.0)
     };
-    // Même sens que `build_bass_table` (indice 12 = +12dB) — voir son
-    // commentaire.
+    // Same direction as `build_bass_table` (index 12 = +12dB) — see its
+    // comment.
     let mut table = [FirstOrderShelf::default(); TONE_STEPS];
     let mut db = db_step * (TONE_STEPS as f32 - 1.0) / 2.0;
     for entry in table.iter_mut().rev() {
@@ -162,7 +160,7 @@ fn build_treble_table() -> [FirstOrderShelf; TONE_STEPS] {
     table
 }
 
-/// État complet du circuit Microwire/LMC1992.
+/// Full state of the Microwire/LMC1992 circuit.
 #[derive(Debug, Clone)]
 pub struct Microwire {
     mask: u16,
@@ -170,32 +168,31 @@ pub struct Microwire {
     master_volume: u16,
     left_volume: u16,
     right_volume: u16,
-    /// Valeur brute (0-15) de la dernière commande graves reçue — 6 =
-    /// plat/0dB par défaut, comme Hatari (`DmaSnd_Reset`) : pas de signal
-    /// de reset propre au Microwire sur silicium réel, mais un réglage
-    /// neutre est un point de départ raisonnable avant toute commande.
+    /// Raw value (0-15) of the last bass command received — 6 = flat/0dB
+    /// by default, like Hatari (`DmaSnd_Reset`): there's no dedicated
+    /// reset signal for the Microwire on real silicon, but a neutral
+    /// setting is a reasonable starting point before any command.
     bass: u8,
-    /// Voir [`Self::bass`], pour les aigus.
+    /// See [`Self::bass`], for treble.
     treble: u8,
     bass_table: [FirstOrderShelf; TONE_STEPS],
     treble_table: [FirstOrderShelf; TONE_STEPS],
-    /// Coefficients du filtre biquad COMBINÉ (graves+aigus multipliés
-    /// algébriquement en un seul filtre du second ordre) —
-    /// `[a1, a2, b0, b1, b2]`, voir [`Self::set_tone_level`].
+    /// Coefficients of the COMBINED biquad filter (bass+treble
+    /// algebraically multiplied into a single second-order filter) —
+    /// `[a1, a2, b0, b1, b2]`, see [`Self::set_tone_level`].
     coef: [f32; 5],
-    /// État (2 derniers échantillons intermédiaires) du filtre IIR, un par
-    /// canal — voir [`Self::filter_left`]/[`Self::filter_right`].
+    /// State (2 last intermediate samples) of the IIR filter, one per
+    /// channel — see [`Self::filter_left`]/[`Self::filter_right`].
     iir_left: [f32; 2],
     iir_right: [f32; 2],
 }
 
 impl Microwire {
     pub fn new() -> Self {
-        // Volume plein par défaut (silicium réel : pas de signal de reset
-        // sur le Microwire lui-même, mais TOS programme systématiquement un
-        // volume raisonnable très tôt au boot ; démarrer atténué rendrait le
-        // son totalement silencieux tant qu'aucune commande n'a encore été
-        // envoyée).
+        // Full volume by default (real silicon: no reset signal on the
+        // Microwire itself, but TOS systematically programs a reasonable
+        // volume very early at boot; starting attenuated would leave the
+        // sound completely silent until any command has been sent).
         let mut mw = Microwire {
             mask: 0,
             data: 0,
@@ -226,8 +223,8 @@ impl Microwire {
         self.data = (self.data & 0x00FF) | ((value as u16) << 8);
     }
 
-    /// Octet bas de DATA : dernier des 4 octets écrits dans la séquence
-    /// réelle (MASK haut/bas puis DATA haut/bas) — décode la commande ici.
+    /// DATA low byte: last of the 4 bytes written in the real sequence
+    /// (MASK high/low then DATA high/low) — decodes the command here.
     pub fn write_data_low(&mut self, value: u8) {
         self.data = (self.data & 0xFF00) | value as u16;
         self.decode();
@@ -254,9 +251,9 @@ impl Microwire {
                 self.apply(cmd);
                 return;
             }
-            // Commande invalide (mauvais préfixe d'adresse ou trop courte) :
-            // on continue de scruter le reste du masque, comme le silicium
-            // réel (voir la doc du module).
+            // Invalid command (wrong address prefix or too short): keep
+            // scanning the rest of the mask, like real silicon (see the
+            // module doc).
         }
     }
 
@@ -273,18 +270,18 @@ impl Microwire {
             3 => self.master_volume = MASTER_VOLUME_TABLE[(cmd & 0x3F) as usize],
             4 => self.right_volume = LEFT_RIGHT_VOLUME_TABLE[(cmd & 0x1F) as usize],
             5 => self.left_volume = LEFT_RIGHT_VOLUME_TABLE[(cmd & 0x1F) as usize],
-            // Mixage (0) : non modélisé, voir la doc du module.
+            // Mixing (0): not modeled, see the module doc.
             _ => {}
         }
     }
 
-    /// Recombine les tables graves/aigus précalculées en un seul filtre
-    /// biquad ([`Self::coef`]), d'après les réglages courants — façon
-    /// Hatari (`DmaSnd_Set_Tone_Level`) : simple développement algébrique
-    /// du produit des deux fonctions de transfert du premier ordre (pas de
-    /// `tan`/`pow`, contrairement à la construction des tables elle-même) —
-    /// peut être appelé à chaque commande graves/aigus reçue sans souci de
-    /// coût.
+    /// Recombines the precomputed bass/treble tables into a single biquad
+    /// filter ([`Self::coef`]), based on the current settings —
+    /// Hatari-style (`DmaSnd_Set_Tone_Level`): a simple algebraic
+    /// expansion of the product of the two first-order transfer functions
+    /// (no `tan`/`pow`, unlike the table construction itself) — can be
+    /// called on every bass/treble command received without worrying
+    /// about cost.
     fn set_tone_level(&mut self) {
         let treb = self.treble_table[BASS_TREBLE_INDEX[(self.treble & 0xF) as usize] as usize];
         let bass = self.bass_table[BASS_TREBLE_INDEX[(self.bass & 0xF) as usize] as usize];
@@ -295,22 +292,22 @@ impl Microwire {
         self.coef[4] = treb.b1 * bass.b1;
     }
 
-    /// Applique gain + filtre graves/aigus au canal GAUCHE pour un
-    /// échantillon — voir la doc de module (`filter_left`/`filter_right`).
+    /// Applies gain + the bass/treble filter to the LEFT channel for one
+    /// sample — see the module doc (`filter_left`/`filter_right`).
     pub fn filter_left(&mut self, xn: f32, gain: f32) -> f32 {
         Self::iir_step(&self.coef, &mut self.iir_left, xn, gain)
     }
 
-    /// Équivalent de [`Self::filter_left`] pour le canal DROIT — état
-    /// indépendant ([`Self::iir_right`]), voir la doc de module sur les
-    /// tons stéréo distincts de la cartouche de diagnostic usine.
+    /// Equivalent of [`Self::filter_left`] for the RIGHT channel —
+    /// independent state ([`Self::iir_right`]), see the module doc about
+    /// the factory diagnostic cartridge's distinct stereo tones.
     pub fn filter_right(&mut self, xn: f32, gain: f32) -> f32 {
         Self::iir_step(&self.coef, &mut self.iir_right, xn, gain)
     }
 
-    /// Un pas de filtre biquad forme directe II — reprise telle quelle de
-    /// Hatari (`DmaSnd_IIRfilterL`/`DmaSnd_IIRfilterR`) : le gain
-    /// s'applique à l'ENTRÉE du filtre (même passe), pas en aval.
+    /// One direct-form-II biquad filter step — taken as-is from Hatari
+    /// (`DmaSnd_IIRfilterL`/`DmaSnd_IIRfilterR`): the gain applies at the
+    /// filter's INPUT (same pass), not downstream.
     fn iir_step(coef: &[f32; 5], state: &mut [f32; 2], xn: f32, gain: f32) -> f32 {
         let a = gain * xn - coef[0] * state[0] - coef[1] * state[1];
         let yn = coef[2] * a + coef[3] * state[0] + coef[4] * state[1];
@@ -319,18 +316,19 @@ impl Microwire {
         yn
     }
 
-    /// Gain (0.0-1.0) du canal gauche : volume gauche × volume maître —
-    /// appliqué séparément du canal droit ([`Self::right_gain`]) puisque la
-    /// cartouche de diagnostic usine STe (test "Stereo 1 kHz/500 Hz tones")
-    /// programme délibérément des volumes gauche/droite différents et
-    /// changeants pour faire entendre 2 tons à des niveaux distincts.
-    /// Diagnostic externe / cible de lissage — voir [`Self::filter_left`]
-    /// pour l'application réelle (gain fourni en paramètre, pas relu ici).
+    /// Gain (0.0-1.0) of the left channel: left volume × master volume —
+    /// applied separately from the right channel ([`Self::right_gain`])
+    /// since the STE factory diagnostic cartridge (test "Stereo 1 kHz/500
+    /// Hz tones") deliberately programs different, changing left/right
+    /// volumes to make 2 tones audible at distinct levels. External
+    /// diagnostic / smoothing target — see [`Self::filter_left`] for the
+    /// actual application (gain supplied as a parameter, not read back
+    /// here).
     pub fn left_gain(&self) -> f32 {
         self.left_volume as f32 / 65535.0 * (self.master_volume as f32 / 65535.0)
     }
 
-    /// Gain (0.0-1.0) du canal droit — voir [`Self::left_gain`].
+    /// Gain (0.0-1.0) of the right channel — see [`Self::left_gain`].
     pub fn right_gain(&self) -> f32 {
         self.right_volume as f32 / 65535.0 * (self.master_volume as f32 / 65535.0)
     }
@@ -354,24 +352,24 @@ mod tests {
     }
 
     #[test]
-    fn volume_plein_par_defaut() {
+    fn full_volume_by_default() {
         let mw = Microwire::new();
         assert!((mw.left_gain() - 1.0).abs() < 0.001);
         assert!((mw.right_gain() - 1.0).abs() < 0.001);
     }
 
     #[test]
-    fn commande_volume_maitre_attenue_les_deux_canaux() {
+    fn master_volume_command_attenuates_both_channels() {
         let mut mw = Microwire::new();
-        // Type=3 (master volume) << 6, valeur=0 (index le plus atténué,
-        // -80dB) ; préfixe d'adresse "10" déjà inclus via le bit10=1/bit9=0.
+        // Type=3 (master volume) << 6, value=0 (most attenuated index,
+        // -80dB); address prefix "10" already included via bit10=1/bit9=0.
         send_command(&mut mw, 0x400 | (3 << 6));
-        assert!(mw.left_gain() < 0.01, "left_gain={} devrait etre tres attenue", mw.left_gain());
-        assert!(mw.right_gain() < 0.01, "right_gain={} devrait etre tres attenue", mw.right_gain());
+        assert!(mw.left_gain() < 0.01, "left_gain={} should be heavily attenuated", mw.left_gain());
+        assert!(mw.right_gain() < 0.01, "right_gain={} should be heavily attenuated", mw.right_gain());
     }
 
     #[test]
-    fn commande_volume_maitre_pleine_echelle_gain_unite() {
+    fn master_volume_command_full_scale_is_unity_gain() {
         let mut mw = Microwire::new();
         send_command(&mut mw, 0x400 | (3 << 6) | 0x3F);
         assert!((mw.left_gain() - 1.0).abs() < 0.001);
@@ -379,54 +377,53 @@ mod tests {
     }
 
     #[test]
-    fn commande_volume_gauche_droite_independante() {
+    fn left_right_volume_command_is_independent() {
         let mut mw = Microwire::new();
-        // Volume droit au minimum, gauche inchangé (plein) : les deux
-        // canaux doivent rester DISTINCTS, pas moyennés ensemble — c'est
-        // précisément ce que le test "Stereo 1 kHz/500 Hz tones" de la
-        // cartouche vérifie (2 tons à des volumes différents).
+        // Right volume at minimum, left unchanged (full): the two
+        // channels must remain DISTINCT, not averaged together — this is
+        // precisely what the cartridge's "Stereo 1 kHz/500 Hz tones" test
+        // verifies (2 tones at different volumes).
         send_command(&mut mw, 0x400 | (4 << 6));
-        assert!((mw.left_gain() - 1.0).abs() < 0.001, "gauche inchangé");
-        assert!(mw.right_gain() < 0.01, "droit doit etre tres attenue");
+        assert!((mw.left_gain() - 1.0).abs() < 0.001, "left unchanged");
+        assert!(mw.right_gain() < 0.01, "right should be heavily attenuated");
     }
 
     #[test]
-    fn commande_avec_mauvais_prefixe_est_ignoree() {
+    fn command_with_wrong_prefix_is_ignored() {
         let mut mw = Microwire::new();
-        // bit10=0 : préfixe invalide (devrait être "10"), la commande ne
-        // doit pas être appliquée.
+        // bit10=0: invalid prefix (should be "10"), the command must not
+        // be applied.
         send_command(&mut mw, 3 << 6);
-        assert!((mw.left_gain() - 1.0).abs() < 0.001, "commande invalide ne doit rien changer");
+        assert!((mw.left_gain() - 1.0).abs() < 0.001, "invalid command must change nothing");
     }
 
-    // --- Filtre graves/aigus (façon Hatari) -----------------------------
+    // --- Bass/treble filter (Hatari-style) ------------------------------
 
     #[test]
-    fn reglage_par_defaut_est_transparent() {
-        // Graves=aigus=6 (0dB/plat, réglage par défaut) : chaque filtre du
-        // premier ordre a une fonction de transfert EXACTEMENT égale à 1
-        // (numérateur == dénominateur, `b0=1, b1=a1` — voir `bass_shelf`/
-        // `treble_shelf` pour g=1.0), donc le biquad combiné aussi, PAS
-        // seulement en régime établi : le filtre doit se comporter comme un
-        // gain pur dès le premier échantillon, y compris en transitoire.
+    fn default_setting_is_transparent() {
+        // Bass=treble=6 (0dB/flat, default setting): each first-order
+        // filter has a transfer function EXACTLY equal to 1 (numerator ==
+        // denominator, `b0=1, b1=a1` — see `bass_shelf`/`treble_shelf` for
+        // g=1.0), so the combined biquad too, NOT only in steady state:
+        // the filter must behave as a pure gain from the very first
+        // sample, including transiently.
         let mut mw = Microwire::new();
         for &xn in &[1000.0, -500.0, 0.0, 12345.0, -8888.0] {
             let yn = mw.filter_left(xn, 2.0);
-            assert!((yn - xn * 2.0).abs() < 0.01, "attendu {} (gain pur), obtenu {yn}", xn * 2.0);
+            assert!((yn - xn * 2.0).abs() < 0.01, "expected {} (pure gain), got {yn}", xn * 2.0);
         }
     }
 
     #[test]
-    fn graves_a_fond_amplifie_un_signal_continu_en_regime_etabli() {
-        // Un shelf de GRAVES agit essentiellement sur le continu (0 Hz) :
-        // un signal constant, en régime établi, doit converger vers
-        // entrée × gain_linéaire(dB des graves) — quasi indépendant du
-        // réglage des aigus (shelf HAUTES fréquences, transparent en
-        // continu). +12dB ~ gain linéaire ×3.98.
+    fn max_bass_amplifies_a_dc_signal_in_steady_state() {
+        // A BASS shelf essentially acts on DC (0 Hz): a constant signal,
+        // in steady state, must converge to input × linear_gain(bass dB)
+        // — nearly independent of the treble setting (HIGH-frequency
+        // shelf, transparent at DC). +12dB ~ linear gain ×3.98.
         let mut mw = Microwire::new();
         mw.write_mask_high(0x07);
         mw.write_mask_low(0xFF);
-        // Type=1 (graves) << 6, valeur=12 (index max, +12dB).
+        // Type=1 (bass) << 6, value=12 (max index, +12dB).
         mw.write_data_high((((0x400 | (1 << 6) | 12) >> 8) & 0xFF) as u8);
         mw.write_data_low(((0x400 | (1 << 6) | 12)) as u8);
 
@@ -434,15 +431,15 @@ mod tests {
         for _ in 0..500 {
             yn = mw.filter_left(1000.0, 1.0);
         }
-        assert!((yn - 3981.0).abs() < 50.0, "régime établi attendu ~3981 (+12dB), obtenu {yn}");
+        assert!((yn - 3981.0).abs() < 50.0, "expected steady state ~3981 (+12dB), got {yn}");
     }
 
     #[test]
-    fn graves_au_minimum_attenue_un_signal_continu_en_regime_etabli() {
+    fn min_bass_attenuates_a_dc_signal_in_steady_state() {
         let mut mw = Microwire::new();
         mw.write_mask_high(0x07);
         mw.write_mask_low(0xFF);
-        // Type=1 (graves) << 6, valeur=0 (index min, -12dB).
+        // Type=1 (bass) << 6, value=0 (min index, -12dB).
         mw.write_data_high((((0x400 | (1 << 6)) >> 8) & 0xFF) as u8);
         mw.write_data_low((0x400 | (1 << 6)) as u8);
 
@@ -450,18 +447,18 @@ mod tests {
         for _ in 0..500 {
             yn = mw.filter_left(1000.0, 1.0);
         }
-        assert!((yn - 251.0).abs() < 20.0, "régime établi attendu ~251 (-12dB), obtenu {yn}");
+        assert!((yn - 251.0).abs() < 20.0, "expected steady state ~251 (-12dB), got {yn}");
     }
 
     #[test]
-    fn canaux_gauche_et_droit_ont_un_etat_independant() {
-        // Le filtre étant récursif (IIR), un canal alimenté en continu ne
-        // doit JAMAIS voir son état influencé par l'autre canal, même
-        // alimenté avec des valeurs très différentes.
+    fn left_and_right_channels_have_independent_state() {
+        // Since the filter is recursive (IIR), a channel fed with DC must
+        // NEVER have its state influenced by the other channel, even when
+        // that one is fed very different values.
         let mut mw = Microwire::new();
         mw.filter_left(10000.0, 1.0);
         mw.filter_left(10000.0, 1.0);
         let right_untouched = mw.filter_right(0.0, 1.0);
-        assert!(right_untouched.abs() < 0.01, "canal droit non affecté par l'activité du canal gauche");
+        assert!(right_untouched.abs() < 0.01, "right channel not affected by left channel activity");
     }
 }

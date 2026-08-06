@@ -1,47 +1,47 @@
-//! Yamaha YM2149 (PSG — Programmable Sound Generator), compatible registre
-//! à registre avec le General Instrument AY-3-8910.
+//! Yamaha YM2149 (PSG — Programmable Sound Generator), register-for-register
+//! compatible with the General Instrument AY-3-8910.
 //!
-//! Sur Atari ST : 3 canaux de son carré (A/B/C), un générateur de bruit
-//! partagé, un générateur d'enveloppe, et deux ports d'E/S 8 bits (le port
-//! A pilote entre autres la sélection de face/lecteur disquette, le strobe
-//! Centronics, et les lignes de sélection joystick/souris — câblage
-//! spécifique au board, pas modélisé ici, cf. limitations).
+//! On the Atari ST: 3 square-wave channels (A/B/C), a shared noise
+//! generator, an envelope generator, and two 8-bit I/O ports (port A
+//! among other things drives floppy drive/side selection, the
+//! Centronics strobe, and the joystick/mouse select lines — board-specific
+//! wiring, not modeled here, cf. limitations).
 //!
-//! Ce module modélise la puce **seule** : registres, générateurs de tonalité/
-//! bruit/enveloppe, niveaux de sortie numériques par canal. C'est au board
-//! de mapper [`Ym2149::read`]/[`Ym2149::write`] dans son `Bus` (registre
-//! sélecteur à `0xFF8800`, registre de données à `0xFF8802` sur ST réel) et
-//! de convertir [`Ym2149::channel_level`] en échantillons audio réels selon
-//! son propre pipeline de sortie.
+//! This module models the chip **alone**: registers, tone/noise/envelope
+//! generators, per-channel digital output levels. It is up to the board
+//! to map [`Ym2149::read`]/[`Ym2149::write`] into its `Bus` (select
+//! register at `0xFF8800`, data register at `0xFF8802` on real ST) and
+//! to convert [`Ym2149::channel_level`] into real audio samples according
+//! to its own output pipeline.
 //!
-//! ## Mixage non-linéaire des 3 canaux (façon Hatari)
-//! [`mix_channels_model`] combine 3 niveaux de canal (0-31) en un seul
-//! échantillon, en modélisant le DAC réel de la puce comme trois
-//! résistances de tirage réglables en parallèle sur une résistance de
-//! charge fixe (diviseur de tension) — PAS une simple somme des 3 niveaux :
-//! le silicium réel n'est physiquement pas un sommateur linéaire (combiner
-//! 2-3 voies à pleine amplitude sature nettement en dessous de 3× une seule
-//! voie). Formule et constantes reprises telles quelles de Hatari
-//! (`sound.c`, `YM2149_BuildModelVolumeTable`, modèle attribué à David
-//! Savinkoff, analyse de mesures réelles par Paulo Simoes et Benjamin
-//! Gerard) — voir la doc de la fonction pour le détail.
+//! ## Non-linear mixing of the 3 channels (Hatari-style)
+//! [`mix_channels_model`] combines 3 channel levels (0-31) into a
+//! single sample, modeling the chip's real DAC as three adjustable
+//! pull-down resistors in parallel across a fixed load resistor
+//! (voltage divider) — NOT a simple sum of the 3 levels: real silicon
+//! is not physically a linear adder (combining 2-3 channels at full
+//! amplitude clearly saturates well below 3x a single channel).
+//! Formula and constants taken as-is from Hatari (`sound.c`,
+//! `YM2149_BuildModelVolumeTable`, model attributed to David
+//! Savinkoff, analysis of real measurements by Paulo Simoes and
+//! Benjamin Gerard) — see the function's doc for details.
 //!
-//! ## Limitations connues (v1)
-//! - Pas de conversion en échantillons PCM allant au-delà du mixage 3
-//!   canaux ci-dessus : pas de filtrage analogique en aval simulé (voir
-//!   plutôt `Microwire` pour le filtre graves/aigus LMC1992, en aval du
-//!   mixage PSG+DMA Sound).
-//! - Signification des bits des ports A/B (sélection lecteur, joystick,
-//!   Centronics...) non interprétée : ce sont des registres 8 bits bruts,
-//!   à charge du board de leur donner un sens.
-//! - Table des formes d'enveloppe et polynôme du générateur de bruit :
-//!   comportement documenté publiquement par le fabricant d'origine
-//!   (General Instrument, datasheet AY-3-8910, table des 10 formes
-//!   d'enveloppe et LFSR 17 bits) — reproduits ici indépendamment, pas
-//!   empruntés à un émulateur existant.
+//! ## Known limitations (v1)
+//! - No conversion to PCM samples beyond the 3-channel mixing above:
+//!   no downstream analog filtering simulated (see `Microwire` instead
+//!   for the LMC1992 bass/treble filter, downstream of the PSG+DMA
+//!   Sound mix).
+//! - Meaning of port A/B bits (drive selection, joystick, Centronics...)
+//!   not interpreted: these are raw 8-bit registers, up to the board
+//!   to give them meaning.
+//! - Envelope shape table and noise generator polynomial: behavior
+//!   publicly documented by the original manufacturer (General
+//!   Instrument, AY-3-8910 datasheet, table of the 10 envelope shapes
+//!   and 17-bit LFSR) — reproduced here independently, not borrowed
+//!   from an existing emulator.
 
-/// Index des 16 registres (sélectionnés via [`Ym2149::write`] sur
-/// [`REG_SELECT`], données lues/écrites ensuite sur [`REG_DATA`]).
+/// Index of the 16 registers (selected via [`Ym2149::write`] on
+/// [`REG_SELECT`], data then read/written on [`REG_DATA`]).
 pub mod reg {
     pub const TONE_A_FINE: u8 = 0;
     pub const TONE_A_COARSE: u8 = 1;
@@ -61,24 +61,24 @@ pub mod reg {
     pub const IO_PORT_B: u8 = 15;
 }
 
-/// Nombre de bits significatifs de chaque registre (le reste est masqué à
-/// l'écriture — comportement standard du silicium, qui n'a pas de bascule
-/// pour les bits non câblés).
+/// Number of significant bits of each register (the rest is masked
+/// off on write — standard silicon behavior, which has no flip-flop
+/// for unwired bits).
 const REG_WIDTH_MASK: [u8; 16] = [
     0xFF, 0x0F, // tone A fine/coarse
     0xFF, 0x0F, // tone B
     0xFF, 0x0F, // tone C
     0x1F, // noise period (5 bits)
-    0xFF, // mixer (tous les bits utilisés)
-    0x1F, 0x1F, 0x1F, // amplitudes A/B/C (bit4 = mode enveloppe, bits0-3 = niveau)
+    0xFF, // mixer (all bits used)
+    0x1F, 0x1F, 0x1F, // amplitudes A/B/C (bit4 = envelope mode, bits0-3 = level)
     0xFF, 0xFF, // envelope period fine/coarse
     0x0F, // envelope shape
     0xFF, 0xFF, // I/O port A/B
 ];
 
-/// Registre offset "select" (offset logique 0) et "data" (offset logique 1)
-/// dans l'espace d'adressage de la puce — sur ST réel, sélecteur à
-/// `0xFF8800`, données à `0xFF8802`.
+/// Register offset "select" (logical offset 0) and "data" (logical
+/// offset 1) in the chip's address space — on real ST, select at
+/// `0xFF8800`, data at `0xFF8802`.
 pub mod bus_offset {
     pub const SELECT: u8 = 0;
     pub const DATA: u8 = 1;
@@ -91,16 +91,17 @@ struct ToneGenerator {
 }
 
 impl ToneGenerator {
-    /// Avance d'un cycle puce (déjà divisé du cycle CPU par l'appelant).
-    /// Une tonalité désactivée (period 0, cas réel documenté : traité comme
-    /// 1) bascule quand même au rythme minimal plutôt que de geler.
+    /// Advances by one chip cycle (already divided down from the CPU
+    /// cycle by the caller). A disabled tone (period 0, a real
+    /// documented case: treated as 1) still toggles at the minimum
+    /// rate rather than freezing.
     ///
-    /// Le compteur interne du silicium avance à clock/8 (pas à la fréquence
-    /// puce elle-même) : basculer tous les `period` cycles puce donnerait un
-    /// son 8× trop aigu. Confirmé par recoupement datasheet AY-3-8910/YM2149
-    /// et par l'implémentation de référence Hatari (`sound.c`,
-    /// `ToneA_count`/`ToneA_per` incrémentés une fois par tick à 250 kHz pour
-    /// une puce cadencée à 2 MHz).
+    /// The silicon's internal counter advances at clock/8 (not at the
+    /// chip frequency itself): toggling every `period` chip cycles
+    /// would produce a sound 8x too high-pitched. Confirmed by
+    /// cross-checking the AY-3-8910/YM2149 datasheet and the Hatari
+    /// reference implementation (`sound.c`, `ToneA_count`/`ToneA_per`
+    /// incremented once per tick at 250 kHz for a chip clocked at 2 MHz).
     fn tick(&mut self, period_reg: u16) {
         let period = period_reg.max(1) * 8;
         self.counter += 1;
@@ -114,8 +115,8 @@ impl ToneGenerator {
 #[derive(Debug, Clone, Default)]
 struct NoiseGenerator {
     counter: u16,
-    /// LFSR 17 bits (bit 0 = sortie courante). Polynôme standard
-    /// AY-3-8910 : rebouclage sur XOR des bits 0 et 3.
+    /// 17-bit LFSR (bit 0 = current output). Standard AY-3-8910
+    /// polynomial: feedback on XOR of bits 0 and 3.
     lfsr: u32,
 }
 
@@ -123,14 +124,14 @@ impl NoiseGenerator {
     fn new() -> Self {
         NoiseGenerator {
             counter: 0,
-            lfsr: 1, // état initial non nul (un LFSR bloqué à 0 ne bougerait jamais)
+            lfsr: 1, // non-zero initial state (an LFSR stuck at 0 would never move)
         }
     }
 
-    /// Le compteur de bruit du silicium avance deux fois moins vite que celui
-    /// de tonalité/enveloppe (clock/16 au lieu de clock/8) — vérifié dans
-    /// Hatari (`sound.c`, `YM2149_Freq_div_2` : `Noise_count` n'avance qu'un
-    /// cycle sur deux par rapport à `ToneX_count`).
+    /// The silicon's noise counter advances at half the rate of the
+    /// tone/envelope counter (clock/16 instead of clock/8) — verified
+    /// in Hatari (`sound.c`, `YM2149_Freq_div_2`: `Noise_count` only
+    /// advances one cycle out of two relative to `ToneX_count`).
     fn tick(&mut self, period_reg: u8) {
         let period = period_reg.max(1) as u16 * 16;
         self.counter += 1;
@@ -146,9 +147,10 @@ impl NoiseGenerator {
     }
 }
 
-/// Forme d'enveloppe (registre `ENVELOPE_SHAPE`, 4 bits) : table standard du
-/// datasheet AY-3-8910 (Continue/Attack/Alternate/Hold), reconstruite ici
-/// depuis la description publique du fabricant (pas du code d'émulateur).
+/// Envelope shape (`ENVELOPE_SHAPE` register, 4 bits): standard
+/// AY-3-8910 datasheet table (Continue/Attack/Alternate/Hold),
+/// reconstructed here from the manufacturer's public description
+/// (not from emulator code).
 #[derive(Debug, Clone, Copy)]
 struct EnvelopeShape {
     continue_: bool,
@@ -171,13 +173,13 @@ impl EnvelopeShape {
 #[derive(Debug, Clone)]
 struct EnvelopeGenerator {
     counter: u32,
-    /// Position dans la rampe 0..31 (5 bits de résolution, deux fois celle
-    /// des canaux — comportement standard documenté du chip).
+    /// Position in the 0..31 ramp (5 bits of resolution, twice that
+    /// of the channels — standard documented chip behavior).
     step: u8,
-    /// Sens de la rampe courante (true = montant).
+    /// Direction of the current ramp (true = rising).
     rising: bool,
-    /// Vrai une fois qu'un cycle non-Continue a atteint sa fin et que le
-    /// niveau doit rester figé.
+    /// True once a non-Continue cycle has reached its end and the
+    /// level must stay frozen.
     finished: bool,
     shape: EnvelopeShape,
 }
@@ -193,8 +195,8 @@ impl EnvelopeGenerator {
         }
     }
 
-    /// Écrire le registre de forme relance toujours l'enveloppe depuis le
-    /// début (comportement documenté du silicium réel).
+    /// Writing the shape register always restarts the envelope from
+    /// the beginning (documented real silicon behavior).
     fn restart(&mut self, shape_bits: u8) {
         self.shape = EnvelopeShape::from_bits(shape_bits);
         self.counter = 0;
@@ -203,11 +205,12 @@ impl EnvelopeGenerator {
         self.finished = false;
     }
 
-    /// Le compteur d'enveloppe avance au même rythme que celui de tonalité
-    /// (clock/8) — vérifié dans Hatari (`sound.c`, `Env_count`/`Env_per`
-    /// incrémentés dans la même boucle à 250 kHz que `ToneX_count`). La
-    /// résolution doublée (32 pas au lieu de 16) vient uniquement du nombre
-    /// de pas de la rampe, pas d'un diviseur d'horloge différent.
+    /// The envelope counter advances at the same rate as the tone
+    /// counter (clock/8) — verified in Hatari (`sound.c`,
+    /// `Env_count`/`Env_per` incremented in the same 250 kHz loop as
+    /// `ToneX_count`). The doubled resolution (32 steps instead of 16)
+    /// comes solely from the ramp's step count, not from a different
+    /// clock divider.
     fn tick(&mut self, period_reg: u16) {
         if self.finished {
             return;
@@ -222,8 +225,8 @@ impl EnvelopeGenerator {
         if self.step > 31 {
             self.step = 0;
             if !self.shape.continue_ {
-                // Une seule rampe : se fige au niveau final (table du
-                // datasheet — Hold n'a d'effet que si Continue=1).
+                // Single ramp: freezes at the final level (datasheet
+                // table — Hold only has an effect if Continue=1).
                 self.finished = true;
                 self.step = if self.rising { 31 } else { 0 };
                 return;
@@ -238,7 +241,7 @@ impl EnvelopeGenerator {
         }
     }
 
-    /// Niveau courant 0-31.
+    /// Current level 0-31.
     fn level(&self) -> u8 {
         if self.rising {
             self.step
@@ -248,29 +251,28 @@ impl EnvelopeGenerator {
     }
 }
 
-/// État complet d'une puce YM2149.
+/// Full state of a YM2149 chip.
 #[derive(Debug, Clone)]
 pub struct Ym2149 {
     selected: u8,
     regs: [u8; 16],
-    /// Accumulateur de cycles CPU fractionnaires : la puce est cadencée à
-    /// CPU/4 (2 MHz pour un CPU ST/STE à 8 MHz).
+    /// Fractional CPU cycle accumulator: the chip is clocked at CPU/4
+    /// (2 MHz for an ST/STE CPU at 8 MHz).
     cpu_cycle_acc: u32,
     tone: [ToneGenerator; 3],
     noise: NoiseGenerator,
     envelope: EnvelopeGenerator,
-    /// Niveaux d'entrée des ports A/B pour les bits configurés en entrée
-    /// (DDR via `MIXER` bits 6-7) — injectés par l'appelant, cf.
+    /// Input levels of ports A/B for bits configured as inputs (DDR
+    /// via `MIXER` bits 6-7) — injected by the caller, cf.
     /// `set_port_a_input`/`set_port_b_input`.
     port_a_in: u8,
     port_b_in: u8,
-    /// Somme des niveaux de sortie de chaque canal, accumulée À CHAQUE
-    /// cycle puce (pas juste échantillonnée ponctuellement) depuis le
-    /// dernier [`Self::take_averaged_levels`] — voir sa doc : nécessaire
-    /// pour éviter l'aliasing quand on convertit vers un taux
-    /// d'échantillonnage audio (44,1 kHz) bien plus lent que l'horloge
-    /// puce (2 MHz, jusqu'à ~45 bascules possibles entre deux échantillons
-    /// de sortie pour une tonalité aiguë).
+    /// Sum of each channel's output level, accumulated on EVERY chip
+    /// cycle (not just sampled occasionally) since the last
+    /// [`Self::take_averaged_levels`] — see its doc: needed to avoid
+    /// aliasing when converting to an audio sample rate (44.1 kHz)
+    /// much slower than the chip clock (2 MHz, up to ~45 possible
+    /// toggles between two output samples for a high-pitched tone).
     level_accum: [u32; 3],
     level_accum_count: u32,
 }
@@ -284,14 +286,13 @@ impl Default for Ym2149 {
 impl Ym2149 {
     pub fn new() -> Self {
         let mut regs = [0u8; 16];
-        // Port A : lignes de sélection lecteur/face du lecteur de
-        // disquette (bits 0-2, voir `port_a_output`) tirées au niveau haut
-        // par des résistances de rappel réelles tant que TOS n'a pas
-        // programmé le port — "aucun lecteur sélectionné + face 0" (0xFF),
-        // confirmé par Hatari (`psg.c` : commentaire explicite sur l'état
-        // après reset). Sans ça, avant que TOS ne programme ce port très
-        // tôt au boot, la face lue par défaut serait la face 1 (bit0=0)
-        // plutôt que 0.
+        // Port A: floppy drive/side select lines (bits 0-2, see
+        // `port_a_output`) pulled up by real pull-up resistors as long
+        // as TOS has not programmed the port — "no drive selected +
+        // side 0" (0xFF), confirmed by Hatari (`psg.c`: explicit
+        // comment about the post-reset state). Without this, before
+        // TOS programs this port very early at boot, the side read by
+        // default would be side 1 (bit0=0) instead of 0.
         regs[reg::IO_PORT_A as usize] = 0xFF;
         Ym2149 {
             selected: 0,
@@ -307,11 +308,11 @@ impl Ym2149 {
         }
     }
 
-    /// Lit le bus de la puce à l'offset logique `offset` (voir
-    /// [`bus_offset`]) : `SELECT` renvoie le numéro de registre
-    /// actuellement sélectionné, `DATA` renvoie son contenu (les ports A/B
-    /// combinent la valeur latchée en sortie avec le niveau d'entrée selon
-    /// la direction programmée dans `MIXER`).
+    /// Reads the chip bus at logical offset `offset` (see
+    /// [`bus_offset`]): `SELECT` returns the currently selected
+    /// register number, `DATA` returns its content (ports A/B combine
+    /// the latched output value with the input level according to the
+    /// direction programmed in `MIXER`).
     pub fn read(&mut self, offset: u8) -> u8 {
         match offset {
             bus_offset::SELECT => self.selected,
@@ -334,7 +335,7 @@ impl Ym2149 {
         }
     }
 
-    /// Écrit le bus de la puce à l'offset logique `offset` (voir
+    /// Writes the chip bus at logical offset `offset` (see
     /// [`bus_offset`]).
     pub fn write(&mut self, offset: u8, value: u8) {
         match offset {
@@ -354,26 +355,26 @@ impl Ym2149 {
         }
     }
 
-    /// Applique un niveau au port A pour les bits configurés en entrée
-    /// (DDR = 0 sur les bits correspondants de `MIXER`).
+    /// Applies a level to port A for bits configured as inputs (DDR =
+    /// 0 on the corresponding bits of `MIXER`).
     pub fn set_port_a_input(&mut self, value: u8) {
         self.port_a_in = value;
     }
 
-    /// Registre de sortie BRUT du port A (bascule interne, pas ce qu'une
-    /// relecture bus verrait via [`Self::read`] — celle-ci dépend de la
-    /// direction DDR programmée dans `MIXER`). Sur ST/STE réel, ce registre
-    /// pilote directement (indépendamment de la direction lue par le CPU)
-    /// les lignes de sélection lecteur/face du connecteur disquette :
-    /// bit0 (inversé) = face (0 après négation = face 1, 1 = face 0),
-    /// bit1 = 0 → lecteur A sélectionné, bit2 = 0 → lecteur B — confirmé
-    /// par Hatari (`psg.c`/`fdc.c`, `FDC_SetDriveSide`). À charge du board
-    /// de décoder ces bits (voir `AtariSt::tick`/écriture `FDC_DATA`).
+    /// RAW output register of port A (internal latch, not what a bus
+    /// read-back would see via [`Self::read`] — that depends on the
+    /// DDR direction programmed in `MIXER`). On real ST/STE, this
+    /// register directly drives (regardless of the direction read by
+    /// the CPU) the floppy connector's drive/side select lines: bit0
+    /// (inverted) = side (0 after negation = side 1, 1 = side 0),
+    /// bit1 = 0 → drive A selected, bit2 = 0 → drive B — confirmed by
+    /// Hatari (`psg.c`/`fdc.c`, `FDC_SetDriveSide`). Up to the board to
+    /// decode these bits (see `AtariSt::tick`/`FDC_DATA` write).
     pub fn port_a_output(&self) -> u8 {
         self.regs[reg::IO_PORT_A as usize]
     }
 
-    /// Applique un niveau au port B pour les bits configurés en entrée.
+    /// Applies a level to port B for bits configured as inputs.
     pub fn set_port_b_input(&mut self, value: u8) {
         self.port_b_in = value;
     }
@@ -382,8 +383,8 @@ impl Ym2149 {
         ((self.regs[coarse as usize] as u16) << 8) | self.regs[fine as usize] as u16
     }
 
-    /// Avance les générateurs de `cpu_cycles` cycles CPU (horloge ST/STE à
-    /// 8 MHz ; la puce elle-même tourne à CPU/4).
+    /// Advances the generators by `cpu_cycles` CPU cycles (ST/STE
+    /// clock at 8 MHz; the chip itself runs at CPU/4).
     pub fn tick(&mut self, cpu_cycles: u32) {
         self.cpu_cycle_acc += cpu_cycles;
         let chip_cycles = self.cpu_cycle_acc / 4;
@@ -401,8 +402,8 @@ impl Ym2149 {
             self.tone[2].tick(tone_c);
             self.noise.tick(noise_period);
             self.envelope.tick(envelope_period);
-            // Accumule le niveau de CE cycle puce précis (pas seulement
-            // l'état final après la boucle) — voir la doc de
+            // Accumulates the level for THIS precise chip cycle (not
+            // just the final state after the loop) — see the doc of
             // `level_accum`/`take_averaged_levels`.
             for ch in 0..3 {
                 self.level_accum[ch] += self.channel_level(ch) as u32;
@@ -411,28 +412,28 @@ impl Ym2149 {
         }
     }
 
-    /// Moyenne temporelle du niveau de chaque canal depuis le dernier appel
-    /// (ou depuis la création/le reset si jamais appelé), puis remet
-    /// l'accumulateur à zéro pour la prochaine période — à appeler une fois
-    /// par échantillon de sortie audio produit (pas plus souvent), sans quoi
-    /// la moyenne ne porterait que sur une fraction de la période réelle.
+    /// Time-average of each channel's level since the last call (or
+    /// since creation/reset if never called), then resets the
+    /// accumulator to zero for the next period — to be called once per
+    /// produced audio output sample (no more often), otherwise the
+    /// average would only cover a fraction of the real period.
     ///
-    /// Contrairement à [`Self::channel_level`] (un échantillonnage ponctuel
-    /// de l'état instantané), ceci intègre TOUTES les bascules
-    /// tonalité/bruit survenues entre deux échantillons de sortie — sans ça,
-    /// une tonalité dont la période puce est plus courte que la période
-    /// d'échantillonnage audio (44,1 kHz vs 2 MHz : jusqu'à ~45 bascules
-    /// possibles par échantillon de sortie) produit un repliement de
-    /// spectre (aliasing) qui sonne comme un parasite granuleux au lieu
-    /// d'une tonalité propre — confirmé par un enregistrement réel de
-    /// l'utilisateur montrant une forme d'onde en escalier au lieu d'un
-    /// signal carré net.
+    /// Unlike [`Self::channel_level`] (a point-in-time sample of the
+    /// instantaneous state), this integrates ALL tone/noise toggles
+    /// that occurred between two output samples — without this, a
+    /// tone whose chip-level period is shorter than the audio sampling
+    /// period (44.1 kHz vs 2 MHz: up to ~45 possible toggles per
+    /// output sample) produces aliasing that sounds like grainy
+    /// static instead of a clean tone — confirmed by an actual user
+    /// recording showing a staircase waveform instead of a clean
+    /// square signal.
     pub fn take_averaged_levels(&mut self) -> [f32; 3] {
         let count = self.level_accum_count;
         let levels = if count == 0 {
-            // Aucun cycle puce écoulé depuis le dernier appel (sortie audio
-            // échantillonnée plus vite que l'horloge puce, cas limite) :
-            // retombe sur l'état instantané plutôt qu'une division par zéro.
+            // No chip cycles elapsed since the last call (audio output
+            // sampled faster than the chip clock, an edge case): falls
+            // back to the instantaneous state rather than a division
+            // by zero.
             [self.channel_level(0) as f32, self.channel_level(1) as f32, self.channel_level(2) as f32]
         } else {
             let mut out = [0.0f32; 3];
@@ -446,19 +447,19 @@ impl Ym2149 {
         levels
     }
 
-    /// Niveau numérique de sortie 0-31 du canal `channel` (0=A, 1=B, 2=C) à
-    /// l'instant courant : combine le portillonnage tonalité/bruit
-    /// (`MIXER`) et le niveau d'amplitude fixe ou d'enveloppe. Une puce
-    /// AY-3-8910/YM2149 réelle produit un niveau 4 bits (0-15) en mode fixe
-    /// mais 5 bits (0-31) en mode enveloppe ; on renvoie ici directement le
-    /// niveau final déjà à l'échelle 0-31 (fixe ×2) pour une seule échelle
-    /// de sortie cohérente entre les deux modes.
+    /// Digital output level 0-31 of channel `channel` (0=A, 1=B, 2=C)
+    /// at the current instant: combines tone/noise gating (`MIXER`)
+    /// and the fixed amplitude or envelope level. A real
+    /// AY-3-8910/YM2149 chip produces a 4-bit level (0-15) in fixed
+    /// mode but 5-bit (0-31) in envelope mode; here we directly return
+    /// the final level already scaled to 0-31 (fixed x2) for a single
+    /// consistent output scale between the two modes.
     pub fn channel_level(&self, channel: usize) -> u8 {
         let (tone_bit, noise_bit, amplitude_reg) = match channel {
             0 => (0, 3, reg::AMPLITUDE_A),
             1 => (1, 4, reg::AMPLITUDE_B),
             2 => (2, 5, reg::AMPLITUDE_C),
-            _ => panic!("canal YM2149 invalide : {channel}"),
+            _ => panic!("invalid YM2149 channel: {channel}"),
         };
         let mixer = self.regs[reg::MIXER as usize];
         let tone_enabled = mixer & (1 << tone_bit) == 0;
@@ -477,32 +478,33 @@ impl Ym2149 {
     }
 }
 
-/// Conversion volume fixe 4 bits (registre d'amplitude) -> échelle 5 bits
-/// (0-31, même échelle que l'enveloppe) — telle que MESURÉE sur silicium
-/// réel (Hatari, `sound.c`, `YmVolume4to5`), PAS un simple ×2 :
-/// `volume5 = volume4*2+1`, sauf 0 et 1 qui restent 0 et 1 (pour que 0
-/// reste bien 0 et que 15 devienne bien 31, aux deux extrémités). Utilisée
-/// par [`Ym2149::channel_level`] ; l'enveloppe, elle, parcourt déjà
-/// nativement 0-31 en pas de 1 (voir [`Envelope::level`]) et n'a pas besoin
-/// de cette conversion.
+/// Conversion of fixed 4-bit volume (amplitude register) to 5-bit
+/// scale (0-31, same scale as the envelope) — as MEASURED on real
+/// silicon (Hatari, `sound.c`, `YmVolume4to5`), NOT a simple x2:
+/// `volume5 = volume4*2+1`, except 0 and 1 which stay 0 and 1 (so that
+/// 0 stays exactly 0 and 15 correctly becomes 31, at both ends). Used
+/// by [`Ym2149::channel_level`]; the envelope, meanwhile, already
+/// natively spans 0-31 in steps of 1 (see [`Envelope::level`]) and
+/// does not need this conversion.
 const VOLUME_4_TO_5: [u8; 16] = [0, 1, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31];
 
-/// Table des 32 "conductances" par canal du modèle de mixage non-linéaire
-/// 3 voies, façon Hatari (`YM2149_BuildModelVolumeTable`, `sound.c`) —
-/// construite une seule fois (calcul récursif partant du niveau 31, voir
+/// Table of the 32 per-channel "conductances" of the non-linear
+/// 3-channel mixing model, Hatari-style
+/// (`YM2149_BuildModelVolumeTable`, `sound.c`) — built once (recursive
+/// computation starting from level 31, see
 /// [`build_conductance_table`]).
 fn conductance_table() -> &'static [f64; 32] {
     static TABLE: std::sync::OnceLock<[f64; 32]> = std::sync::OnceLock::new();
     TABLE.get_or_init(build_conductance_table)
 }
 
-/// Construit la table de conductances — voir [`conductance_table`]. Modèle
-/// physique du DAC réel : chaque canal est vu comme une résistance de
-/// tirage réglable (0-31), le niveau 31 correspondant à la conductance la
-/// plus élevée (résistance la plus faible). `FOURTH2` (racine quatrième de
-/// deux) et `WARP` sont repris tels quels de Hatari, où `WARP` est
-/// documenté comme "mesuré à 1.65932 depuis 46602" (résultat empirique,
-/// pas dérivé analytiquement).
+/// Builds the conductance table — see [`conductance_table`]. Physical
+/// model of the real DAC: each channel is seen as an adjustable
+/// pull-down resistor (0-31), level 31 corresponding to the highest
+/// conductance (lowest resistance). `FOURTH2` (fourth root of two)
+/// and `WARP` are taken as-is from Hatari, where `WARP` is documented
+/// as "measured at 1.65932 from 46602" (an empirical result, not
+/// analytically derived).
 fn build_conductance_table() -> [f64; 32] {
     const FOURTH2: f64 = 1.19;
     const WARP: f64 = 1.666666666666666667;
@@ -512,17 +514,17 @@ fn build_conductance_table() -> [f64; 32] {
         table[i] = conductance / 2.0;
         conductance = 1.0 / (1.0 - 1.0 / FOURTH2 / (1.0 / conductance + 1.0)) - 1.0;
     }
-    table[0] = 1.0e-8; // évite une division par zéro (silence total)
+    table[0] = 1.0e-8; // avoids a division by zero (total silence)
     table
 }
 
-/// Conductance interpolée linéairement pour un niveau FRACTIONNAIRE
-/// (0.0-31.0) — [`Ym2149::take_averaged_levels`] renvoie une moyenne
-/// temporelle (anti-repliement), pas un niveau entier 0-31 comme le
-/// ferait un échantillonnage instantané façon Hatari ; interpoler entre
-/// les 2 entrées de table les plus proches est une adaptation raisonnable
-/// de ce modèle discret à une entrée continue (l'écart entre deux niveaux
-/// adjacents du DAC réel est de toute façon faible, ~1.19× en amplitude).
+/// Linearly interpolated conductance for a FRACTIONAL level
+/// (0.0-31.0) — [`Ym2149::take_averaged_levels`] returns a time
+/// average (anti-aliasing), not an integer 0-31 level as an
+/// instantaneous Hatari-style sample would; interpolating between the
+/// 2 nearest table entries is a reasonable adaptation of this
+/// discrete model to a continuous input (the gap between two adjacent
+/// levels of the real DAC is small anyway, ~1.19x in amplitude).
 fn conductance_at(table: &[f64; 32], level: f32) -> f64 {
     let level = level.clamp(0.0, 31.0);
     let lo = level.floor() as usize;
@@ -531,19 +533,19 @@ fn conductance_at(table: &[f64; 32], level: f32) -> f64 {
     table[lo] * (1.0 - frac) + table[hi] * frac
 }
 
-/// Combine 3 niveaux de canal (0-31, voir [`Ym2149::channel_level`]/
-/// [`Ym2149::take_averaged_levels`]) en un seul échantillon de sortie
-/// NON-LINÉAIRE, façon Hatari (`YM2149_BuildModelVolumeTable`,
-/// `YM_MODEL_MIXING`) — voir la doc de module. Renvoie une valeur dans
-/// `0.0..=65535.0` (0 = silence, 65535 = les 3 canaux au maximum
-/// simultanément) ; à centrer/mettre à l'échelle par l'appelant selon son
-/// propre pipeline de sortie (voir `atari_st_sdl2.rs::mix_sample`).
+/// Combines 3 channel levels (0-31, see [`Ym2149::channel_level`]/
+/// [`Ym2149::take_averaged_levels`]) into a single NON-LINEAR output
+/// sample, Hatari-style (`YM2149_BuildModelVolumeTable`,
+/// `YM_MODEL_MIXING`) — see the module doc. Returns a value in
+/// `0.0..=65535.0` (0 = silence, 65535 = all 3 channels at maximum
+/// simultaneously); to be centered/scaled by the caller according to
+/// its own output pipeline (see `atari_st_sdl2.rs::mix_sample`).
 ///
-/// Formule reprise telle quelle de Hatari (`sound.c`, commentaire attribué
-/// à David Savinkoff) : `(MaxVol*WARP) / (1.0 +
-/// 1.0/(conductance_i+conductance_j+conductance_k))` — un diviseur de
-/// tension entre la résistance de charge fixe (normalisée à 1.0) et les 3
-/// résistances de tirage réglables en parallèle.
+/// Formula taken as-is from Hatari (`sound.c`, comment attributed to
+/// David Savinkoff): `(MaxVol*WARP) / (1.0 +
+/// 1.0/(conductance_i+conductance_j+conductance_k))` — a voltage
+/// divider between the fixed load resistor (normalized to 1.0) and
+/// the 3 adjustable pull-down resistors in parallel.
 pub fn mix_channels_model(levels: [f32; 3]) -> f32 {
     const MAX_VOL: f64 = 65535.0;
     const WARP: f64 = 1.666666666666666667;

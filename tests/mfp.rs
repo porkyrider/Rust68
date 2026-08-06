@@ -1,73 +1,73 @@
 #![cfg(feature = "atari-st")]
-//! Tests unitaires du MC68901 MFP (`rust68::peripherals::atari_st::mfp`).
+//! Unit tests for the MC68901 MFP (`rust68::peripherals::atari_st::mfp`).
 //!
-//! Aucune suite TomHarte n'existe pour ce périphérique (spécifique Atari
-//! ST, pas partie de la famille 68k elle-même) : ce fichier est le seul
-//! filet de sécurité, sur le même principe que `tests/instructions.rs`.
+//! No TomHarte suite exists for this peripheral (Atari ST specific,
+//! not part of the 68k family itself): this file is the only safety
+//! net, on the same principle as `tests/instructions.rs`.
 
 use rust68::peripherals::atari_st::mfp::{Mfp, channel, reg};
 
 #[test]
-fn gpip_lecture_reflete_ddr() {
+fn gpip_read_reflects_ddr() {
     let mut mfp = Mfp::new();
-    // DDR=0x0F : P0-P3 en sortie, P4-P7 en entrée.
+    // DDR=0x0F: P0-P3 as output, P4-P7 as input.
     mfp.write(reg::DDR, 0x0F);
-    mfp.write(reg::GPIP, 0b0000_0101); // latch de sortie pour P0-P3
-    mfp.set_gpip_input(4, true); // P4 (entrée) à 1
+    mfp.write(reg::GPIP, 0b0000_0101); // output latch for P0-P3
+    mfp.set_gpip_input(4, true); // P4 (input) set to 1
 
     let gpip = mfp.read(reg::GPIP);
-    assert_eq!(gpip & 0x0F, 0b0101, "les bits de sortie reflètent le latch écrit");
-    assert_eq!(gpip & 0x10, 0x10, "P4 (entrée) reflète le niveau appliqué");
+    assert_eq!(gpip & 0x0F, 0b0101, "output bits reflect the written latch");
+    assert_eq!(gpip & 0x10, 0x10, "P4 (input) reflects the applied level");
 }
 
 #[test]
-fn gpip_front_montant_ou_descendant_selon_aer() {
+fn gpip_rising_or_falling_edge_depending_on_aer() {
     let mut mfp = Mfp::new();
-    mfp.write(reg::DDR, 0x00); // tout en entrée
-    mfp.write(reg::IERB, 1 << channel::GPIP0); // activer le canal GPIP0
+    mfp.write(reg::DDR, 0x00); // all inputs
+    mfp.write(reg::IERB, 1 << channel::GPIP0); // enable channel GPIP0
     mfp.write(reg::IMRB, 1 << channel::GPIP0);
 
-    // AER bit0 = 0 : déclenche sur front DESCENDANT.
+    // AER bit0 = 0: triggers on FALLING edge.
     mfp.write(reg::AER, 0x00);
-    mfp.set_gpip_input(0, true); // montant : ne doit rien déclencher
+    mfp.set_gpip_input(0, true); // rising: should trigger nothing
     assert!(!mfp.interrupt_requested());
-    mfp.set_gpip_input(0, false); // descendant : doit déclencher
+    mfp.set_gpip_input(0, false); // falling: should trigger
     assert!(mfp.interrupt_requested());
 
-    // Acquitter, puis vérifier le sens inverse avec AER bit0 = 1.
+    // Acknowledge, then check the opposite sense with AER bit0 = 1.
     mfp.iack();
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::IERB, 1 << channel::GPIP0);
     mfp.write(reg::IMRB, 1 << channel::GPIP0);
-    mfp.write(reg::AER, 0x01); // front montant
+    mfp.write(reg::AER, 0x01); // rising edge
     mfp.set_gpip_input(0, true);
     assert!(mfp.interrupt_requested());
 }
 
 #[test]
-fn interruption_masquee_sans_ier_ni_imr() {
+fn interrupt_masked_without_ier_or_imr() {
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::AER, 0x01);
-    // IER non activé : le front ne doit même pas armer IPR.
+    // IER not enabled: the edge must not even arm IPR.
     mfp.set_gpip_input(0, true);
     assert!(!mfp.interrupt_requested());
     assert_eq!(mfp.read(reg::IPRB) & 1, 0);
 
-    // IER activé mais IMR non activé : IPR s'arme, mais pas de requête visible.
+    // IER enabled but IMR not enabled: IPR arms, but no visible request.
     mfp.write(reg::IERB, 0x01);
     mfp.set_gpip_input(0, false);
     mfp.set_gpip_input(0, true);
-    assert_eq!(mfp.read(reg::IPRB) & 1, 1, "IPR s'arme dès que IER est actif");
+    assert_eq!(mfp.read(reg::IPRB) & 1, 1, "IPR arms as soon as IER is active");
     assert!(
         !mfp.interrupt_requested(),
-        "IMR non activé : pas de requête vers le CPU"
+        "IMR not enabled: no request toward the CPU"
     );
 }
 
 #[test]
-fn ipr_isr_ne_s_effacent_que_par_ecriture_de_zero() {
+fn ipr_isr_clear_only_by_writing_zero() {
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::AER, 0x01);
@@ -75,74 +75,74 @@ fn ipr_isr_ne_s_effacent_que_par_ecriture_de_zero() {
     mfp.set_gpip_input(0, true);
     assert_eq!(mfp.read(reg::IPRB) & 1, 1);
 
-    // Écrire 1 ne doit pas ré-armer / n'a aucun effet (bit déjà à 1).
+    // Writing 1 must not re-arm / has no effect (bit already 1).
     mfp.write(reg::IPRB, 0xFF);
-    assert_eq!(mfp.read(reg::IPRB) & 1, 1, "écrire 1 n'affecte pas le bit");
+    assert_eq!(mfp.read(reg::IPRB) & 1, 1, "writing 1 does not affect the bit");
 
-    // Écrire 0 efface.
+    // Writing 0 clears it.
     mfp.write(reg::IPRB, 0xFE);
-    assert_eq!(mfp.read(reg::IPRB) & 1, 0, "écrire 0 efface le bit");
+    assert_eq!(mfp.read(reg::IPRB) & 1, 0, "writing 0 clears the bit");
 }
 
 #[test]
-fn iack_calcule_le_vecteur_et_arme_isr_dans_les_deux_modes_eoi() {
-    // Bit S (bit 3 du VR) — sens contre-intuitif, confirmé contre Hatari
-    // (`mfp.c`, `MFP_ProcessIACK`) : bit POSÉ = SEI ("software
-    // end-of-interrupt", ISR reste armé jusqu'à effacement logiciel), bit à
-    // 0 = EOI AUTOMATIQUE (le silicium arme PUIS efface ISR dans le MÊME
-    // cycle IACK — jamais observable posé). Voir la doc de `Mfp::iack`.
+fn iack_computes_vector_and_arms_isr_in_both_eoi_modes() {
+    // Bit S (VR bit 3) — counter-intuitive meaning, confirmed against Hatari
+    // (`mfp.c`, `MFP_ProcessIACK`): bit SET = SEI ("software
+    // end-of-interrupt", ISR stays armed until cleared by software), bit
+    // CLEAR = AUTOMATIC EOI (the silicon arms THEN clears ISR in the SAME
+    // IACK cycle — never observable as set). See the docs on `Mfp::iack`.
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::AER, 0x01);
     mfp.write(reg::IERB, 1 << channel::GPIP0);
     mfp.write(reg::IMRB, 1 << channel::GPIP0);
-    mfp.write(reg::VR, 0x40); // base vecteur 0x40 (bits 7-3), bit3=0 : EOI automatique
+    mfp.write(reg::VR, 0x40); // vector base 0x40 (bits 7-3), bit3=0: automatic EOI
     mfp.set_gpip_input(0, true);
 
     let vector = mfp.iack();
-    assert_eq!(vector, 0x40, "vecteur = VR[7:4] | canal (canal 0 ici)");
-    assert_eq!(mfp.read(reg::ISRB) & 1, 0, "EOI automatique : ISR jamais observable posé après l'IACK");
-    assert_eq!(mfp.read(reg::IPRB) & 1, 0, "IPR est effacé par l'IACK");
+    assert_eq!(vector, 0x40, "vector = VR[7:4] | channel (channel 0 here)");
+    assert_eq!(mfp.read(reg::ISRB) & 1, 0, "automatic EOI: ISR never observable as set after the IACK");
+    assert_eq!(mfp.read(reg::IPRB) & 1, 0, "IPR is cleared by the IACK");
 
-    // Mode SEI (bit 3 posé) : ISR s'arme et RESTE posé après l'IACK, jusqu'à
-    // effacement logiciel explicite — c'est ce mode qu'utilise la
-    // cartouche de diagnostic usine STe (test "T0 MFP timer", VR=0x48) :
-    // son gestionnaire d'interruption partagé (une seule routine aux 4
-    // vecteurs Timer A/B/C/D) distingue quel timer a déclenché en lisant
-    // précisément ces bits ISR avant de les effacer lui-même.
+    // SEI mode (bit 3 set): ISR arms and STAYS set after the IACK, until
+    // explicit software clearing — this is the mode used by the STe
+    // factory diagnostic cartridge (test "T0 MFP timer", VR=0x48):
+    // its shared interrupt handler (a single routine for the 4
+    // Timer A/B/C/D vectors) tells which timer triggered by reading
+    // precisely these ISR bits before clearing them itself.
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::AER, 0x01);
     mfp.write(reg::IERB, 1 << channel::GPIP0);
     mfp.write(reg::IMRB, 1 << channel::GPIP0);
-    mfp.write(reg::VR, 0x48); // bit3 posé : SEI
+    mfp.write(reg::VR, 0x48); // bit3 set: SEI
     mfp.set_gpip_input(0, true);
     mfp.iack();
-    assert_eq!(mfp.read(reg::ISRB) & 1, 1, "SEI : ISR reste armé après l'IACK");
+    assert_eq!(mfp.read(reg::ISRB) & 1, 1, "SEI: ISR stays armed after the IACK");
 }
 
 #[test]
-fn iack_exclut_le_bit_s_auto_eoi_du_vecteur() {
-    // Le bit 3 du VR (S, SEI/software-EOI quand posé — voir la doc de
-    // `Mfp::iack`) est un bit de contrôle séparé, PAS le bit de poids fort
-    // du numéro de canal : seuls VR[7:4] forment la base du vecteur, les 4
-    // bits de canal (0-15) occupent tout le bas. Un TOS réel programme
-    // VR=0x48 (base 0x40, SEI actif) puis installe ses gestionnaires à
-    // `0x100 + canal*4` (vecteur `0x40 | canal`) — confondre
-    // le bit S avec le bit haut du canal calculerait `0x48 | canal` à la
-    // place, un décalage de 8 vecteurs (32 octets) qui fait vectorer vers
-    // un gestionnaire jamais installé (bug réel rencontré en faisant
-    // démarrer un TOS réel : Timer C, VR=0x48, vectorait vers `$134`
-    // au lieu de `$114` où le TOS avait réellement installé son
-    // gestionnaire).
+fn iack_excludes_s_bit_auto_eoi_from_vector() {
+    // VR bit 3 (S, SEI/software-EOI when set — see the docs on
+    // `Mfp::iack`) is a separate control bit, NOT the high-order bit
+    // of the channel number: only VR[7:4] form the vector base, the 4
+    // channel bits (0-15) occupy the entire low part. A real TOS programs
+    // VR=0x48 (base 0x40, SEI active) then installs its handlers at
+    // `0x100 + channel*4` (vector `0x40 | channel`) — confusing
+    // the S bit with the channel's high bit would compute `0x48 | channel`
+    // instead, an offset of 8 vectors (32 bytes) which vectors to
+    // a handler that was never installed (a real bug encountered while
+    // booting a real TOS: Timer C, VR=0x48, vectored to `$134`
+    // instead of `$114` where TOS had actually installed its
+    // handler).
     let mut mfp = Mfp::new();
     mfp.write(reg::IERB, 1 << channel::TIMER_C);
     mfp.write(reg::IMRB, 1 << channel::TIMER_C);
     mfp.write(reg::VR, 0x48);
-    // Timer C en mode delay, prescaler ÷4 (control=1), data=1 : décompte
-    // dès le premier tick et déclenche `request()` en interne. La donnée
-    // doit être écrite AVANT le contrôle : `reload()` (déclenché par
-    // l'écriture de TCDCR) recharge le compteur depuis la donnée.
+    // Timer C in delay mode, prescaler ÷4 (control=1), data=1: counts down
+    // on the very first tick and triggers `request()` internally. The data
+    // must be written BEFORE the control: `reload()` (triggered by
+    // the write to TCDCR) reloads the counter from the data.
     mfp.write(reg::TCDR, 1);
     mfp.write(reg::TCDCR, 0x01 << 4);
     mfp.tick(100);
@@ -151,21 +151,21 @@ fn iack_exclut_le_bit_s_auto_eoi_du_vecteur() {
     assert_eq!(
         vector,
         0x40 | channel::TIMER_C,
-        "VR=0x48 avec S=1 : vecteur = VR[7:4](0x40) | canal, pas VR[7:3](0x48) | canal"
+        "VR=0x48 with S=1: vector = VR[7:4](0x40) | channel, not VR[7:3](0x48) | channel"
     );
 }
 
 #[test]
-fn priorite_du_canal_le_plus_haut() {
+fn priority_of_highest_channel() {
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
-    mfp.write(reg::AER, 0xFF); // tous fronts montants
+    mfp.write(reg::AER, 0xFF); // all rising edges
     mfp.write(reg::IERB, (1 << channel::GPIP0) | (1 << channel::GPIP2));
     mfp.write(reg::IMRB, (1 << channel::GPIP0) | (1 << channel::GPIP2));
     mfp.set_gpip_input(0, true);
     mfp.set_gpip_input(2, true);
 
-    // Canal 2 (GPIP2) > canal 0 (GPIP0) : doit être acquitté en premier.
+    // Channel 2 (GPIP2) > channel 0 (GPIP0): must be acknowledged first.
     let vector = mfp.iack();
     assert_eq!(vector & 0x07, channel::GPIP2);
     let vector2 = mfp.iack();
@@ -173,16 +173,16 @@ fn priorite_du_canal_le_plus_haut() {
 }
 
 #[test]
-fn un_isr_de_priorite_inferieure_ne_bloque_pas_un_canal_superieur() {
-    // Canal 5 (GPIP5, priorité basse) déjà "in service" : un nouveau canal
-    // de priorité STRICTEMENT supérieure (TIMER_A=13) doit quand même
-    // pouvoir demander service — c'est la préemption d'un ISR de priorité
-    // inférieure par un canal supérieur, le vrai comportement MC68901
-    // (voir la doc de `Mfp::highest_priority_pending`).
+fn a_lower_priority_isr_does_not_block_a_higher_channel() {
+    // Channel 5 (GPIP5, low priority) already "in service": a new channel
+    // of STRICTLY higher priority (TIMER_A=13) must still be able
+    // to request service — this is preemption of a lower-priority
+    // ISR by a higher channel, the real MC68901 behavior
+    // (see the docs on `Mfp::highest_priority_pending`).
     let mut mfp = Mfp::new();
-    // Mode SEI (bit 3 du VR posé) : ISR reste armé après l'IACK jusqu'à
-    // effacement logiciel — nécessaire ici pour observer la préemption (en
-    // EOI automatique, ISR ne reste jamais posé, voir la doc de
+    // SEI mode (VR bit 3 set): ISR stays armed after the IACK until
+    // cleared by software — needed here to observe the preemption (in
+    // automatic EOI, ISR never stays set, see the docs on
     // `Mfp::iack`).
     mfp.write(reg::VR, 0x08);
     mfp.write(reg::DDR, 0x00);
@@ -190,32 +190,32 @@ fn un_isr_de_priorite_inferieure_ne_bloque_pas_un_canal_superieur() {
     mfp.write(reg::IERB, 1 << channel::GPIP5);
     mfp.write(reg::IMRB, 1 << channel::GPIP5);
     mfp.set_gpip_input(5, true);
-    let v = mfp.iack(); // GPIP5 passe "in service" (ISR armé, IPR effacé)
+    let v = mfp.iack(); // GPIP5 becomes "in service" (ISR armed, IPR cleared)
     assert_eq!(v & 0x0F, channel::GPIP5);
     assert_eq!(mfp.read(reg::ISRB) & (1 << channel::GPIP5), 1 << channel::GPIP5);
 
     mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
     mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
     mfp.write(reg::TADR, 1);
-    mfp.write(reg::TACR, 1); // démarre, ÷4
-    mfp.tick(1000); // largement de quoi déclencher au moins une fois
+    mfp.write(reg::TACR, 1); // starts, ÷4
+    mfp.tick(1000); // comfortably enough to trigger at least once
 
     assert!(
         mfp.interrupt_requested(),
-        "TIMER_A (canal 13) doit préempter GPIP5 (canal 7) déjà in-service"
+        "TIMER_A (channel 13) must preempt GPIP5 (channel 7) already in-service"
     );
     let v2 = mfp.iack();
-    assert_eq!(v2 & 0x0F, channel::TIMER_A, "TIMER_A doit être le canal acquitté");
+    assert_eq!(v2 & 0x0F, channel::TIMER_A, "TIMER_A must be the acknowledged channel");
 }
 
 #[test]
-fn un_isr_de_priorite_superieure_bloque_un_canal_inferieur() {
-    // Symétrique du test précédent : canal 13 (TIMER_A) in service, un
-    // nouveau canal 5 (GPIP2, priorité inférieure) pending+non masqué ne
-    // doit PAS générer de requête tant que TIMER_A n'est pas acquitté.
+fn a_higher_priority_isr_blocks_a_lower_channel() {
+    // Mirror of the previous test: channel 13 (TIMER_A) in service, a
+    // new channel 5 (GPIP2, lower priority) pending+unmasked must NOT
+    // generate a request until TIMER_A is acknowledged.
     let mut mfp = Mfp::new();
-    // Mode SEI (bit 3 du VR posé), même raison que le test précédent : ISR
-    // doit rester posé après l'IACK pour observer le blocage.
+    // SEI mode (VR bit 3 set), same reason as the previous test: ISR
+    // must stay set after the IACK to observe the blocking.
     mfp.write(reg::VR, 0x08);
     mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
     mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
@@ -236,138 +236,138 @@ fn un_isr_de_priorite_superieure_bloque_un_canal_inferieur() {
     mfp.write(reg::IMRB, 1 << channel::GPIP2);
     mfp.set_gpip_input(2, true);
 
-    assert_eq!(mfp.read(reg::IPRB) & (1 << channel::GPIP2), 1 << channel::GPIP2, "GPIP2 reste pending");
+    assert_eq!(mfp.read(reg::IPRB) & (1 << channel::GPIP2), 1 << channel::GPIP2, "GPIP2 stays pending");
     assert!(
         !mfp.interrupt_requested(),
-        "GPIP2 (canal 2) ne doit pas demander service tant que TIMER_A (canal 13) est in-service"
+        "GPIP2 (channel 2) must not request service while TIMER_A (channel 13) is in-service"
     );
 
-    // Acquitter TIMER_A (SEI, mode armé explicitement ci-dessus) libère la
-    // voie pour GPIP2.
+    // Acknowledging TIMER_A (SEI, explicitly armed mode above) clears the
+    // way for GPIP2.
     mfp.write(reg::ISRA, 0x00);
     assert!(
         mfp.interrupt_requested(),
-        "TIMER_A acquitté : GPIP2 redevient éligible"
+        "TIMER_A acknowledged: GPIP2 becomes eligible again"
     );
     let v2 = mfp.iack();
     assert_eq!(v2 & 0x0F, channel::GPIP2);
 }
 
 #[test]
-fn timer_a_delay_mode_declenche_et_recharge() {
+fn timer_a_delay_mode_triggers_and_reloads() {
     let mut mfp = Mfp::new();
     mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
     mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
-    mfp.write(reg::TADR, 5); // valeur de rechargement
-    mfp.write(reg::TACR, 1); // démarre en mode delay, ÷4
+    mfp.write(reg::TADR, 5); // reload value
+    mfp.write(reg::TACR, 1); // starts in delay mode, ÷4
 
-    // Lecture pendant que le timer tourne : renvoie le compte courant, pas 5.
+    // Reading while the timer runs: returns the current count, not 5.
     assert_eq!(mfp.read(reg::TADR), 5);
 
-    // Budget clairement insuffisant : pas encore déclenché.
+    // Clearly insufficient budget: not triggered yet.
     mfp.tick(10);
     assert!(
         !mfp.interrupt_requested(),
-        "10 cycles CPU ne suffisent pas à épuiser data=5 en ÷4"
+        "10 CPU cycles are not enough to exhaust data=5 at ÷4"
     );
 
-    // Budget généreux (largement supérieur à (5+1)*4 cycles MFP convertis
-    // en cycles CPU) : doit avoir déclenché au moins une fois.
+    // Generous budget (well above (5+1)*4 MFP cycles converted
+    // to CPU cycles): must have triggered at least once.
     for _ in 0..30 {
         mfp.tick(10);
     }
     assert!(
         mfp.interrupt_requested(),
-        "budget généreux : le timer A doit avoir déclenché"
+        "generous budget: timer A must have triggered"
     );
     assert_eq!(mfp.read(reg::IPRA) & (1 << (channel::TIMER_A - 8)), 1 << (channel::TIMER_A - 8));
 }
 
 #[test]
-fn timer_arrete_ne_declenche_jamais() {
+fn stopped_timer_never_triggers() {
     let mut mfp = Mfp::new();
     mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
     mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
-    mfp.write(reg::TADR, 1); // période minimale
-    mfp.write(reg::TACR, 0); // arrêté
+    mfp.write(reg::TADR, 1); // minimal period
+    mfp.write(reg::TACR, 0); // stopped
 
     for _ in 0..1000 {
         mfp.tick(100);
     }
-    assert!(!mfp.interrupt_requested(), "timer arrêté (control=0) : jamais de déclenchement");
-    assert_eq!(mfp.read(reg::TADR), 1, "lecture à l'arrêt = valeur de rechargement telle quelle");
+    assert!(!mfp.interrupt_requested(), "stopped timer (control=0): never triggers");
+    assert_eq!(mfp.read(reg::TADR), 1, "reading while stopped = reload value as-is");
 }
 
 #[test]
-fn timer_a_event_count_ignore_tick_et_reagit_a_pulse() {
+fn timer_a_event_count_ignores_tick_and_reacts_to_pulse() {
     let mut mfp = Mfp::new();
     mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
     mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
     mfp.write(reg::TADR, 3);
-    mfp.write(reg::TACR, 0x08); // mode event-count
+    mfp.write(reg::TACR, 0x08); // event-count mode
 
-    // tick() ne doit jamais faire progresser un timer en event-count.
+    // tick() must never advance a timer in event-count mode.
     for _ in 0..10_000 {
         mfp.tick(1000);
     }
-    assert!(!mfp.interrupt_requested(), "event-count : tick() ne doit rien décompter");
+    assert!(!mfp.interrupt_requested(), "event-count: tick() must not decrement anything");
 
-    // pulse_ta() doit décompter : période = data = 3 pulses (même compteur
-    // que le mode delay, voir la doc de `Timer::decrement` — le compte
-    // affiché juste après rechargement vaut déjà `data`, donc le
-    // déclenchement a lieu au `data`-ième décrément, pas au `data+1`-ième).
+    // pulse_ta() must decrement: period = data = 3 pulses (same counter
+    // as delay mode, see the docs on `Timer::decrement` — the count
+    // displayed right after reload is already `data`, so the
+    // trigger happens on the `data`-th decrement, not the `data+1`-th).
     for _ in 0..2 {
         mfp.pulse_ta();
         assert!(!mfp.interrupt_requested());
     }
     mfp.pulse_ta();
-    assert!(mfp.interrupt_requested(), "3e pulse : déclenchement attendu");
+    assert!(mfp.interrupt_requested(), "3rd pulse: trigger expected");
 }
 
 #[test]
-fn timer_c_et_d_partagent_tcdcr() {
+fn timer_c_and_d_share_tcdcr() {
     let mut mfp = Mfp::new();
     mfp.write(reg::TCDCR, (0x03 << 4) | 0x02); // Timer C = ÷16, Timer D = ÷10
     assert_eq!(mfp.read(reg::TCDCR), (0x03 << 4) | 0x02);
 }
 
 #[test]
-fn usart_reception_et_transmission_au_niveau_octet() {
+fn usart_byte_level_reception_and_transmission() {
     let mut mfp = Mfp::new();
     mfp.write(reg::IERA, 1 << (channel::RX_FULL - 8));
     mfp.write(reg::IMRA, 1 << (channel::RX_FULL - 8));
 
     mfp.push_rx_byte(0x41);
-    assert!(mfp.interrupt_requested(), "octet reçu : RX_FULL doit s'armer");
+    assert!(mfp.interrupt_requested(), "byte received: RX_FULL must arm");
     assert_eq!(mfp.read(reg::RSR) & 0x80, 0x80, "buffer full");
-    assert_eq!(mfp.read(reg::UDR), 0x41, "lecture d'UDR renvoie l'octet reçu");
-    assert_eq!(mfp.read(reg::RSR) & 0x80, 0, "lecture d'UDR efface buffer full");
+    assert_eq!(mfp.read(reg::UDR), 0x41, "reading UDR returns the received byte");
+    assert_eq!(mfp.read(reg::RSR) & 0x80, 0, "reading UDR clears buffer full");
 
-    // Transmission : écrire UDR doit être récupérable via take_tx_byte.
+    // Transmission: writing UDR must be retrievable via take_tx_byte.
     mfp.write(reg::UDR, 0x42);
     assert_eq!(mfp.take_tx_byte(), Some(0x42));
     assert_eq!(mfp.take_tx_byte(), None);
-    assert_eq!(mfp.read(reg::TSR) & 0x80, 0x80, "buffer empty après transmission");
+    assert_eq!(mfp.read(reg::TSR) & 0x80, 0x80, "buffer empty after transmission");
 }
 
 #[test]
-fn tsr_buffer_empty_a_1_au_reset_et_survit_a_l_activation_emetteur() {
-    // Reproduit la séquence d'initialisation standard de l'USART (ex.
-    // cartouche de diagnostic usine STe) : TSR démarre à "buffer empty" par
-    // défaut (aucun octet en attente au reset), et l'activer via bit0
-    // (Transmitter Enable) ne doit pas effacer ce bit de statut matériel —
-    // sinon plus aucune transmission ne peut jamais avoir lieu ensuite.
+fn tsr_buffer_empty_is_1_at_reset_and_survives_transmitter_enable() {
+    // Reproduces the standard USART initialization sequence (e.g.
+    // STe factory diagnostic cartridge): TSR starts at "buffer empty" by
+    // default (no byte pending at reset), and enabling it via bit0
+    // (Transmitter Enable) must not clear this hardware status bit —
+    // otherwise no transmission could ever take place afterward.
     let mut mfp = Mfp::new();
-    assert_eq!(mfp.read(reg::TSR) & 0x80, 0x80, "buffer empty dès le reset");
+    assert_eq!(mfp.read(reg::TSR) & 0x80, 0x80, "buffer empty right at reset");
 
-    mfp.write(reg::TSR, 0x01); // active l'émetteur (bit0), comme le ferait un vrai pilote
+    mfp.write(reg::TSR, 0x01); // enables the transmitter (bit0), as a real driver would
     assert_eq!(
         mfp.read(reg::TSR) & 0x80,
         0x80,
-        "buffer empty doit survivre à l'activation de l'émetteur"
+        "buffer empty must survive transmitter activation"
     );
-    assert_eq!(mfp.read(reg::TSR) & 0x01, 0x01, "bit d'activation bien pris en compte");
+    assert_eq!(mfp.read(reg::TSR) & 0x01, 0x01, "enable bit correctly taken into account");
 
     mfp.write(reg::UDR, 0x55);
-    assert_eq!(mfp.take_tx_byte(), Some(0x55), "la transmission doit fonctionner après l'activation");
+    assert_eq!(mfp.take_tx_byte(), Some(0x55), "transmission must work after activation");
 }

@@ -1,8 +1,7 @@
-//! Périphériques des systèmes hôtes bâtis sur le cœur 68000, un
-//! sous-module par système (voir [`atari_st`]) — chacun compilé uniquement
-//! si la feature Cargo correspondante est activée, pour que le cœur 68000
-//! seul reste utilisable sans rapatrier ni compiler de code spécifique à
-//! un système particulier.
+//! Peripherals for host systems built on the 68000 core, one submodule per
+//! system (see [`atari_st`]) — each compiled only if the corresponding
+//! Cargo feature is enabled, so that the 68000 core alone remains usable
+//! without pulling in or compiling code specific to a particular system.
 
 #[cfg(feature = "atari-st")]
 pub mod atari_st;

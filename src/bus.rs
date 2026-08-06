@@ -1,160 +1,155 @@
-//! Interface mémoire/bus du CPU.
+//! CPU memory/bus interface.
 //!
-//! Le 68000 ne connaît pas la disposition physique de la mémoire : il émet des
-//! accès sur son bus, et le système (Atari, Amiga, banc de test…) décide ce que
-//! ces adresses recouvrent (RAM, ROM, registres de périphériques…).
+//! The 68000 has no knowledge of the physical memory layout: it issues
+//! accesses on its bus, and the system (Atari, Amiga, test harness…) decides
+//! what those addresses cover (RAM, ROM, peripheral registers…).
 //!
-//! L'appelant implémente [`Bus`] pour son système. Seuls [`Bus::read8`] et
-//! [`Bus::write8`] sont obligatoires ; les accès 16 et 32 bits sont dérivés en
-//! **big-endian** (l'ordre natif du 68000) et peuvent être surchargés pour de
-//! meilleures performances ou pour modéliser un comportement particulier.
+//! The caller implements [`Bus`] for its system. Only [`Bus::read8`] and
+//! [`Bus::write8`] are mandatory; 16- and 32-bit accesses are derived in
+//! **big-endian** (the 68000's native ordering) and can be overridden for
+//! better performance or to model specific behavior.
 
-/// Bus mémoire vu par le CPU 68000.
+/// Memory bus as seen by the 68000 CPU.
 ///
-/// Le 68000 dispose d'un espace d'adressage de 24 bits (16 Mo). Les adresses
-/// passées ici sont déjà tronquées par le CPU à 24 bits significatifs.
+/// The 68000 has a 24-bit (16 MB) address space. Addresses passed here are
+/// already truncated by the CPU to 24 significant bits.
 pub trait Bus {
-    /// Lit un octet à l'adresse `addr`.
+    /// Reads a byte at address `addr`.
     fn read8(&mut self, addr: u32) -> u8;
 
-    /// Écrit un octet `value` à l'adresse `addr`.
+    /// Writes a byte `value` at address `addr`.
     fn write8(&mut self, addr: u32, value: u8);
 
-    /// Lit un mot (16 bits) big-endian à l'adresse `addr`.
+    /// Reads a big-endian word (16 bits) at address `addr`.
     fn read16(&mut self, addr: u32) -> u16 {
         let hi = self.read8(addr) as u16;
         let lo = self.read8(addr.wrapping_add(1)) as u16;
         (hi << 8) | lo
     }
 
-    /// Lit un mot long (32 bits) big-endian à l'adresse `addr`.
+    /// Reads a big-endian longword (32 bits) at address `addr`.
     fn read32(&mut self, addr: u32) -> u32 {
         let hi = self.read16(addr) as u32;
         let lo = self.read16(addr.wrapping_add(2)) as u32;
         (hi << 16) | lo
     }
 
-    /// Écrit un mot (16 bits) big-endian à l'adresse `addr`.
+    /// Writes a big-endian word (16 bits) at address `addr`.
     fn write16(&mut self, addr: u32, value: u16) {
         self.write8(addr, (value >> 8) as u8);
         self.write8(addr.wrapping_add(1), value as u8);
     }
 
-    /// Écrit un mot long (32 bits) big-endian à l'adresse `addr`.
+    /// Writes a big-endian longword (32 bits) at address `addr`.
     fn write32(&mut self, addr: u32, value: u32) {
         self.write16(addr, (value >> 16) as u16);
         self.write16(addr.wrapping_add(2), value as u16);
     }
 
-    /// Appelé lorsque le CPU exécute l'instruction RESET (opcode 0x4E70).
-    /// Sur le 68000, cette instruction génère le signal /RESET vers les
-    /// périphériques externes pendant 124 cycles. Implémentation par défaut
-    /// no-op ; surcharger pour propager le reset aux périphériques.
+    /// Called when the CPU executes the RESET instruction (opcode 0x4E70).
+    /// On the 68000, this instruction asserts the /RESET signal to external
+    /// peripherals for 124 cycles. Default implementation is a no-op;
+    /// override to propagate the reset to peripherals.
     fn reset_bus(&mut self) {}
 
-    /// Vrai si `addr` est soumise à une contention de bus DRAM/vidéo (le
-    /// Shifter/la puce vidéo partage le bus RAM avec le CPU et lui vole des
-    /// cycles selon un motif périodique — modélisé par le CPU comme un
-    /// arrondi à 4 cycles, cf. `Cpu::step`). Par défaut : aucune contention
-    /// (ROM, registres périphériques, ou système sans modèle de contention).
-    /// Les implémentations Atari ST/STE doivent renvoyer `true` pour les
-    /// adresses RAM effectivement peuplées.
+    /// True if `addr` is subject to DRAM/video bus contention (the
+    /// Shifter/video chip shares the RAM bus with the CPU and steals cycles
+    /// from it in a periodic pattern — modeled by the CPU as rounding up to
+    /// 4 cycles, cf. `Cpu::step`). Default: no contention (ROM, peripheral
+    /// registers, or a system without a contention model). Atari ST/STE
+    /// implementations must return `true` for addresses in populated RAM.
     fn is_contended(&self, addr: u32) -> bool {
         let _ = addr;
         false
     }
 
-    /// Consulté par [`crate::cpu::Cpu::step`] juste après chaque transaction
-    /// bus (fetch d'instruction, puis à nouveau après exécution) pour savoir
-    /// si l'accès le plus récent a touché une adresse sans aucun chip select
-    /// (le "trou" physique entre le haut de la RAM installée et le début de
-    /// la ROM sur un ST/STE réel). Si `Some((fault_addr, is_write))` est
-    /// renvoyé, le CPU déclenche immédiatement un bus error (vecteur 2) au
-    /// lieu de continuer normalement, et l'indicateur doit être consommé
-    /// (remis à `None`) par cet appel.
+    /// Checked by [`crate::cpu::Cpu::step`] right after each bus transaction
+    /// (instruction fetch, then again after execution) to know whether the
+    /// most recent access touched an address with no chip select at all
+    /// (the physical "hole" between the top of installed RAM and the start
+    /// of ROM on a real ST/STE). If `Some((fault_addr, is_write))` is
+    /// returned, the CPU immediately triggers a bus error (vector 2)
+    /// instead of continuing normally, and the flag must be consumed (reset
+    /// to `None`) by this call.
     ///
-    /// Implémentation par défaut : jamais de bus error (mapping "toujours
-    /// disponible" — comportement historique de tous les `Bus` existants,
-    /// notamment les bancs de test ProcessorTests qui n'ont pas de notion de
-    /// RAM limitée).
+    /// Default implementation: never a bus error ("always available"
+    /// mapping — the historical behavior of all existing `Bus`
+    /// implementations, notably the ProcessorTests test harnesses, which
+    /// have no notion of limited RAM).
     fn take_bus_fault(&mut self) -> Option<(u32, bool)> {
         None
     }
 
-    /// Comme [`Self::take_bus_fault`], mais sans consommer l'indicateur —
-    /// pour les instructions à accès multiples (MOVEM) qui doivent
-    /// s'arrêter au PREMIER accès fautif (silicium réel : le CPU avorte
-    /// immédiatement, il ne continue pas à essayer les registres suivants
-    /// de la liste) tout en laissant [`Self::take_bus_fault`] intact pour
-    /// que la vérification générique post-instruction de `Cpu::step`
-    /// déclenche l'exception normalement, avec l'adresse du PREMIER accès
-    /// fautif plutôt que du dernier.
+    /// Like [`Self::take_bus_fault`], but without consuming the flag — for
+    /// multi-access instructions (MOVEM) that must stop at the FIRST
+    /// faulting access (real silicon: the CPU aborts immediately, it does
+    /// not keep trying the remaining registers in the list) while leaving
+    /// [`Self::take_bus_fault`] intact so that `Cpu::step`'s generic
+    /// post-instruction check triggers the exception normally, with the
+    /// address of the FIRST faulting access rather than the last.
     ///
-    /// Implémentation par défaut : jamais de fault en attente (cohérent
-    /// avec [`Self::take_bus_fault`] par défaut).
+    /// Default implementation: no fault pending (consistent with
+    /// [`Self::take_bus_fault`]'s default).
     fn has_pending_bus_fault(&self) -> bool {
         false
     }
 
-    /// Niveau d'interruption (IPL2-0) actuellement demandé par les
-    /// périphériques au CPU : 0 = aucune demande, 1-6 = niveau normal,
-    /// 7 = non masquable (NMI). Consulté par [`crate::cpu::Cpu::step`] avant
-    /// le fetch de chaque instruction : le CPU prend l'interruption si
-    /// `level` est strictement supérieur au masque IPL courant du SR (ou
-    /// toujours pour le niveau 7). Implémentation par défaut : aucune
-    /// demande (bancs de test ProcessorTests, systèmes sans périphérique
-    /// interruptif).
+    /// Interrupt level (IPL2-0) currently requested by peripherals to the
+    /// CPU: 0 = no request, 1-6 = normal level, 7 = non-maskable (NMI).
+    /// Checked by [`crate::cpu::Cpu::step`] before fetching each
+    /// instruction: the CPU takes the interrupt if `level` is strictly
+    /// greater than the SR's current IPL mask (or always for level 7).
+    /// Default implementation: no request (ProcessorTests test harnesses,
+    /// systems without an interrupting peripheral).
     fn irq_level(&self) -> u8 {
         0
     }
 
-    /// Cycle d'acquittement d'interruption (IACK) pour le niveau `level` que
-    /// le CPU vient d'accepter : le périphérique renvoie le numéro de
-    /// vecteur (0-255) à utiliser pour construire l'adresse du handler.
-    /// Implémentation par défaut : autovecteur (24 + level), le cas le plus
-    /// courant sur Atari ST (GLUE HBL/VBL). Un périphérique vectorisé (MFP
-    /// 68901) doit surcharger cette méthode pour renvoyer son propre
-    /// vecteur programmé pour ce niveau.
+    /// Interrupt acknowledge (IACK) cycle for the level `level` the CPU
+    /// just accepted: the peripheral returns the vector number (0-255) to
+    /// use for building the handler address. Default implementation:
+    /// autovector (24 + level), the most common case on Atari ST (GLUE
+    /// HBL/VBL). A vectored peripheral (MFP 68901) must override this
+    /// method to return its own programmed vector for that level.
     fn irq_ack(&mut self, level: u8) -> u8 {
         24 + level
     }
 }
 
-/// Puits d'événements pour [`TracingBus`] — découplé du format de sortie
-/// (fichier, canal en mémoire, etc.) pour que `TracingBus` reste générique
-/// et testable sans I/O.
+/// Event sink for [`TracingBus`] — decoupled from the output format (file,
+/// in-memory channel, etc.) so that `TracingBus` stays generic and testable
+/// without I/O.
 pub trait TraceSink {
-    /// `pc` : adresse de l'instruction CPU en cours (fournie par l'appelant,
-    /// voir [`TracingBus::pc`]). `size` : 1/2/4 octets. `value` : la valeur
-    /// lue/écrite, alignée à droite (pas de décalage selon `size`).
+    /// `pc`: address of the current CPU instruction (supplied by the
+    /// caller, see [`TracingBus::pc`]). `size`: 1/2/4 bytes. `value`: the
+    /// value read/written, right-aligned (no shift based on `size`).
     fn on_read(&mut self, pc: u32, addr: u32, size: u8, value: u32);
     fn on_write(&mut self, pc: u32, addr: u32, size: u8, value: u32);
 }
 
-/// Bus intercalé qui journalise toute transaction bus réelle (taille exacte
-/// de l'accès — .B/.W/.L — telle qu'émise par le CPU ou tout autre appelant
-/// générique sur `impl Bus`) vers un [`TraceSink`], de façon transparente
-/// pour le code traversé (comme [`TimedBus`] pour le minutage).
+/// Interposed bus that logs every real bus transaction (exact access size —
+/// .B/.W/.L — as issued by the CPU or any other generic caller on
+/// `impl Bus`) to a [`TraceSink`], transparently to the code it passes
+/// through (like [`TimedBus`] for timing).
 ///
-/// Contrairement à un traçage ad hoc dispersé dans les implémentations
-/// `Bus` individuelles (qui ne peut voir qu'un octet à la fois dès que
-/// l'appelant utilise les implémentations `read16`/`write16` par défaut du
-/// trait, ou qui doit dupliquer la logique de traçage dans chaque
-/// surcharge `read16`/`write16`/`read32`/`write32` spécifique à un
-/// système), ce décorateur capture la transaction telle qu'émise par
-/// l'appelant, à sa taille réelle, en un seul point — puis délègue à
-/// `inner`, qui peut la décomposer ou la court-circuiter comme il
-/// l'entend sans jamais avoir besoin de connaître le traçage.
+/// Unlike ad hoc tracing scattered across individual `Bus` implementations
+/// (which can only see one byte at a time as soon as the caller uses the
+/// trait's default `read16`/`write16` implementations, or which has to
+/// duplicate the tracing logic in every system-specific
+/// `read16`/`write16`/`read32`/`write32` override), this decorator captures
+/// the transaction as issued by the caller, at its real size, at a single
+/// point — then delegates to `inner`, which can split it or short-circuit
+/// it as it sees fit without ever needing to know about tracing.
 ///
-/// `sink: None` est le chemin rapide quand le traçage est désactivé (un
-/// seul test `Option::is_none` par accès, pas d'allocation ni de
-/// formatage) — permet de toujours envelopper le bus dans la boucle
-/// principale sans code dupliqué pour le cas "pas de traçage".
+/// `sink: None` is the fast path when tracing is disabled (a single
+/// `Option::is_none` check per access, no allocation or formatting) —
+/// allows the bus to always be wrapped in the main loop without duplicated
+/// code for the "no tracing" case.
 pub struct TracingBus<'b, B: Bus> {
     pub inner: &'b mut B,
     pub sink: Option<&'b mut dyn TraceSink>,
-    /// PC de l'instruction en cours — à mettre à jour par l'appelant avant
-    /// chaque `Cpu::step` (le CPU n'expose pas son PC courant au `Bus`).
+    /// PC of the current instruction — to be updated by the caller before
+    /// each `Cpu::step` (the CPU does not expose its current PC to the `Bus`).
     pub pc: u32,
 }
 
@@ -229,19 +224,18 @@ impl<'b, B: Bus> Bus for TracingBus<'b, B> {
     }
 }
 
-/// Bus intercalé qui applique le modèle de wait-state DRAM/vidéo (façon
-/// Steem : `RAM_ACCESS_WS`) à chaque transaction bus réelle, de façon
-/// transparente pour tout le code du CPU (addressing.rs / execute.rs)
-/// puisqu'ils sont génériques sur `impl Bus` et ne savent pas qu'ils
-/// traversent ce wrapper.
+/// Interposed bus that applies the DRAM/video wait-state model (Steem
+/// style: `RAM_ACCESS_WS`) to every real bus transaction, transparently to
+/// all CPU code (addressing.rs / execute.rs) since they are generic over
+/// `impl Bus` and have no idea they are going through this wrapper.
 ///
-/// `pos` est la position courante sur la grille de 4 cycles — initialisée
-/// depuis `Cpu.cycles` par `Cpu::step` avant chaque instruction et jamais
-/// remise à zéro entre les instructions, pour rester en phase avec
-/// l'horloge vidéo continue. Chaque transaction consomme nominalement 4
-/// cycles ; si `is_contended(addr)` et que la position n'est pas déjà
-/// alignée sur 4, l'écart est perdu (aligné au 4 supérieur) avant la
-/// transaction — exactement le mécanisme Steem.
+/// `pos` is the current position on the 4-cycle grid — initialized from
+/// `Cpu.cycles` by `Cpu::step` before each instruction and never reset
+/// between instructions, to stay in phase with the continuous video clock.
+/// Each transaction nominally consumes 4 cycles; if `is_contended(addr)`
+/// and the position isn't already aligned to 4, the gap is lost (rounded up
+/// to the next multiple of 4) before the transaction — exactly the Steem
+/// mechanism.
 pub struct TimedBus<'b, B: Bus> {
     pub inner: &'b mut B,
     pub pos: u64,
@@ -283,9 +277,9 @@ impl<'b, B: Bus> Bus for TimedBus<'b, B> {
     }
 
     fn read32(&mut self, addr: u32) -> u32 {
-        // Bus 16 bits réel : un accès long = deux cycles bus mot indépendants,
-        // chacun avec son propre alignement de grille (pas un seul accès 32
-        // bits atomique).
+        // Real 16-bit bus: a long access = two independent word bus cycles,
+        // each with its own grid alignment (not a single atomic 32-bit
+        // access).
         let hi = self.read16(addr) as u32;
         let lo = self.read16(addr.wrapping_add(2)) as u32;
         (hi << 16) | lo

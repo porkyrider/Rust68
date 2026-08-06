@@ -1,50 +1,49 @@
-//! GLUE (« General Logic Unit ») — Atari ST.
+//! GLUE ("General Logic Unit") — Atari ST.
 //!
-//! Puce custom qui génère, entre autres fonctions, les deux interruptions
-//! vidéo autovectorisées du système : HBL (horizontal blank, fin de chaque
-//! ligne balayée) sur **IPL2**, et VBL (vertical blank, fin de trame) sur
-//! **IPL4**. C'est ce qui rythme l'affichage — TOS utilise VBL pour sa
-//! file d'attente vbl (défilement, changement de palette par ligne via
-//! HBL, lecture clavier périodique…).
+//! Custom chip that generates, among other functions, the system's two
+//! autovectored video interrupts: HBL (horizontal blank, end of each
+//! scanline) on **IPL2**, and VBL (vertical blank, end of frame) on
+//! **IPL4**. This is what paces the display — TOS uses VBL for its vbl
+//! queue (scrolling, per-line palette changes via HBL, periodic keyboard
+//! reads…).
 //!
-//! Comme [`crate::peripherals::mfp`], ce module modélise le signal de
-//! timing **seul** : c'est au board ([`crate::systems::atari_st::AtariSt`])
-//! de brancher [`Glue::hbl_pending`]/[`Glue::vbl_pending`] sur
-//! `Bus::irq_level` (IPL2/IPL4, priorité en dessous du MFP sur IPL6) et
-//! [`Glue::ack_hbl`]/[`Glue::ack_vbl`] sur `Bus::irq_ack`.
+//! Like [`crate::peripherals::mfp`], this module models the timing signal
+//! **only**: it's up to the board ([`crate::systems::atari_st::AtariSt`])
+//! to wire [`Glue::hbl_pending`]/[`Glue::vbl_pending`] to `Bus::irq_level`
+//! (IPL2/IPL4, priority below the MFP on IPL6) and
+//! [`Glue::ack_hbl`]/[`Glue::ack_vbl`] to `Bus::irq_ack`.
 //!
-//! ## Limitations connues (v1)
-//! - Uniquement le timing HBL/VBL : GLUE gère aussi en réalité une partie
-//!   du décodage mémoire/bus (rôle partagé avec la MMU), non modélisé ici.
-//! - Constantes de timing (cycles/ligne, lignes/trame) : valeurs usuelles
-//!   citées par la communauté d'émulation (Hatari/WinSTon), pas vérifiées
-//!   contre une référence matérielle formelle (aucune suite de test
-//!   équivalente à TomHarte n'existe pour ce composant).
-//! - Numérotation de ligne alignée sur celle de Hatari : `current_line()`
-//!   est une position ABSOLUE dans la trame (0..LINES_PER_FRAME), incluant
-//!   un vrai blanking haut (`VideoMode::frame_start_line()`, 63 en PAL/34
-//!   en NTSC) avant la fenêtre visible nominale. `display_line()` donne
-//!   l'index dans le framebuffer (`None` en blanking/bordure).
-//! - Overscan vertical (haut/bas) : `write_sync`/`read_sync` modélisent le
-//!   registre `$FF820A` — un switch 50/60Hz survenant dans la bonne fenêtre
-//!   de cycle près du haut ou du bas de la fenêtre visible étend celle-ci
-//!   pour la trame en cours (`display_start`/`display_end`), à la manière
-//!   du overscan vertical façon Hatari. Simplification : une fois
-//!   déclenchée pour une trame, l'extension n'est jamais annulée par une
-//!   écriture ultérieure qui reviendrait en arrière (Hatari gère quelques
-//!   cas d'annulation plus fins, non modélisés ici). L'overscan horizontal
-//!   (bordure gauche/droite, `$FF8260`) n'est pas géré par `Glue` mais par
-//!   `Shifter` (voir son propre module).
+//! ## Known limitations (v1)
+//! - HBL/VBL timing only: GLUE also actually handles part of memory/bus
+//!   decoding in reality (role shared with the MMU), not modeled here.
+//! - Timing constants (cycles/line, lines/frame): usual values quoted by
+//!   the emulation community (Hatari/WinSTon), not verified against a
+//!   formal hardware reference (no test suite equivalent to TomHarte
+//!   exists for this component).
+//! - Line numbering aligned with Hatari's: `current_line()` is an
+//!   ABSOLUTE position within the frame (0..LINES_PER_FRAME), including a
+//!   real top blanking period (`VideoMode::frame_start_line()`, 63 in
+//!   PAL/34 in NTSC) before the nominal visible window. `display_line()`
+//!   gives the index into the framebuffer (`None` during blanking/border).
+//! - Vertical overscan (top/bottom): `write_sync`/`read_sync` model the
+//!   `$FF820A` register — a 50/60Hz switch occurring in the right cycle
+//!   window near the top or bottom of the visible window extends it for
+//!   the current frame (`display_start`/`display_end`), Hatari-style
+//!   vertical overscan. Simplification: once triggered for a frame, the
+//!   extension is never cancelled by a later write that would revert it
+//!   (Hatari handles a few finer cancellation cases, not modeled here).
+//!   Horizontal overscan (left/right border, `$FF8260`) isn't handled by
+//!   `Glue` but by `Shifter` (see its own module).
 
-/// Mode vidéo : détermine le rythme HBL/VBL. Le ST/STE fonctionne à 8 MHz
-/// CPU quel que soit le mode ; seul le nombre de cycles par ligne/lignes
-/// par trame change selon la norme de diffusion.
+/// Video mode: determines the HBL/VBL pace. The ST/STE runs at 8 MHz CPU
+/// regardless of mode; only the number of cycles per line/lines per frame
+/// changes depending on the broadcast standard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoMode {
-    /// 50 Hz, 313 lignes/trame, 512 cycles CPU/ligne (le plus courant en
-    /// Europe — valeurs usuelles Hatari/WinSTon).
+    /// 50 Hz, 313 lines/frame, 512 CPU cycles/line (the most common in
+    /// Europe — usual Hatari/WinSTon values).
     Pal50,
-    /// 60 Hz, 263 lignes/trame, 508 cycles CPU/ligne.
+    /// 60 Hz, 263 lines/frame, 508 CPU cycles/line.
     Ntsc60,
 }
 
@@ -63,9 +62,9 @@ impl VideoMode {
         }
     }
 
-    /// Cycle de début d'affichage actif (DE) dans la ligne — seuil de
-    /// "gating" des écritures `$FF8264`/`$FF8265` (voir la doc de
-    /// [`Glue::line_start_cycle`]) : valeurs Hatari (`video.h`,
+    /// Active-display-start (DE) cycle within the line — the "gating"
+    /// threshold for `$FF8264`/`$FF8265` writes (see the doc of
+    /// [`Glue::line_start_cycle`]): Hatari values (`video.h`,
     /// `LINE_START_CYCLE_50`/`_60`).
     fn line_start_cycle(self) -> u32 {
         match self {
@@ -74,9 +73,9 @@ impl VideoMode {
         }
     }
 
-    /// Cycle de fin d'affichage actif (DE) dans la ligne — seuil de
-    /// "gating" de l'écriture `$FF820F` (voir la doc de
-    /// [`Glue::line_end_cycle`]) : valeurs Hatari (`video.h`,
+    /// Active-display-end (DE) cycle within the line — the "gating"
+    /// threshold for the `$FF820F` write (see the doc of
+    /// [`Glue::line_end_cycle`]): Hatari values (`video.h`,
     /// `LINE_END_CYCLE_50`/`_60`).
     fn line_end_cycle(self) -> u32 {
         match self {
@@ -85,28 +84,27 @@ impl VideoMode {
         }
     }
 
-    /// Nombre de lignes réellement affichées (identique PAL/NTSC — seule la
-    /// durée du blanking vertical qui suit diffère). Voir la doc de
-    /// [`Glue::vbl_edge_count`] pour pourquoi cette frontière, pas le
-    /// bouclage complet de [`Self::lines_per_frame`], est ce qui déclenche
-    /// VBL sur silicium réel.
+    /// Number of lines actually displayed (identical PAL/NTSC — only the
+    /// duration of the vertical blanking that follows differs). See the
+    /// doc of [`Glue::vbl_edge_count`] for why this boundary, not the full
+    /// wraparound of [`Self::lines_per_frame`], is what triggers VBL on
+    /// real silicon.
     fn visible_lines(self) -> u32 {
         200
     }
 
-    /// Première ligne ABSOLUE (0..lignes par trame) où l'affichage actif
-    /// démarre normalement — valeurs Hatari (`video.h`,
-    /// `VIDEO_START_HBL_50HZ`/`_60HZ`) : un vrai blanking vertical HAUT de
-    /// 63 lignes (PAL) précède la première ligne visible, pas juste le
-    /// blanking BAS de fin de trame déjà modélisé. Nécessaire pour la
-    /// suppression de bordure haute STE (voir
-    /// `peripherals::atari_st::shifter`) : sans cette période "avant" la
-    /// ligne normalement visible, il n'y a tout simplement aucune ligne à
-    /// révéler. Le blanking bas correspondant se déduit de
-    /// `lines_per_frame() - frame_start_line() - visible_lines()` (50 en
-    /// PAL, 63-313+200... voir [`Glue::display_line`]) — la SOMME des deux
-    /// blancs (113 en PAL) reste celle déjà modélisée avant cette
-    /// refonte, seule leur répartition haut/bas change.
+    /// First ABSOLUTE line (0..lines per frame) where active display
+    /// normally starts — Hatari values (`video.h`,
+    /// `VIDEO_START_HBL_50HZ`/`_60HZ`): a real TOP vertical blanking
+    /// period of 63 lines (PAL) precedes the first visible line, not just
+    /// the BOTTOM end-of-frame blanking already modeled. Needed for STE
+    /// top border removal (see `peripherals::atari_st::shifter`): without
+    /// this period "before" the normally visible line, there's simply no
+    /// line to reveal. The corresponding bottom blanking is deduced from
+    /// `lines_per_frame() - frame_start_line() - visible_lines()` (50 in
+    /// PAL, 63-313+200... see [`Glue::display_line`]) — the SUM of the two
+    /// blanking periods (113 in PAL) remains the one already modeled
+    /// before this rework, only their top/bottom split changes.
     fn frame_start_line(self) -> u32 {
         match self {
             VideoMode::Pal50 => 63,
@@ -114,9 +112,9 @@ impl VideoMode {
         }
     }
 
-    /// Lignes supplémentaires révélées par une suppression de bordure
-    /// basse réussie — valeurs Hatari (`video.h`, `VIDEO_HEIGHT_BOTTOM_50HZ`/
-    /// `_60HZ`). Voir [`Glue::write_sync`].
+    /// Extra lines revealed by a successful bottom border removal —
+    /// Hatari values (`video.h`, `VIDEO_HEIGHT_BOTTOM_50HZ`/`_60HZ`). See
+    /// [`Glue::write_sync`].
     fn bottom_border_extra_lines(self) -> u32 {
         match self {
             VideoMode::Pal50 => 47,
@@ -125,17 +123,16 @@ impl VideoMode {
     }
 }
 
-/// Cycle limite, dans la ligne, pour qu'un switch 50/60Hz (`$FF820A`)
-/// proche du haut ou du bas de la fenêtre affichable déclenche une
-/// suppression de bordure — valeur Hatari (`video.h`,
-/// `LINE_REMOVE_TOP_CYCLE`/`LINE_REMOVE_BOTTOM_CYCLE`, ~504 STF/500 STE ;
-/// une seule valeur retenue ici, l'écart de 4 cycles entre variantes de
-/// silicium n'étant pas vérifiable sans référence matérielle, voir les
-/// limitations de module). Réutilisée telle quelle pour PAL et NTSC faute
-/// de valeur NTSC distincte trouvée en recherche.
+/// Cycle limit, within the line, for a 50/60Hz switch (`$FF820A`) near the
+/// top or bottom of the displayable window to trigger a border removal —
+/// Hatari value (`video.h`, `LINE_REMOVE_TOP_CYCLE`/
+/// `LINE_REMOVE_BOTTOM_CYCLE`, ~504 STF/500 STE; a single value kept here,
+/// as the 4-cycle gap between silicon variants isn't verifiable without a
+/// hardware reference, see the module limitations). Reused as-is for PAL
+/// and NTSC for lack of a distinct NTSC value found during research.
 const LINE_REMOVE_BORDER_CYCLE: u32 = 504;
 
-/// État du générateur de timing HBL/VBL.
+/// State of the HBL/VBL timing generator.
 #[derive(Debug, Clone)]
 pub struct Glue {
     mode: VideoMode,
@@ -145,14 +142,15 @@ pub struct Glue {
     hbl_pending: bool,
     vbl_pending: bool,
     vbl_edges: u64,
-    /// Fenêtre [début, fin) de lignes ABSOLUES affichées pour la trame EN
-    /// COURS — par défaut `frame_start_line()..frame_start_line()+visible_lines()`,
-    /// remise à ce défaut à chaque nouvelle trame (voir [`Self::tick`]).
-    /// Ajustable par [`Self::write_sync`] (suppression de bordure
-    /// haute/basse STE) pour la trame en cours.
+    /// [start, end) window of ABSOLUTE lines displayed for the CURRENT
+    /// frame — defaults to
+    /// `frame_start_line()..frame_start_line()+visible_lines()`, reset to
+    /// this default on each new frame (see [`Self::tick`]). Adjustable by
+    /// [`Self::write_sync`] (STE top/bottom border removal) for the
+    /// current frame.
     display_start: u32,
     display_end: u32,
-    /// Registre `$FF820A` brut (bit 1 = sélection 50/60Hz externe) — voir
+    /// Raw `$FF820A` register (bit 1 = external 50/60Hz select) — see
     /// [`Self::write_sync`].
     sync: u8,
 }
@@ -175,15 +173,15 @@ impl Glue {
         }
     }
 
-    /// Avance le générateur de `cpu_cycles` cycles CPU, armant HBL à chaque
-    /// fin de ligne et VBL à la transition ligne visible -> blanking
-    /// vertical (voir la doc de [`Self::vbl_edge_count`]) — PAS au bouclage
-    /// complet de la trame (`line` reprenant à 0), qui reste réservé à
-    /// [`Self::frame_count`]. La fenêtre affichable (`display_start`/`_end`)
-    /// est remise à sa valeur nominale à chaque nouvelle trame — toute
-    /// suppression de bordure haute/basse ne vaut que pour la trame où elle
-    /// a été déclenchée, jamais les suivantes (comportement réel du
-    /// silicium, confirmé par Hatari : recalculé à chaque VBL).
+    /// Advances the generator by `cpu_cycles` CPU cycles, arming HBL at
+    /// each end of line and VBL at the visible-line -> vertical-blanking
+    /// transition (see the doc of [`Self::vbl_edge_count`]) — NOT at the
+    /// full frame wraparound (`line` resetting to 0), which stays reserved
+    /// for [`Self::frame_count`]. The displayable window
+    /// (`display_start`/`_end`) is reset to its nominal value on each new
+    /// frame — any top/bottom border removal only applies to the frame
+    /// where it was triggered, never subsequent ones (real silicon
+    /// behavior, confirmed by Hatari: recomputed on each VBL).
     pub fn tick(&mut self, cpu_cycles: u32) {
         self.cycles_in_line += cpu_cycles;
         let per_line = self.mode.cycles_per_line();
@@ -204,28 +202,28 @@ impl Glue {
         }
     }
 
-    /// Index de ligne AFFICHÉE (0..lignes visibles de la trame courante) si
-    /// la ligne balayée absolue courante ([`Self::current_line`]) est dans
-    /// la fenêtre affichable — `None` sinon (blanking haut ou bas). C'est
-    /// cet index, pas [`Self::current_line`] directement, qu'il faut
-    /// utiliser pour indexer `AtariSt::framebuffer` : la fenêtre affichable
-    /// peut démarrer avant la position nominale (suppression de bordure
-    /// haute) ou se terminer après (bordure basse), voir
+    /// DISPLAYED line index (0..visible lines of the current frame) if
+    /// the current absolute scanline ([`Self::current_line`]) is within
+    /// the displayable window — `None` otherwise (top or bottom
+    /// blanking). It's this index, not [`Self::current_line`] directly,
+    /// that must be used to index `AtariSt::framebuffer`: the displayable
+    /// window can start before the nominal position (top border removal)
+    /// or end after it (bottom border), see
     /// `peripherals::atari_st::shifter`.
     pub fn display_line(&self) -> Option<u32> {
         self.display_index(self.line)
     }
 
-    /// Comme [`Self::display_line`], mais pour une ligne balayée ABSOLUE
-    /// arbitraire plutôt que forcément la courante — utile à
-    /// `AtariSt::tick` pour son rattrapage éventuel de plusieurs lignes en
-    /// un seul appel (voir la doc du champ `display_start`/`display_end`) :
-    /// n'est exact que si toutes les lignes rattrapées appartiennent à la
-    /// même trame que celle dont la fenêtre affichable est actuellement
-    /// mémorisée ici — cas normal en usage réel (un `tick()` ne couvre
-    /// jamais qu'une poignée de cycles CPU, largement moins qu'une trame
-    /// entière), pas garanti pour un `tick()` de test couvrant délibérément
-    /// plusieurs trames d'un coup.
+    /// Like [`Self::display_line`], but for an arbitrary ABSOLUTE
+    /// scanline rather than necessarily the current one — useful to
+    /// `AtariSt::tick` for its occasional catch-up of several lines in a
+    /// single call (see the doc of the `display_start`/`display_end`
+    /// field): only exact if all the caught-up lines belong to the same
+    /// frame as the one whose displayable window is currently stored here
+    /// — the normal case in real usage (a `tick()` never covers more than
+    /// a handful of CPU cycles, far less than a whole frame), not
+    /// guaranteed for a test `tick()` deliberately covering several
+    /// frames at once.
     pub fn display_index(&self, absolute_line: u32) -> Option<u32> {
         if absolute_line >= self.display_start && absolute_line < self.display_end {
             Some(absolute_line - self.display_start)
@@ -234,119 +232,118 @@ impl Glue {
         }
     }
 
-    /// Vrai si un HBL est en attente d'acquittement (IPL2).
+    /// True if an HBL is pending acknowledgment (IPL2).
     pub fn hbl_pending(&self) -> bool {
         self.hbl_pending
     }
 
-    /// Vrai si un VBL est en attente d'acquittement (IPL4).
+    /// True if a VBL is pending acknowledgment (IPL4).
     pub fn vbl_pending(&self) -> bool {
         self.vbl_pending
     }
 
-    /// Acquitte le HBL en cours (à appeler depuis `Bus::irq_ack` pour le
-    /// niveau 2).
+    /// Acknowledges the pending HBL (to be called from `Bus::irq_ack` for
+    /// level 2).
     pub fn ack_hbl(&mut self) {
         self.hbl_pending = false;
     }
 
-    /// Acquitte le VBL en cours (à appeler depuis `Bus::irq_ack` pour le
-    /// niveau 4).
+    /// Acknowledges the pending VBL (to be called from `Bus::irq_ack` for
+    /// level 4).
     pub fn ack_vbl(&mut self) {
         self.vbl_pending = false;
     }
 
-    /// Ligne balayée courante (0..lignes par trame).
+    /// Current scanline (0..lines per frame).
     pub fn current_line(&self) -> u32 {
         self.line
     }
 
-    /// Nombre de trames complètes écoulées depuis la création/le dernier
-    /// reset — utile pour cadencer un rendu vidéo externe.
+    /// Number of complete frames elapsed since creation/last reset —
+    /// useful for pacing an external video renderer.
     pub fn frame_count(&self) -> u64 {
         self.frame
     }
 
-    /// Nombre de fronts VBL survenus depuis la création/le dernier reset —
-    /// à la transition ligne visible -> blanking vertical (voir la doc de
-    /// [`Self::tick`]), PAS au bouclage complet de la trame.
+    /// Number of VBL edges that occurred since creation/last reset — at
+    /// the visible-line -> vertical-blanking transition (see the doc of
+    /// [`Self::tick`]), NOT at the full frame wraparound.
     ///
-    /// Distinct de [`Self::frame_count`] (qui, lui, avance seulement au
-    /// bouclage complet) : sur silicium réel, VBL survient au DÉBUT du
-    /// blanking vertical (juste après la dernière ligne visible), avec tout
-    /// le reste du blanking (~113 lignes en PAL) qui s'écoule ENSUITE avant
-    /// que la ligne 0 de la trame suivante ne soit affichée. Le board
-    /// ([`crate::systems::atari_st::AtariSt::tick`]) doit détecter ce
-    /// changement (pas celui de `frame_count`) pour recharger le compteur
-    /// vidéo du Shifter depuis sa base — sinon celui-ci ne redémarrerait
-    /// qu'au bouclage 0, dans le MÊME appel `tick()` qui rendrait déjà la
-    /// ligne visible 0 de la trame suivante, sans laisser au logiciel la
-    /// moindre chance de prendre l'interruption VBL avant que cette ligne
-    /// ne soit déjà rendue — confirmé nécessaire par la cartouche de
-    /// diagnostic usine STe (test "T4 Video Counter in Memory Controller",
-    /// qui échouait systématiquement d'exactement une ligne vidéo à sa toute
-    /// première lecture après reprogrammation de la base).
+    /// Distinct from [`Self::frame_count`] (which only advances at the
+    /// full wraparound): on real silicon, VBL occurs at the START of
+    /// vertical blanking (right after the last visible line), with the
+    /// rest of the blanking period (~113 lines in PAL) elapsing
+    /// AFTERWARDS before line 0 of the next frame is displayed. The board
+    /// ([`crate::systems::atari_st::AtariSt::tick`]) must detect this
+    /// change (not that of `frame_count`) to reload the Shifter's video
+    /// counter from its base — otherwise it would only restart at the
+    /// wraparound to 0, in the SAME `tick()` call that would already
+    /// render visible line 0 of the next frame, leaving the software no
+    /// chance at all to take the VBL interrupt before that line has
+    /// already been rendered — confirmed necessary by the STE factory
+    /// diagnostic cartridge (test "T4 Video Counter in Memory Controller",
+    /// which systematically failed by exactly one video line on its very
+    /// first read after the base was reprogrammed).
     pub fn vbl_edge_count(&self) -> u64 {
         self.vbl_edges
     }
 
-    /// Nombre de lignes par trame dans le mode vidéo courant — utile pour
-    /// détecter le bouclage de `current_line()` d'un tick à l'autre.
+    /// Number of lines per frame in the current video mode — useful for
+    /// detecting `current_line()` wraparound from one tick to the next.
     pub fn lines_per_frame(&self) -> u32 {
         self.mode.lines_per_frame()
     }
 
-    /// Position en cycles CPU dans la ligne balayée courante (0..cycles/ligne
-    /// du mode courant) — nécessaire pour le "gating" cycle-exact des
-    /// écritures de registres Shifter STE (`$FF8264`/`$FF8265`/`$FF820F`,
-    /// voir `peripherals::atari_st::shifter`) : une écriture avant le début
-    /// d'affichage actif de la ligne courante s'y applique immédiatement,
-    /// après elle est différée à la ligne suivante — exactement le
-    /// mécanisme `New*`/staging de Hatari (`video.c`,
+    /// Position in CPU cycles within the current scanline (0..cycles/line
+    /// of the current mode) — needed for cycle-exact "gating" of STE
+    /// Shifter register writes (`$FF8264`/`$FF8265`/`$FF820F`, see
+    /// `peripherals::atari_st::shifter`): a write before the start of
+    /// active display of the current line applies immediately, after it
+    /// is deferred to the next line — exactly Hatari's `New*`/staging
+    /// mechanism (`video.c`,
     /// `Video_HorScroll_Write`/`Video_LineWidth_WriteByte`).
     pub fn cycles_in_line(&self) -> u32 {
         self.cycles_in_line
     }
 
-    /// Cycle de début d'affichage actif (DE) dans la ligne, dans le mode
-    /// vidéo courant — voir [`Self::cycles_in_line`].
+    /// Active-display-start (DE) cycle within the line, in the current
+    /// video mode — see [`Self::cycles_in_line`].
     pub fn line_start_cycle(&self) -> u32 {
         self.mode.line_start_cycle()
     }
 
-    /// Cycle de fin d'affichage actif (DE) dans la ligne, dans le mode
-    /// vidéo courant — voir [`Self::cycles_in_line`].
+    /// Active-display-end (DE) cycle within the line, in the current
+    /// video mode — see [`Self::cycles_in_line`].
     pub fn line_end_cycle(&self) -> u32 {
         self.mode.line_end_cycle()
     }
 
-    /// Registre `$FF820A` brut (bit 1 = sélection 50/60Hz externe).
+    /// Raw `$FF820A` register (bit 1 = external 50/60Hz select).
     pub fn read_sync(&self) -> u8 {
         self.sync
     }
 
-    /// Écrit `$FF820A` (bit 1 = sélection 50/60Hz externe) — au passage,
-    /// détecte la suppression de bordure haute/basse STE : un switch VERS
-    /// 60Hz survenant à un cycle précis près du haut ou du bas de la
-    /// fenêtre affichable nominale étend celle-ci pour LA TRAME EN COURS
-    /// (voir Hatari, `video.c`, `Video_Update_Glue_State`). Seul un switch
-    /// vers 60Hz peut agrandir la fenêtre (le mode nominal de la machine
-    /// reste [`Self::mode`], jamais changé par cette écriture elle-même —
-    /// seule la fenêtre affichée pour cette trame précise l'est) :
-    /// - **Bordure haute** : le switch survient encore dans le blanking
-    ///   haut nominal (`self.line < frame_start_line()`) — la fenêtre
-    ///   démarre alors à la position de départ NOMINALE du mode 60Hz (34),
-    ///   révélant les lignes entre les deux.
-    /// - **Bordure basse** : le switch survient sur l'avant-dernière ou la
-    ///   dernière ligne affichée nominale — la fenêtre s'étend de
-    ///   [`VideoMode::bottom_border_extra_lines`] lignes supplémentaires.
+    /// Writes `$FF820A` (bit 1 = external 50/60Hz select) — along the
+    /// way, detects STE top/bottom border removal: a switch TO 60Hz
+    /// occurring at a precise cycle near the top or bottom of the nominal
+    /// displayable window extends it for THE CURRENT FRAME (see Hatari,
+    /// `video.c`, `Video_Update_Glue_State`). Only a switch to 60Hz can
+    /// enlarge the window (the machine's nominal mode remains
+    /// [`Self::mode`], never changed by this write itself — only the
+    /// window displayed for this particular frame is):
+    /// - **Top border**: the switch occurs while still in the nominal top
+    ///   blanking (`self.line < frame_start_line()`) — the window then
+    ///   starts at the NOMINAL start position of 60Hz mode (34), revealing
+    ///   the lines in between.
+    /// - **Bottom border**: the switch occurs on the second-to-last or
+    ///   last nominal displayed line — the window extends by
+    ///   [`VideoMode::bottom_border_extra_lines`] extra lines.
     ///
-    /// Simplification assumée par rapport à Hatari : pas de mécanisme
-    /// d'ANNULATION si un switch ultérieur revient sur la décision (une
-    /// fois déclenchée pour cette trame, l'extension reste acquise jusqu'à
-    /// la prochaine trame) — capture le cas courant (un seul switch bien
-    /// placé par trame), pas les séquences multi-écritures les plus
-    /// exotiques.
+    /// Simplification assumed relative to Hatari: no CANCELLATION
+    /// mechanism if a later switch reverts the decision (once triggered
+    /// for this frame, the extension stays in effect until the next
+    /// frame) — captures the common case (a single well-placed switch per
+    /// frame), not the most exotic multi-write sequences.
     pub fn write_sync(&mut self, value: u8) {
         self.sync = value;
         let selecting_60hz = value & 0x02 == 0;

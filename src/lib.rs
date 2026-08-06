@@ -1,29 +1,29 @@
 //! # Rust68
 //!
-//! Émulateur de la série Motorola 68000 (68k) en Rust.
+//! Motorola 68000 series (68k) emulator written in Rust.
 //!
-//! L'objectif à terme est de couvrir toute la famille 68000 et ses variantes.
-//! Cette première version cible le **MC68000** d'origine, celui de l'Atari ST
-//! et de l'Amiga.
+//! The eventual goal is to cover the whole 68000 family and its variants.
+//! This first version targets the original **MC68000**, the one found in
+//! the Atari ST and the Amiga.
 //!
 //! ## Architecture
 //!
-//! - [`Cpu`] modélise l'état du processeur (registres, SR/CCR, PC).
-//! - Le CPU ne contient pas de mémoire : tous les accès passent par un [`Bus`]
-//!   que l'appelant implémente pour son système.
-//! - [`Cpu::reset`] amorce le CPU depuis le vecteur de reset, [`Cpu::step`]
-//!   exécute une instruction.
+//! - [`Cpu`] models the processor state (registers, SR/CCR, PC).
+//! - The CPU holds no memory: all accesses go through a [`Bus`] that the
+//!   caller implements for its system.
+//! - [`Cpu::reset`] boots the CPU from the reset vector, [`Cpu::step`]
+//!   executes one instruction.
 //!
-//! ## Exemple
+//! ## Example
 //!
 //! ```
 //! use rust68::{Cpu, Bus, FlatBus};
 //!
 //! let mut bus = FlatBus::new();
-//! // Vecteur de reset : SSP = 0x1000, PC = 0x0400.
+//! // Reset vector: SSP = 0x1000, PC = 0x0400.
 //! bus.write32(0x0000, 0x0000_1000);
 //! bus.write32(0x0004, 0x0000_0400);
-//! // Un NOP à l'adresse de départ.
+//! // A NOP at the starting address.
 //! bus.write16(0x0400, 0x4E71);
 //!
 //! let mut cpu = Cpu::new();
@@ -47,16 +47,16 @@ pub use bus::{Bus, TimedBus, TraceSink, TracingBus};
 pub use cpu::{ADDR_MASK, Cpu, CpuType, ccr, sr};
 pub use execute::StepError;
 
-/// Bus mémoire plat de 16 Mo (tout l'espace d'adressage du 68000).
+/// Flat 16 MB memory bus (the 68000's entire address space).
 ///
-/// Utile pour les tests et le prototypage : toute adresse est de la RAM
-/// ordinaire. Les systèmes réels (Atari, Amiga) fourniront leur propre [`Bus`].
+/// Useful for testing and prototyping: every address is plain RAM. Real
+/// systems (Atari, Amiga) will provide their own [`Bus`].
 pub struct FlatBus {
     ram: Vec<u8>,
 }
 
 impl FlatBus {
-    /// Crée un bus de 16 Mo initialisé à zéro.
+    /// Creates a 16 MB bus initialized to zero.
     pub fn new() -> Self {
         FlatBus {
             ram: vec![0; 0x0100_0000],

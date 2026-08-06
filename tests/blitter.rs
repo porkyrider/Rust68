@@ -1,20 +1,20 @@
 #![cfg(feature = "atari-st")]
-//! Tests unitaires du Blitter (`rust68::peripherals::atari_st::blitter`).
+//! Unit tests for the Blitter (`rust68::peripherals::atari_st::blitter`).
 //!
-//! Aucune suite équivalente à TomHarte n'existe pour ce périphérique :
-//! ces tests valident la logique interne implémentée (table de vérité OP,
-//! HOP, endmask, parcours X/Y), et pour `skew` spécifiquement, le
-//! comportement *tel qu'implémenté* plutôt qu'une référence matérielle
-//! vérifiée (voir les limitations documentées dans le module).
+//! No TomHarte-equivalent test suite exists for this peripheral: these
+//! tests validate the internal logic implemented (OP truth table, HOP,
+//! endmask, X/Y traversal), and for `skew` specifically, the behavior *as
+//! implemented* rather than a verified hardware reference (see the
+//! documented limitations in the module).
 
 use rust68::peripherals::atari_st::blitter::{Blitter, reg};
 use rust68::{Bus, FlatBus};
 
-// Écriture par mot/long complet — reflète le vrai chemin d'accès `.W`/`.L`
-// du CPU (voir `Blitter::write_word`/`Blitter::write_long` : un accès `.B`
-// isolé sur ces registres est ignoré sur le silicium réel, donc composer la
-// valeur via deux/quatre `bl.write()` octet par octet n'aurait plus aucun
-// effet depuis ce changement).
+// Full word/long write — reflects the real `.W`/`.L` access path used by
+// the CPU (see `Blitter::write_word`/`Blitter::write_long`: an isolated
+// `.B` access on these registers is ignored on real silicon, so composing
+// the value via two/four byte-by-byte `bl.write()` calls would no longer
+// have any effect since this change).
 fn write_word(bl: &mut Blitter, offset: u32, value: u16) {
     bl.write_word(offset, value);
 }
@@ -24,9 +24,9 @@ fn write_long(bl: &mut Blitter, offset: u32, value: u32) {
 }
 
 #[test]
-fn registres_16_et_32_bits_round_trip() {
+fn registers_16_and_32_bit_round_trip() {
     let mut bl = Blitter::new();
-    write_word(&mut bl, reg::SRC_X_INC, 0xFFFE); // -2 en i16
+    write_word(&mut bl, reg::SRC_X_INC, 0xFFFE); // -2 as i16
     write_word(&mut bl, reg::X_COUNT, 10);
     write_long(&mut bl, reg::SRC_ADDR, 0x001234);
     write_word(&mut bl, reg::HALFTONE_BASE + 4, 0xABCD); // halftone[2]
@@ -51,10 +51,10 @@ fn registres_16_et_32_bits_round_trip() {
 }
 
 #[test]
-fn hop_zero_ignore_source_et_demi_teinte_op_toujours_un() {
+fn hop_zero_ignores_source_and_halftone_when_op_always_one() {
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 0);
-    bl.write(reg::OP, 0x0F); // OP = toujours 1, pour isoler l'effet de HOP
+    bl.write(reg::OP, 0x0F); // OP = always 1, to isolate the effect of HOP
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
     write_word(&mut bl, reg::X_COUNT, 1);
@@ -64,28 +64,28 @@ fn hop_zero_ignore_source_et_demi_teinte_op_toujours_un() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    bus.write16(0x1000, 0xFFFF); // source : tout à 1
-    bus.write16(0x2000, 0x0000); // dest : tout à 0
+    bus.write16(0x1000, 0xFFFF); // source: all 1s
+    bus.write16(0x2000, 0x0000); // dest: all 0s
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
     bl.execute(&mut bus);
 
-    // OP=0xF -> sortie toujours 1 quel que soit s/d : le résultat doit
-    // donc être 0xFFFF indépendamment de HOP.
+    // OP=0xF -> output always 1 regardless of s/d: the result must
+    // therefore be 0xFFFF independently of HOP.
     assert_eq!(bus.read16(0x2000), 0xFFFF);
 }
 
 #[test]
-fn hop_zero_vaut_tous_a_un_pas_zero() {
-    // D'après le datasheet BLITTER.TXT (info-coach.fr) et le BLIT_FAQ.TXT
-    // (ggnkua/Atari_ST_Sources) : la table HOP est 0=tous à 1, 1=demi-teinte,
-    // 2=source, 3=source ET demi-teinte — HOP=0 ne met donc PAS le résultat
-    // à zéro. On utilise OP=0xC (copie de hop_result) pour observer
-    // directement l'effet de HOP.
+fn hop_zero_means_all_ones_not_zero() {
+    // According to the BLITTER.TXT datasheet (info-coach.fr) and
+    // BLIT_FAQ.TXT (ggnkua/Atari_ST_Sources): the HOP table is 0=all ones,
+    // 1=halftone, 2=source, 3=source AND halftone — HOP=0 therefore does
+    // NOT set the result to zero. We use OP=0xC (copy of hop_result) to
+    // directly observe the effect of HOP.
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 0);
-    bl.write(reg::OP, 0x3); // copie hop_result vers la destination
+    bl.write(reg::OP, 0x3); // copy hop_result to the destination
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
     write_word(&mut bl, reg::X_COUNT, 1);
@@ -95,30 +95,30 @@ fn hop_zero_vaut_tous_a_un_pas_zero() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    bus.write16(0x1000, 0x0000); // source : tout à 0 (ne doit pas influer)
-    bus.write16(0x2000, 0x5555); // dest : peu importe, remplacée par hop_result
+    bus.write16(0x1000, 0x0000); // source: all 0s (must have no effect)
+    bus.write16(0x2000, 0x5555); // dest: doesn't matter, replaced by hop_result
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0xFFFF, "HOP=0 -> tous les bits à 1");
+    assert_eq!(bus.read16(0x2000), 0xFFFF, "HOP=0 -> all bits set to 1");
 }
 
-/// Table de vérité OP vérifiée par résolution directe du système
-/// d'équations posé par le manuel Blitter officiel (User Manual for the
-/// Atari ST Bit-Block Transfer Processor, archive.org — recoupé avec
-/// BLITTER.TXT, mêmes valeurs) : OP=1 "source AND destination", OP=2
-/// "source AND NOT destination", OP=4 "NOT source AND destination", OP=8
-/// "NOT source AND NOT destination" ne sont simultanément satisfaisables
-/// qu'avec l'index inversé `3 - ((s<<1)|d)` — pas l'index direct
-/// `(s<<1)|d` qu'utilisait le code avant correction (bug confirmé : cet
-/// index direct donnait par ex. OP=3="NOT source" et OP=0xA="destination
-/// inchangée" au lieu de "source" et "NOT destination").
+/// OP truth table verified by directly solving the system of equations
+/// laid out by the official Blitter manual (User Manual for the Atari ST
+/// Bit-Block Transfer Processor, archive.org — cross-checked with
+/// BLITTER.TXT, same values): OP=1 "source AND destination", OP=2 "source
+/// AND NOT destination", OP=4 "NOT source AND destination", OP=8 "NOT
+/// source AND NOT destination" can only be simultaneously satisfied with
+/// the inverted index `3 - ((s<<1)|d)` — not the direct index `(s<<1)|d`
+/// used by the code before the fix (confirmed bug: this direct index gave
+/// e.g. OP=3="NOT source" and OP=0xA="destination unchanged" instead of
+/// "source" and "NOT destination").
 #[test]
-fn op_0x3_est_source_op_0xa_est_not_destination() {
+fn op_0x3_is_source_op_0xa_is_not_destination() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule (pas de demi-teinte)
+    bl.write(reg::HOP, 2); // source only (no halftone)
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
     write_word(&mut bl, reg::X_COUNT, 1);
@@ -127,7 +127,7 @@ fn op_0x3_est_source_op_0xa_est_not_destination() {
     write_word(&mut bl, reg::ENDMASK_2, 0xFFFF);
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
-    // OP=0x3 : source, indépendant de la destination.
+    // OP=0x3: source, independent of the destination.
     bl.write(reg::OP, 0x3);
     let mut bus = FlatBus::new();
     bus.write16(0x1000, 0b1010_1010_1010_1010);
@@ -135,9 +135,9 @@ fn op_0x3_est_source_op_0xa_est_not_destination() {
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
     bl.execute(&mut bus);
-    assert_eq!(bus.read16(0x2000), 0b1010_1010_1010_1010, "OP=0x3 copie la source telle quelle");
+    assert_eq!(bus.read16(0x2000), 0b1010_1010_1010_1010, "OP=0x3 copies the source as-is");
 
-    // OP=0xA : NOT(destination), indépendant de la source.
+    // OP=0xA: NOT(destination), independent of the source.
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 2);
     write_word(&mut bl, reg::SRC_X_INC, 2);
@@ -154,17 +154,16 @@ fn op_0x3_est_source_op_0xa_est_not_destination() {
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
     bl.execute(&mut bus);
-    assert_eq!(bus.read16(0x2000), !0x1234u16, "OP=0xA inverse la destination, indépendamment de la source");
+    assert_eq!(bus.read16(0x2000), !0x1234u16, "OP=0xA inverts the destination, independently of the source");
 }
 
-/// Vérifie les 16 valeurs d'OP en une seule fois (un seul bit source/dest
-/// à la fois, pour lire directement la table de vérité), contre le manuel
-/// Blitter officiel — verrouille le bug d'indexation corrigé (voir
-/// `apply_op`) pour de bon.
+/// Checks all 16 OP values at once (one source/dest bit at a time, to read
+/// the truth table directly) against the official Blitter manual — locks
+/// in the fixed indexing bug (see `apply_op`) for good.
 #[test]
-fn table_de_verite_op_complete_seize_valeurs() {
-    // (règle, table [((0,0)),(0,1),(1,0),(1,1)] pour (source,destination))
-    let regles: [(u8, [bool; 4]); 16] = [
+fn op_truth_table_complete_sixteen_values() {
+    // (rule, table [((0,0)),(0,1),(1,0),(1,1)] for (source,destination))
+    let rules: [(u8, [bool; 4]); 16] = [
         (0x0, [false, false, false, false]), // all zeros
         (0x1, [false, false, false, true]),  // source AND destination
         (0x2, [false, false, true, false]),  // source AND NOT destination
@@ -183,10 +182,10 @@ fn table_de_verite_op_complete_seize_valeurs() {
         (0xF, [true, true, true, true]),     // all ones
     ];
 
-    for (op, table) in regles {
+    for (op, table) in rules {
         for (i, &(s, d)) in [(0u16, 0u16), (0, 1), (1, 0), (1, 1)].iter().enumerate() {
             let mut bl = Blitter::new();
-            bl.write(reg::HOP, 2); // source seule
+            bl.write(reg::HOP, 2); // source only
             bl.write(reg::OP, op);
             write_word(&mut bl, reg::SRC_X_INC, 2);
             write_word(&mut bl, reg::DST_X_INC, 2);
@@ -205,24 +204,24 @@ fn table_de_verite_op_complete_seize_valeurs() {
             assert_eq!(
                 bus.read16(0x2000),
                 expected,
-                "OP={op:#x} avec (source={s},destination={d}) doit donner {expected:#06x}"
+                "OP={op:#x} with (source={s},destination={d}) must give {expected:#06x}"
             );
         }
     }
 }
 
 #[test]
-fn endmask_masque_le_premier_et_dernier_mot_de_chaque_ligne() {
+fn endmask_masks_first_and_last_word_of_each_line() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // remplace par la source (copie pure)
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // replace with source (pure copy)
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
     write_word(&mut bl, reg::X_COUNT, 3);
     write_word(&mut bl, reg::Y_COUNT, 1);
-    write_word(&mut bl, reg::ENDMASK_1, 0x00FF); // premier mot : seul l'octet bas passe
-    write_word(&mut bl, reg::ENDMASK_2, 0xFFFF); // mot du milieu : tout passe
-    write_word(&mut bl, reg::ENDMASK_3, 0xFF00); // dernier mot : seul l'octet haut passe
+    write_word(&mut bl, reg::ENDMASK_1, 0x00FF); // first word: only the low byte passes
+    write_word(&mut bl, reg::ENDMASK_2, 0xFFFF); // middle word: everything passes
+    write_word(&mut bl, reg::ENDMASK_3, 0xFF00); // last word: only the high byte passes
 
     let mut bus = FlatBus::new();
     for i in 0..3 {
@@ -234,30 +233,29 @@ fn endmask_masque_le_premier_et_dernier_mot_de_chaque_ligne() {
 
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0x00FF, "premier mot masqué par ENDMASK1");
-    assert_eq!(bus.read16(0x2002), 0xFFFF, "mot du milieu masqué par ENDMASK2");
-    assert_eq!(bus.read16(0x2004), 0xFF00, "dernier mot masqué par ENDMASK3");
+    assert_eq!(bus.read16(0x2000), 0x00FF, "first word masked by ENDMASK1");
+    assert_eq!(bus.read16(0x2002), 0xFFFF, "middle word masked by ENDMASK2");
+    assert_eq!(bus.read16(0x2004), 0xFF00, "last word masked by ENDMASK3");
 }
 
-/// D'après le manuel Blitter officiel : "In the case of a one word line
-/// ENDMASK 1 is used" — ENDMASK_3 est simplement IGNORÉ pour une ligne
-/// d'un seul mot, pas combiné par ET avec ENDMASK_1 (une correction
-/// antérieure avait cru le contraire — "les deux masques fusionnent" —
-/// ce qui mettait silencieusement à zéro des blits par ailleurs valides
-/// dès qu'ENDMASK_3 valait 0, un cas très fréquent en pratique observé
-/// sur les petits blits du curseur souris).
+/// According to the official Blitter manual: "In the case of a one word
+/// line ENDMASK 1 is used" — ENDMASK_3 is simply IGNORED for a one-word
+/// line, not ANDed together with ENDMASK_1 (an earlier fix had assumed
+/// the opposite — "the two masks merge" — which silently zeroed out
+/// otherwise valid blits as soon as ENDMASK_3 was 0, a very common case in
+/// practice observed on small mouse cursor blits).
 #[test]
-fn ligne_d_un_seul_mot_utilise_endmask1_seul_endmask3_ignore() {
+fn single_word_line_uses_endmask1_only_endmask3_ignored() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // remplace par la source (copie pure)
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // replace with source (pure copy)
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
     write_word(&mut bl, reg::X_COUNT, 1);
     write_word(&mut bl, reg::Y_COUNT, 1);
-    write_word(&mut bl, reg::ENDMASK_1, 0xFF00); // seul masque qui doit compter
-    write_word(&mut bl, reg::ENDMASK_2, 0xFFFF); // jamais utilisé ici (pas de mot du milieu)
-    write_word(&mut bl, reg::ENDMASK_3, 0x0000); // doit être ignoré, pas combiné
+    write_word(&mut bl, reg::ENDMASK_1, 0xFF00); // the only mask that should count
+    write_word(&mut bl, reg::ENDMASK_2, 0xFFFF); // never used here (no middle word)
+    write_word(&mut bl, reg::ENDMASK_3, 0x0000); // must be ignored, not combined
 
     let mut bus = FlatBus::new();
     bus.write16(0x1000, 0xFFFF);
@@ -270,19 +268,19 @@ fn ligne_d_un_seul_mot_utilise_endmask1_seul_endmask3_ignore() {
     assert_eq!(
         bus.read16(0x2000),
         0xFF00,
-        "ENDMASK_1 seul doit s'appliquer ; ENDMASK_3=0 ne doit pas tout annuler"
+        "ENDMASK_1 alone must apply; ENDMASK_3=0 must not cancel everything"
     );
 }
 
 #[test]
-fn parcours_y_avance_via_les_increments_y() {
+fn y_traversal_advances_via_y_increments() {
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 2);
-    bl.write(reg::OP, 0x3); // copie
+    bl.write(reg::OP, 0x3); // copy
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
-    write_word(&mut bl, reg::SRC_Y_INC, 0); // pas d'avancée Y côté source : relit la même ligne
-    write_word(&mut bl, reg::DST_Y_INC, 4); // saute une ligne de 2 mots côté dest
+    write_word(&mut bl, reg::SRC_Y_INC, 0); // no Y advance on the source side: rereads the same line
+    write_word(&mut bl, reg::DST_Y_INC, 4); // skips a 2-word line on the dest side
     write_word(&mut bl, reg::X_COUNT, 1);
     write_word(&mut bl, reg::Y_COUNT, 2);
     write_word(&mut bl, reg::ENDMASK_1, 0xFFFF);
@@ -296,15 +294,15 @@ fn parcours_y_avance_via_les_increments_y() {
 
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0x4242, "ligne 0");
-    assert_eq!(bus.read16(0x2004), 0x4242, "ligne 1, après DST_Y_INC");
+    assert_eq!(bus.read16(0x2000), 0x4242, "line 0");
+    assert_eq!(bus.read16(0x2004), 0x4242, "line 1, after DST_Y_INC");
 }
 
 #[test]
-fn halftone_cycle_par_ligne() {
+fn halftone_cycles_per_line() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 1); // demi-teinte seule
-    bl.write(reg::OP, 0x3); // copie du résultat HOP
+    bl.write(reg::HOP, 1); // halftone only
+    bl.write(reg::OP, 0x3); // copy of the HOP result
     write_word(&mut bl, reg::HALFTONE_BASE, 0x1111);
     write_word(&mut bl, reg::HALFTONE_BASE + 2, 0x2222);
     write_word(&mut bl, reg::SRC_X_INC, 2);
@@ -322,19 +320,19 @@ fn halftone_cycle_par_ligne() {
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0x1111, "ligne 0 utilise halftone[0]");
-    assert_eq!(bus.read16(0x2004), 0x2222, "ligne 1 utilise halftone[1]");
+    assert_eq!(bus.read16(0x2000), 0x1111, "line 0 uses halftone[0]");
+    assert_eq!(bus.read16(0x2004), 0x2222, "line 1 uses halftone[1]");
 }
 
-/// Le manuel officiel documente que X_COUNT/Y_COUNT décomptent en interne
-/// pendant l'exécution puis reviennent à leur valeur INITIALE une fois le
-/// blit terminé — jamais à zéro (0 désignant 65536, un appelant qui
-/// enchaîne des blits sans réécrire Y_COUNT à chaque fois, en s'appuyant
-/// sur cette persistance documentée, verrait sinon un 0 fallacieux =
-/// 65536 lignes). Confirmé buggé avant correction : le code remettait
-/// `y_count` à 0 explicitement en fin d'exécution.
+/// The official manual documents that X_COUNT/Y_COUNT count down
+/// internally during execution and then return to their INITIAL value
+/// once the blit is finished — never to zero (0 meaning 65536; a caller
+/// chaining blits without rewriting Y_COUNT each time, relying on this
+/// documented persistence, would otherwise see a spurious 0 = 65536
+/// lines). Confirmed buggy before the fix: the code explicitly reset
+/// `y_count` to 0 at the end of execution.
 #[test]
-fn busy_efface_et_y_count_retrouve_sa_valeur_initiale_apres_execute() {
+fn busy_cleared_and_y_count_returns_to_initial_value_after_execute() {
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 2);
     bl.write(reg::OP, 0x3);
@@ -343,34 +341,33 @@ fn busy_efface_et_y_count_retrouve_sa_valeur_initiale_apres_execute() {
     write_word(&mut bl, reg::ENDMASK_1, 0xFFFF);
     write_word(&mut bl, reg::ENDMASK_2, 0xFFFF);
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
-    bl.write(reg::CONTROL, 1 << 7); // BUSY posé "à la main" pour le test
+    bl.write(reg::CONTROL, 1 << 7); // BUSY set "by hand" for the test
 
     let mut bus = FlatBus::new();
     bl.execute(&mut bus);
 
-    assert!(!bl.busy(), "BUSY doit être effacé après execute()");
-    // Y_COUNT est un compteur VIVANT (décompte réellement à chaque ligne
-    // traitée, pas une copie figée relue à l'identique) — confirmé par
-    // Hatari (`BlitterRegs.y_count--`) et Steem SSE (`Blitter.YCounter--`
-    // puis `Blitter.YCount=(WORD)Blitter.YCounter`, resynchronisé à chaque
-    // ligne). Une fois le blit entièrement terminé, il lit donc 0, pas sa
-    // valeur de départ — une version précédente de ce test supposait
-    // l'inverse (registre figé), cohérent avec l'ancien modèle "tout
-    // d'un coup" qui ne modifiait jamais le registre visible, seulement
-    // une copie locale.
-    assert_eq!(bl.read(reg::Y_COUNT), 0, "octet haut de Y_COUNT après un blit terminé");
-    assert_eq!(bl.read(reg::Y_COUNT + 1), 0, "Y_COUNT doit valoir 0 une fois le blit entièrement terminé");
+    assert!(!bl.busy(), "BUSY must be cleared after execute()");
+    // Y_COUNT is a LIVE counter (it really counts down on each line
+    // processed, not a frozen copy reread identically) — confirmed by
+    // Hatari (`BlitterRegs.y_count--`) and Steem SSE (`Blitter.YCounter--`
+    // then `Blitter.YCount=(WORD)Blitter.YCounter`, resynced on every
+    // line). Once the blit is fully finished, it therefore reads 0, not
+    // its starting value — an earlier version of this test assumed the
+    // opposite (frozen register), consistent with the old "all at once"
+    // model that never modified the visible register, only a local copy.
+    assert_eq!(bl.read(reg::Y_COUNT), 0, "high byte of Y_COUNT after a finished blit");
+    assert_eq!(bl.read(reg::Y_COUNT + 1), 0, "Y_COUNT must be 0 once the blit is fully finished");
 }
 
 #[test]
-fn fxsr_amorce_le_registre_tampon_avant_la_premiere_lecture() {
-    // D'après le datasheet : FXSR (bit 7 de SKEW) déclenche une lecture
-    // source supplémentaire en tout début de ligne, pour amorcer le
-    // "registre tampon" utilisé par le décalage skew. Sans FXSR, ce
-    // tampon part de zéro.
+fn fxsr_primes_the_buffer_register_before_first_read() {
+    // According to the datasheet: FXSR (bit 7 of SKEW) triggers an extra
+    // source read right at the start of the line, to prime the "buffer
+    // register" used by the skew shift. Without FXSR, this buffer starts
+    // at zero.
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // copie
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // copy
     bl.write(reg::SKEW, 0x84); // FXSR=1, skew=4
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
@@ -381,13 +378,13 @@ fn fxsr_amorce_le_registre_tampon_avant_la_premiere_lecture() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    // FXSR lit à SRC_ADDR courant (0x1000) puis avance SRC_ADDR de
-    // SRC_X_INC AVANT la lecture normale du mot 0, qui a donc lieu à
-    // 0x1000+2=0x1002 (confirmé par Hatari, `Blitter_ProcessWord` :
-    // `src_addr += src_x_incr` a lieu entre la lecture FXSR et la
-    // lecture normale du premier mot).
-    bus.write16(0x1000, 0x000F); // mot "précédent" (lu par FXSR) : bits bas = 1111
-    bus.write16(0x1002, 0x0000); // mot source courant (mot 0, réellement lu à SRC_ADDR+SRC_X_INC)
+    // FXSR reads at the current SRC_ADDR (0x1000) then advances SRC_ADDR
+    // by SRC_X_INC BEFORE the normal read of word 0, which therefore
+    // takes place at 0x1000+2=0x1002 (confirmed by Hatari,
+    // `Blitter_ProcessWord`: `src_addr += src_x_incr` happens between the
+    // FXSR read and the normal read of the first word).
+    bus.write16(0x1000, 0x000F); // "previous" word (read by FXSR): low bits = 1111
+    bus.write16(0x1002, 0x0000); // current source word (word 0, actually read at SRC_ADDR+SRC_X_INC)
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
@@ -396,11 +393,11 @@ fn fxsr_amorce_le_registre_tampon_avant_la_premiere_lecture() {
     assert_eq!(
         bus.read16(0x2000),
         0xF000,
-        "FXSR=1 : les 4 bits bas du mot précédent remontent en tête du résultat décalé"
+        "FXSR=1: the low 4 bits of the previous word rise to the top of the shifted result"
     );
 
-    // Même essai sans FXSR : le tampon d'amorçage part de zéro, le mot
-    // précédent en mémoire n'a donc plus d'effet.
+    // Same test without FXSR: the priming buffer starts at zero, so the
+    // previous word in memory no longer has any effect.
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 2);
     bl.write(reg::OP, 0x3);
@@ -418,33 +415,33 @@ fn fxsr_amorce_le_registre_tampon_avant_la_premiere_lecture() {
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
     bl.execute(&mut bus);
-    assert_eq!(bus.read16(0x2000), 0x0000, "FXSR=0 : pas d'amorçage, tampon initial à zéro");
+    assert_eq!(bus.read16(0x2000), 0x0000, "FXSR=0: no priming, initial buffer at zero");
 }
 
 #[test]
-fn nfsr_ligne_d_un_seul_mot_relit_et_combine_le_mot_avec_lui_meme() {
-    // NFSR (bit 6 de SKEW) sur une ligne d'UN SEUL mot est un cas
-    // particulier documenté séparément par Hatari (`Blitter_ProcessWord`,
-    // commentaire "Special 'weird' case for x_count=1 and NFSR=1") : la
-    // lecture source normale a bien lieu (contrairement à une ligne
-    // multi-mots, où NFSR omet la dernière lecture), MAIS le silicium
-    // effectue en plus un décalage+relecture supplémentaire (réutilisant
-    // le dernier mot bus lu) avant ET après le traitement du mot. Avec
-    // SKEW=0, cela revient à combiner le mot source avec lui-même dans le
-    // registre tampon 32 bits, ce qui redonne simplement ce même mot en
-    // sortie — vérifié par un test différentiel exhaustif comparant notre
-    // implémentation à un portage direct de `Blitter_ProcessWord`
-    // (`tests/blitter_hatari_diff.rs`, 0 divergence sur 8731 configurations
-    // dont celle-ci). Une version précédente traitait NFSR comme un simple
-    // "réutilise le mot précédent" y compris pour X_COUNT=1, ce qui aurait
-    // donné 0x0000 ici (tampon initial nul) plutôt que 0xFFFF.
+fn nfsr_single_word_line_rereads_and_combines_word_with_itself() {
+    // NFSR (bit 6 of SKEW) on a line of a SINGLE word is a special case
+    // documented separately by Hatari (`Blitter_ProcessWord`, comment
+    // "Special 'weird' case for x_count=1 and NFSR=1"): the normal source
+    // read does take place (unlike a multi-word line, where NFSR skips
+    // the last read), BUT the silicon additionally performs an extra
+    // shift+reread (reusing the last word read off the bus) both before
+    // AND after processing the word. With SKEW=0, this amounts to
+    // combining the source word with itself in the 32-bit buffer
+    // register, which simply yields that same word as output — verified
+    // by an exhaustive differential test comparing our implementation to
+    // a direct port of `Blitter_ProcessWord` (`tests/blitter_hatari_diff.rs`,
+    // 0 mismatches across 8731 configurations including this one). An
+    // earlier version treated NFSR as a simple "reuse the previous word"
+    // even for X_COUNT=1, which would have given 0x0000 here (null
+    // initial buffer) instead of 0xFFFF.
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // copie
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // copy
     bl.write(reg::SKEW, 0x40); // NFSR=1, skew=0
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
-    write_word(&mut bl, reg::X_COUNT, 1); // un seul mot : c'est aussi le dernier
+    write_word(&mut bl, reg::X_COUNT, 1); // a single word: it's also the last one
     write_word(&mut bl, reg::Y_COUNT, 1);
     write_word(&mut bl, reg::ENDMASK_1, 0xFFFF);
     write_word(&mut bl, reg::ENDMASK_2, 0xFFFF);
@@ -457,23 +454,23 @@ fn nfsr_ligne_d_un_seul_mot_relit_et_combine_le_mot_avec_lui_meme() {
 
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0xFFFF, "NFSR=1, ligne d'un seul mot : lu puis recombiné avec lui-même");
+    assert_eq!(bus.read16(0x2000), 0xFFFF, "NFSR=1, single-word line: read then recombined with itself");
 }
 
 #[test]
-fn nfsr_ligne_d_un_seul_mot_avec_fxsr_relit_aussi_le_mot_normal() {
-    // Même cas particulier que le test précédent, mais avec FXSR=1 en
-    // plus : le tampon est d'abord amorcé par la lecture FXSR (à
-    // SRC_ADDR=0x1000), PUIS la lecture "normale" du mot 0 a bien lieu
-    // elle aussi (à 0x1000+SRC_X_INC=0x1002 — le cas X_COUNT=1 ne
-    // supprime PAS cette lecture, seul le décalage+relecture
-    // supplémentaire de fin de mot réutilise le dernier mot bus lu, ici
-    // celui de 0x1002, pas celui de 0x1000). Avec SKEW=0, c'est donc la
-    // valeur lue à 0x1002 qui domine en sortie, pas celle de l'amorçage
-    // FXSR — vérifié par le même test différentiel exhaustif.
+fn nfsr_single_word_line_with_fxsr_also_rereads_the_normal_word() {
+    // Same special case as the previous test, but with FXSR=1 as well:
+    // the buffer is first primed by the FXSR read (at SRC_ADDR=0x1000),
+    // THEN the "normal" read of word 0 also takes place (at
+    // 0x1000+SRC_X_INC=0x1002 — the X_COUNT=1 case does NOT suppress
+    // this read, only the extra end-of-word shift+reread reuses the last
+    // word read off the bus, here the one at 0x1002, not the one at
+    // 0x1000). With SKEW=0, it is therefore the value read at 0x1002
+    // that dominates in the output, not the FXSR priming value —
+    // verified by the same exhaustive differential test.
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // copie
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // copy
     bl.write(reg::SKEW, 0xC0); // FXSR=1, NFSR=1, skew=0
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
@@ -484,8 +481,8 @@ fn nfsr_ligne_d_un_seul_mot_avec_fxsr_relit_aussi_le_mot_normal() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    bus.write16(0x1000, 0xABCD); // lu par FXSR (à SRC_ADDR courant)
-    bus.write16(0x1002, 0x1111); // lu par la lecture normale du mot 0
+    bus.write16(0x1000, 0xABCD); // read by FXSR (at the current SRC_ADDR)
+    bus.write16(0x1002, 0x1111); // read by the normal read of word 0
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
@@ -494,20 +491,20 @@ fn nfsr_ligne_d_un_seul_mot_avec_fxsr_relit_aussi_le_mot_normal() {
     assert_eq!(
         bus.read16(0x2000),
         0x1111,
-        "NFSR=1+FXSR=1, ligne d'un seul mot : la lecture normale (0x1002) domine en sortie"
+        "NFSR=1+FXSR=1, single-word line: the normal read (0x1002) dominates in the output"
     );
 }
 
 #[test]
-fn smudge_choisit_la_demi_teinte_via_les_bits_bas_de_la_source() {
-    // SMUDGE (bit 5 de CONTROL) : le mot de demi-teinte utilisé pour
-    // chaque mot vient des 4 bits bas du mot source décalé, pas du
-    // numéro de ligne courant — donc potentiellement différent à chaque
-    // mot d'une même ligne (contrairement au mode normal).
+fn smudge_selects_halftone_via_low_bits_of_source() {
+    // SMUDGE (bit 5 of CONTROL): the halftone word used for each word
+    // comes from the low 4 bits of the shifted source word, not from the
+    // current line number — so it can potentially differ for each word
+    // within the same line (unlike normal mode).
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 1); // demi-teinte seule
-    bl.write(reg::OP, 0x3); // copie du résultat HOP
-    bl.write(reg::CONTROL, 0x20); // SMUDGE=1, numéro de ligne=0
+    bl.write(reg::HOP, 1); // halftone only
+    bl.write(reg::OP, 0x3); // copy of the HOP result
+    bl.write(reg::CONTROL, 0x20); // SMUDGE=1, line number=0
     write_word(&mut bl, reg::HALFTONE_BASE + 2 * 3, 0x3333); // halftone[3]
     write_word(&mut bl, reg::HALFTONE_BASE + 2 * 7, 0x7777); // halftone[7]
     write_word(&mut bl, reg::SRC_X_INC, 2);
@@ -519,35 +516,35 @@ fn smudge_choisit_la_demi_teinte_via_les_bits_bas_de_la_source() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    bus.write16(0x1000, 0x0003); // nibble bas = 3
-    bus.write16(0x1002, 0x0007); // nibble bas = 7
+    bus.write16(0x1000, 0x0003); // low nibble = 3
+    bus.write16(0x1002, 0x0007); // low nibble = 7
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0x3333, "mot 0 : nibble source 3 -> halftone[3]");
-    assert_eq!(bus.read16(0x2002), 0x7777, "mot 1 : nibble source 7 -> halftone[7], même ligne");
+    assert_eq!(bus.read16(0x2000), 0x3333, "word 0: source nibble 3 -> halftone[3]");
+    assert_eq!(bus.read16(0x2002), 0x7777, "word 1: source nibble 7 -> halftone[7], same line");
 }
 
 #[test]
-fn numero_de_ligne_demi_teinte_lisible_et_reglable_via_control() {
-    // Le numéro de ligne de demi-teinte est exposé directement par les
-    // bits 0-3 de CONTROL (lisible/inscriptible), pas un compteur caché.
-    // Sa direction d'avancement suit le signe de DST_Y_INC.
+fn halftone_line_number_readable_and_settable_via_control() {
+    // The halftone line number is exposed directly by bits 0-3 of
+    // CONTROL (readable/writable), not a hidden counter. Its direction of
+    // travel follows the sign of DST_Y_INC.
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 1); // demi-teinte seule
-    bl.write(reg::OP, 0x3); // copie
+    bl.write(reg::HOP, 1); // halftone only
+    bl.write(reg::OP, 0x3); // copy
     write_word(&mut bl, reg::HALFTONE_BASE + 2 * 5, 0x5555); // halftone[5]
     write_word(&mut bl, reg::HALFTONE_BASE + 2 * 4, 0x4444); // halftone[4]
 
-    bl.write(reg::CONTROL, 5); // pré-positionne le numéro de ligne à 5
-    assert_eq!(bl.read(reg::CONTROL) & 0x0F, 5, "numéro de ligne relu tel qu'écrit");
+    bl.write(reg::CONTROL, 5); // preset the line number to 5
+    assert_eq!(bl.read(reg::CONTROL) & 0x0F, 5, "line number read back as written");
 
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
     write_word(&mut bl, reg::SRC_Y_INC, 0);
-    write_word(&mut bl, reg::DST_Y_INC, 0xFFFC); // -4 en i16
+    write_word(&mut bl, reg::DST_Y_INC, 0xFFFC); // -4 as i16
     write_word(&mut bl, reg::X_COUNT, 1);
     write_word(&mut bl, reg::Y_COUNT, 2);
     write_word(&mut bl, reg::ENDMASK_1, 0xFFFF);
@@ -559,26 +556,26 @@ fn numero_de_ligne_demi_teinte_lisible_et_reglable_via_control() {
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0x5555, "ligne 0 : numéro pré-positionné à 5");
+    assert_eq!(bus.read16(0x2000), 0x5555, "line 0: number preset to 5");
     assert_eq!(
         bus.read16(0x1FFC),
         0x4444,
-        "ligne 1 : numéro décrémenté à 4 (DST_Y_INC négatif), dst = 0x2000-4"
+        "line 1: number decremented to 4 (negative DST_Y_INC), dst = 0x2000-4"
     );
     assert_eq!(
         bl.read(reg::CONTROL) & 0x0F,
         3,
-        "numéro de ligne final = 5-2 après 2 lignes décroissantes"
+        "final line number = 5-2 after 2 decreasing lines"
     );
 }
 
 #[test]
-fn skew_zero_ne_modifie_pas_le_mot_source() {
-    // skew=0 doit toujours renvoyer le mot courant tel quel, quel que soit
-    // le mot précédent — c'est la partie de `skew` dont on est certain.
+fn skew_zero_does_not_modify_source_word() {
+    // skew=0 must always return the current word as-is, regardless of the
+    // previous word — this is the part of `skew` we're certain about.
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 2);
-    bl.write(reg::OP, 0x3); // copie
+    bl.write(reg::OP, 0x3); // copy
     bl.write(reg::SKEW, 0);
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
@@ -589,27 +586,27 @@ fn skew_zero_ne_modifie_pas_le_mot_source() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    bus.write16(0x0FFE, 0xAAAA); // mot juste avant la source (ne doit pas influer)
+    bus.write16(0x0FFE, 0xAAAA); // word just before the source (must have no effect)
     bus.write16(0x1000, 0x1234);
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0x1234, "skew=0 : mot source inchangé");
+    assert_eq!(bus.read16(0x2000), 0x1234, "skew=0: source word unchanged");
 }
 
-/// Vérifie la combinaison décalée contre l'exemple chiffré concret de
-/// BLIT_FAQ.TXT (SKEW=3 : "reads out bits 18..3" d'un tampon [précédent
-/// (haut, bits 16-31)][courant (bas, bits 0-15)]) — verrouille le bug
-/// (ordre des mots ET sens du décalage inversés) trouvé et corrigé cette
-/// session dans `skewed_source`.
+/// Checks the shifted combination against the concrete worked example from
+/// BLIT_FAQ.TXT (SKEW=3: "reads out bits 18..3" of a buffer [previous
+/// (high, bits 16-31)][current (low, bits 0-15)]) — locks in the bug
+/// (word order AND shift direction both reversed) found and fixed this
+/// session in `skewed_source`.
 #[test]
-fn skew_non_nul_combine_precedent_et_courant_dans_le_bon_ordre() {
+fn nonzero_skew_combines_previous_and_current_in_correct_order() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // copie
-    bl.write(reg::SKEW, 0x83); // FXSR posé (bit 7) + skew=3
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // copy
+    bl.write(reg::SKEW, 0x83); // FXSR set (bit 7) + skew=3
 
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
@@ -620,40 +617,40 @@ fn skew_non_nul_combine_precedent_et_courant_dans_le_bon_ordre() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    // FXSR lit à SRC_ADDR courant (0x1000) puis SRC_ADDR avance de
-    // SRC_X_INC avant la lecture normale du mot 0, qui a donc lieu à
-    // 0x1000+2=0x1002.
-    bus.write16(0x1000, 0x0005); // mot "précédent" (lu par FXSR) : bits bas = 101
-    bus.write16(0x1002, 0x0000); // mot "courant" (mot 0)
+    // FXSR reads at the current SRC_ADDR (0x1000) then SRC_ADDR advances
+    // by SRC_X_INC before the normal read of word 0, which therefore
+    // takes place at 0x1000+2=0x1002.
+    bus.write16(0x1000, 0x0005); // "previous" word (read by FXSR): low bits = 101
+    bus.write16(0x1002, 0x0000); // "current" word (word 0)
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
     bl.execute(&mut bus);
 
-    // Attendu : bits bas (101) du mot précédent remontés en tête (décalés
-    // de 16-3=13), combinés aux bits hauts (tous à 0 ici) du mot courant
-    // décalé à droite de 3 → 0b101_0000000000000 = 0xA000.
-    assert_eq!(bus.read16(0x2000), 0xA000, "combinaison decalée précédent/courant dans le bon ordre");
+    // Expected: low bits (101) of the previous word raised to the top
+    // (shifted by 16-3=13), combined with the high bits (all 0 here) of
+    // the current word shifted right by 3 -> 0b101_0000000000000 = 0xA000.
+    assert_eq!(bus.read16(0x2000), 0xA000, "shifted combination of previous/current in the correct order");
 }
 
-/// Même exemple chiffré que le test précédent, mais avec SRC_X_INC négatif
-/// (parcours décroissant, blit "miroir") : d'après Hatari
-/// (`Blitter_SourceShift`/`Blitter_SourceFetch`), l'ordre des deux moitiés
-/// du tampon 32 bits s'INVERSE dans ce cas — le mot COURANT (nouvellement
-/// lu) occupe la moitié HAUTE et le mot PRÉCÉDENT la moitié BASSE (au lieu
-/// de l'inverse pour un parcours croissant). On place donc le motif "101"
-/// dans le mot COURANT (pas le précédent) pour obtenir le même résultat
-/// 0xA000 — une version qui ne tiendrait pas compte de la direction (comme
-/// avant cette correction) donnerait 0x0000 ici, puisqu'elle chercherait
-/// le motif dans le mauvais mot.
+/// Same worked example as the previous test, but with a negative
+/// SRC_X_INC (decreasing traversal, "mirror" blit): according to Hatari
+/// (`Blitter_SourceShift`/`Blitter_SourceFetch`), the order of the two
+/// halves of the 32-bit buffer is REVERSED in this case — the CURRENT
+/// (newly read) word occupies the HIGH half and the PREVIOUS word the LOW
+/// half (instead of the reverse for an increasing traversal). We
+/// therefore place the "101" pattern in the CURRENT word (not the
+/// previous one) to obtain the same 0xA000 result — a version that
+/// ignored the direction (as before this fix) would give 0x0000 here,
+/// since it would look for the pattern in the wrong word.
 #[test]
-fn skew_non_nul_inverse_ordre_de_combinaison_si_src_x_inc_negatif() {
+fn nonzero_skew_reverses_combination_order_if_src_x_inc_negative() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // copie
-    bl.write(reg::SKEW, 0x83); // FXSR posé (bit 7) + skew=3
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // copy
+    bl.write(reg::SKEW, 0x83); // FXSR set (bit 7) + skew=3
 
-    write_word(&mut bl, reg::SRC_X_INC, 0xFFFE); // -2 : parcours décroissant
+    write_word(&mut bl, reg::SRC_X_INC, 0xFFFE); // -2: decreasing traversal
     write_word(&mut bl, reg::DST_X_INC, 2);
     write_word(&mut bl, reg::X_COUNT, 1);
     write_word(&mut bl, reg::Y_COUNT, 1);
@@ -662,11 +659,11 @@ fn skew_non_nul_inverse_ordre_de_combinaison_si_src_x_inc_negatif() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    // FXSR lit à SRC_ADDR courant (0x1000) puis SRC_ADDR avance de
-    // SRC_X_INC (-2) avant la lecture normale du mot 0, qui a donc lieu à
-    // 0x1000-2=0x0FFE.
-    bus.write16(0x1000, 0x0000); // mot "précédent" (lu par FXSR)
-    bus.write16(0x0FFE, 0x0005); // mot "courant" (mot 0) : bits bas = 101
+    // FXSR reads at the current SRC_ADDR (0x1000) then SRC_ADDR advances
+    // by SRC_X_INC (-2) before the normal read of word 0, which therefore
+    // takes place at 0x1000-2=0x0FFE.
+    bus.write16(0x1000, 0x0000); // "previous" word (read by FXSR)
+    bus.write16(0x0FFE, 0x0005); // "current" word (word 0): low bits = 101
     write_long(&mut bl, reg::SRC_ADDR, 0x1000);
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
@@ -675,32 +672,31 @@ fn skew_non_nul_inverse_ordre_de_combinaison_si_src_x_inc_negatif() {
     assert_eq!(
         bus.read16(0x2000),
         0xA000,
-        "parcours décroissant : le motif doit être cherché dans le mot COURANT, pas le précédent"
+        "decreasing traversal: the pattern must be looked for in the CURRENT word, not the previous one"
     );
 }
 
-/// Avance d'adresse en fin de ligne pour un blit multi-mots/multi-lignes
-/// avec X_INC non nul. Sur le silicium réel (confirmé par Hatari,
-/// `Blitter_Step` : le pointeur avance de X_INC entre les mots, mais le
-/// DERNIER mot de la ligne avance de Y_INC À LA PLACE de X_INC), Y_INC doit
-/// donc déjà tenir compte des (X_COUNT-1) pas de X_INC parcourus dans la
-/// ligne. Un bug précédent ajoutait Y_INC seul à l'adresse de DÉBUT de
-/// ligne, perdant la contribution de (X_COUNT-1)*X_INC — invisible sur les
-/// blits d'un seul mot (curseur souris) mais corrompant tout blit
-/// multi-mots (texte/icônes GEM), ce qui correspond exactement aux
-/// symptômes observés en direct par l'utilisateur.
+/// End-of-line address advance for a multi-word/multi-line blit with a
+/// nonzero X_INC. On real silicon (confirmed by Hatari, `Blitter_Step`:
+/// the pointer advances by X_INC between words, but the LAST word of the
+/// line advances by Y_INC INSTEAD of X_INC), Y_INC must therefore already
+/// account for the (X_COUNT-1) X_INC steps taken within the line. A
+/// previous bug added Y_INC alone to the START-of-line address, losing
+/// the contribution of (X_COUNT-1)*X_INC — invisible on single-word blits
+/// (mouse cursor) but corrupting every multi-word blit (GEM text/icons),
+/// which matches exactly the symptoms observed live by the user.
 #[test]
-fn avance_fin_de_ligne_tient_compte_de_x_count_moins_un_fois_x_inc() {
+fn end_of_line_advance_accounts_for_x_count_minus_one_times_x_inc() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // copie
-    bl.write(reg::SKEW, 0x00); // pas de décalage/FXSR/NFSR
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // copy
+    bl.write(reg::SKEW, 0x00); // no shift/FXSR/NFSR
 
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
-    // Largeur de ligne réelle (mémoire) = 20 octets ; X_COUNT=3 mots
-    // parcourus par pas de 2 → Y_INC doit valoir 20 - (3-1)*2 = 16 pour
-    // que la ligne suivante démarre au bon endroit.
+    // Real (memory) line width = 20 bytes; X_COUNT=3 words traversed in
+    // steps of 2 -> Y_INC must be 20 - (3-1)*2 = 16 for the next line to
+    // start at the right place.
     write_word(&mut bl, reg::SRC_Y_INC, 16);
     write_word(&mut bl, reg::DST_Y_INC, 16);
     write_word(&mut bl, reg::X_COUNT, 3);
@@ -710,11 +706,11 @@ fn avance_fin_de_ligne_tient_compte_de_x_count_moins_un_fois_x_inc() {
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
 
     let mut bus = FlatBus::new();
-    // Ligne 0 (source à 0x1000, largeur réelle 20 octets)
+    // Line 0 (source at 0x1000, real width 20 bytes)
     bus.write16(0x1000, 0x1111);
     bus.write16(0x1002, 0x2222);
     bus.write16(0x1004, 0x3333);
-    // Ligne 1 (source à 0x1000+20=0x1014)
+    // Line 1 (source at 0x1000+20=0x1014)
     bus.write16(0x1014, 0x4444);
     bus.write16(0x1016, 0x5555);
     bus.write16(0x1018, 0x6666);
@@ -723,26 +719,26 @@ fn avance_fin_de_ligne_tient_compte_de_x_count_moins_un_fois_x_inc() {
 
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0x1111, "ligne 0, mot 0");
-    assert_eq!(bus.read16(0x2002), 0x2222, "ligne 0, mot 1");
-    assert_eq!(bus.read16(0x2004), 0x3333, "ligne 0, mot 2");
-    assert_eq!(bus.read16(0x2014), 0x4444, "ligne 1 (0x2000+20), mot 0");
-    assert_eq!(bus.read16(0x2016), 0x5555, "ligne 1, mot 1");
-    assert_eq!(bus.read16(0x2018), 0x6666, "ligne 1, mot 2");
+    assert_eq!(bus.read16(0x2000), 0x1111, "line 0, word 0");
+    assert_eq!(bus.read16(0x2002), 0x2222, "line 0, word 1");
+    assert_eq!(bus.read16(0x2004), 0x3333, "line 0, word 2");
+    assert_eq!(bus.read16(0x2014), 0x4444, "line 1 (0x2000+20), word 0");
+    assert_eq!(bus.read16(0x2016), 0x5555, "line 1, word 1");
+    assert_eq!(bus.read16(0x2018), 0x6666, "line 1, word 2");
 }
 
-/// X_COUNT=0 écrit par MOT complet : le manuel Blitter officiel et Hatari
-/// documentent cette valeur comme désignant 65536, mais trois tentatives
-/// indépendantes d'implémenter cette règle ont toutes aggravé nettement la
-/// corruption observée en pratique (voir le commentaire de
-/// `Blitter::write_word`) — revenu à la valeur écrite telle quelle (bornée à
-/// 1 mot minimum par `execute`, pas 65536) en attendant de localiser la
-/// vraie cause amont.
+/// X_COUNT=0 written as a full WORD: the official Blitter manual and
+/// Hatari document this value as meaning 65536, but three independent
+/// attempts at implementing this rule all noticeably worsened the
+/// corruption observed in practice (see the comment on
+/// `Blitter::write_word`) — reverted to the written value as-is (clamped
+/// to a minimum of 1 word by `execute`, not 65536) pending localization of
+/// the real root cause upstream.
 #[test]
-fn x_count_zero_ecrit_par_mot_reste_borne_a_un_seul_mot() {
+fn x_count_zero_written_as_word_stays_clamped_to_one_word() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 0); // tout à 1, résultat indépendant de la source
-    bl.write(reg::OP, 0x3); // copie du résultat HOP (donc 0xFFFF partout)
+    bl.write(reg::HOP, 0); // all ones, result independent of the source
+    bl.write(reg::OP, 0x3); // copy of the HOP result (so 0xFFFF everywhere)
     write_word(&mut bl, reg::X_COUNT, 0);
     write_word(&mut bl, reg::Y_COUNT, 1);
     write_word(&mut bl, reg::SRC_X_INC, 2);
@@ -757,21 +753,21 @@ fn x_count_zero_ecrit_par_mot_reste_borne_a_un_seul_mot() {
     assert_eq!(bl.read(reg::X_COUNT1), 0);
 
     let mut bus = FlatBus::new();
-    bus.write16(0x2002, 0x4242); // second mot : ne doit pas être modifié
+    bus.write16(0x2002, 0x4242); // second word: must not be modified
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0xFFFF, "premier (et seul) mot traité");
-    assert_eq!(bus.read16(0x2002), 0x4242, "pas de second mot (donc pas 65536)");
+    assert_eq!(bus.read16(0x2000), 0xFFFF, "first (and only) word processed");
+    assert_eq!(bus.read16(0x2002), 0x4242, "no second word (so not 65536)");
 }
 
-/// Écriture d'un ou deux octets ISOLÉS dans X_COUNT : sur le silicium réel,
-/// un accès `.B` isolé à ce registre est ignoré (voir `Blitter::write`) —
-/// x_count reste donc à sa valeur précédente (0, jamais touché). `execute`
-/// borne ensuite x_count à un minimum de 1 (voir son commentaire : évite un
-/// dépassement arithmétique dans le calcul d'avance de fin de ligne) — donc
-/// UN SEUL mot doit être traité, ni zéro ni 65536.
+/// Writing one or two ISOLATED bytes to X_COUNT: on real silicon, an
+/// isolated `.B` access to this register is ignored (see `Blitter::write`)
+/// — x_count therefore stays at its previous value (0, never touched).
+/// `execute` then clamps x_count to a minimum of 1 (see its comment: this
+/// avoids an arithmetic overflow in the end-of-line advance calculation)
+/// — so exactly ONE word must be processed, neither zero nor 65536.
 #[test]
-fn x_count_zero_ecrit_par_octet_isole_ne_declenche_pas_la_conversion() {
+fn x_count_zero_written_as_isolated_byte_does_not_trigger_conversion() {
     let mut bl = Blitter::new();
     bl.write(reg::HOP, 0);
     bl.write(reg::OP, 0x3);
@@ -787,32 +783,32 @@ fn x_count_zero_ecrit_par_octet_isole_ne_declenche_pas_la_conversion() {
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
     let mut bus = FlatBus::new();
-    bus.write16(0x2002, 0x4242); // second mot : ne doit pas être modifié
+    bus.write16(0x2002, 0x4242); // second word: must not be modified
     bl.execute(&mut bus);
 
-    assert_eq!(bus.read16(0x2000), 0xFFFF, "x_count=0 -> borné à 1 seul mot traité");
+    assert_eq!(bus.read16(0x2000), 0xFFFF, "x_count=0 -> clamped to a single word processed");
     assert_eq!(
         bus.read16(0x2002),
         0x4242,
-        "un seul mot traité : pas de second mot (donc pas 65536)"
+        "only one word processed: no second word (so not 65536)"
     );
 }
 
-/// Reproduit la boucle de relance du mode non-HOG utilisée par TOS
-/// (`TAS.B` sur CONTROL en boucle jusqu'à ce que BUSY retombe) : une fois
-/// le blit terminé, reposer le bit BUSY SANS avoir réécrit Y_COUNT ne doit
-/// PAS redéclencher une exécution complète — le manuel Blitter officiel
-/// documente explicitement que "the flag will remain clear... the BLiTTER
-/// won't be restarted" tant que Y_COUNT n'a pas été explicitement réarmé.
-/// Un bug réel (confirmé par comparaison directe Blitter activé/désactivé
-/// sur un cas concret) faisait ré-exécuter tout le blit à chaque tentative
-/// de redémarrage, écrivant du contenu erroné depuis des adresses déjà
-/// avancées par le tour précédent.
+/// Reproduces the non-HOG mode restart loop used by TOS (`TAS.B` on
+/// CONTROL in a loop until BUSY clears): once the blit is finished,
+/// resetting the BUSY bit WITHOUT having rewritten Y_COUNT must NOT
+/// retrigger a full execution — the official Blitter manual explicitly
+/// documents that "the flag will remain clear... the BLiTTER won't be
+/// restarted" as long as Y_COUNT hasn't been explicitly rearmed. A real
+/// bug (confirmed by direct comparison with Blitter enabled/disabled on a
+/// concrete case) caused the entire blit to re-execute on every restart
+/// attempt, writing corrupted content from addresses already advanced by
+/// the previous pass.
 #[test]
-fn control_busy_repose_sans_reecrire_y_count_ne_redeclenche_pas() {
+fn control_busy_reset_without_rewriting_y_count_does_not_retrigger() {
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // copie
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // copy
     write_word(&mut bl, reg::SRC_X_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 2);
     write_word(&mut bl, reg::X_COUNT, 1);
@@ -826,60 +822,60 @@ fn control_busy_repose_sans_reecrire_y_count_ne_redeclenche_pas() {
     let mut bus = FlatBus::new();
     bus.write16(0x1000, 0x1234);
     bl.execute(&mut bus);
-    assert_eq!(bus.read16(0x2000), 0x1234, "premier blit : copie normale");
+    assert_eq!(bus.read16(0x2000), 0x1234, "first blit: normal copy");
 
-    // SRC_ADDR/DST_ADDR ont avancé (Y_INC par défaut = 0, donc inchangés
-    // ici, mais le point est de vérifier qu'AUCUNE deuxième copie n'a
-    // lieu) : on modifie la source pour détecter un second passage.
-    // `bl.write(CONTROL,..)` puis `bl.execute(..)` reproduit ce que fait le
-    // board (`AtariSt`) sur écriture réelle de CONTROL : lui seul déclenche
-    // `execute()`, `Blitter::write` seul ne le fait pas.
+    // SRC_ADDR/DST_ADDR have advanced (default Y_INC = 0, so unchanged
+    // here, but the point is to check that NO second copy happens): we
+    // modify the source to detect a second pass. `bl.write(CONTROL,..)`
+    // followed by `bl.execute(..)` reproduces what the board (`AtariSt`)
+    // does on a real CONTROL write: it alone triggers `execute()`,
+    // `Blitter::write` alone does not.
     bus.write16(0x1000, 0x9999);
-    bl.write(reg::CONTROL, 0x80); // TAS.B repose BUSY sans réécrire Y_COUNT
+    bl.write(reg::CONTROL, 0x80); // TAS.B resets BUSY without rewriting Y_COUNT
     bl.execute(&mut bus);
     assert_eq!(
         bus.read16(0x2000),
         0x1234,
-        "reposer BUSY sans réarmer Y_COUNT ne doit PAS redéclencher le blit"
+        "resetting BUSY without rearming Y_COUNT must NOT retrigger the blit"
     );
-    assert!(!bl.busy(), "BUSY doit rester lisible à 0, pas rester \"collé\" à 1");
+    assert!(!bl.busy(), "BUSY must remain readable as 0, not stay \"stuck\" at 1");
 
-    // Réarmement explicite (réécriture de Y_COUNT) : un nouveau
-    // déclenchement DOIT alors fonctionner normalement.
+    // Explicit rearm (rewriting Y_COUNT): a new trigger MUST then work
+    // normally.
     write_word(&mut bl, reg::Y_COUNT, 1);
     bl.write(reg::CONTROL, 0x80);
     bl.execute(&mut bus);
     assert_eq!(
         bus.read16(0x2000),
         0x9999,
-        "après réarmement explicite de Y_COUNT, un nouveau blit doit s'exécuter"
+        "after explicitly rearming Y_COUNT, a new blit must execute"
     );
 }
 
 #[test]
-fn tranche_non_hog_compte_les_acces_bus_reels_pas_les_mots() {
-    // Distingue le modèle actuel (`BUS_ACCESSES_PER_SLICE` = 64 accès bus
-    // réels) de l'ancienne approximation par mots traités : ce blit LIT la
-    // source (HOP=2 "source seule", OP=0x3 "copie" — need_src=true), donc
-    // chaque mot coûte 3 accès bus (lecture source + lecture destination
-    // pour la combinaison OP + écriture destination), pas 2 comme le blit
-    // HOP=0 utilisé par les tests de tranche de `tests/atari_st.rs`.
+fn non_hog_slice_counts_real_bus_accesses_not_words() {
+    // Distinguishes the current model (`BUS_ACCESSES_PER_SLICE` = 64 real
+    // bus accesses) from the old approximation based on words processed:
+    // this blit READS the source (HOP=2 "source only", OP=0x3 "copy" —
+    // need_src=true), so each word costs 3 bus accesses (source read +
+    // destination read for the OP combination + destination write), not 2
+    // like the HOP=0 blit used by the slice tests in `tests/atari_st.rs`.
     //
-    // Le budget se vérifie AVANT de traiter un mot, avec le total accumulé
-    // par les mots déjà traités (pas un arrêt en plein milieu d'un mot) :
-    // après 21 mots (63 accès, < 64), le mot 22 démarre quand même et porte
-    // le total à 66 — la tranche s'arrête donc après 22 mots, pas 21.
+    // The budget is checked BEFORE processing a word, against the total
+    // accumulated by the words already processed (not a mid-word stop):
+    // after 21 words (63 accesses, < 64), word 22 still starts and brings
+    // the total to 66 — the slice therefore stops after 22 words, not 21.
     let mut bl = Blitter::new();
-    bl.write(reg::HOP, 2); // source seule
-    bl.write(reg::OP, 0x3); // copie (source ET destination lues/écrites)
-    bl.write(reg::SKEW, 0x00); // pas de FXSR (pas d'accès bus supplémentaire à compter)
+    bl.write(reg::HOP, 2); // source only
+    bl.write(reg::OP, 0x3); // copy (source AND destination read/written)
+    bl.write(reg::SKEW, 0x00); // no FXSR (no extra bus access to count)
 
     write_word(&mut bl, reg::SRC_X_INC, 0);
     write_word(&mut bl, reg::SRC_Y_INC, 2);
     write_word(&mut bl, reg::DST_X_INC, 0);
     write_word(&mut bl, reg::DST_Y_INC, 2);
     write_word(&mut bl, reg::X_COUNT, 1);
-    write_word(&mut bl, reg::Y_COUNT, 30); // 30 lignes d'1 mot = 30 mots
+    write_word(&mut bl, reg::Y_COUNT, 30); // 30 lines of 1 word = 30 words
     write_word(&mut bl, reg::ENDMASK_1, 0xFFFF);
     write_word(&mut bl, reg::ENDMASK_2, 0xFFFF);
     write_word(&mut bl, reg::ENDMASK_3, 0xFFFF);
@@ -887,21 +883,21 @@ fn tranche_non_hog_compte_les_acces_bus_reels_pas_les_mots() {
     write_long(&mut bl, reg::DST_ADDR, 0x2000);
 
     let mut bus = FlatBus::new();
-    bl.write(reg::CONTROL, 0x80); // BUSY=1, HOG=0 : déclenche la première tranche
+    bl.write(reg::CONTROL, 0x80); // BUSY=1, HOG=0: triggers the first slice
 
     bl.execute(&mut bus);
     assert_eq!(
         (bl.read(reg::Y_COUNT) as u16) << 8 | bl.read(reg::Y_COUNT + 1) as u16,
         30 - 22,
-        "22 mots (66 accès bus) traités par la première tranche, pas 21 (63) ni un multiple de 64/3 arrondi au mot"
+        "22 words (66 bus accesses) processed by the first slice, not 21 (63) nor a multiple of 64/3 rounded to a word"
     );
-    assert!(bl.busy(), "blit pas fini : BUSY doit rester observable par polling");
+    assert!(bl.busy(), "blit not finished: BUSY must remain observable by polling");
 
-    // Reprise (`TAS.B` typique : repose BUSY sans réécrire Y_COUNT) :
-    // les 8 mots restants (24 accès, sous le budget de 64) terminent le blit.
+    // Resume (typical `TAS.B`: resets BUSY without rewriting Y_COUNT):
+    // the remaining 8 words (24 accesses, under the 64 budget) finish the blit.
     bl.write(reg::CONTROL, 0x80);
     bl.execute(&mut bus);
-    assert_eq!(bl.read(reg::Y_COUNT), 0, "blit terminé après la deuxième tranche");
+    assert_eq!(bl.read(reg::Y_COUNT), 0, "blit finished after the second slice");
     assert_eq!(bl.read(reg::Y_COUNT + 1), 0);
     assert!(!bl.busy());
 }

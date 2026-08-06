@@ -1,39 +1,39 @@
 //! Motorola MC68901 MFP (Multi-Function Peripheral).
 //!
-//! Puce d'E/S de l'Atari ST (et de bien d'autres systèmes 68k) : 8 lignes
-//! d'E/S générales (GPIP), 4 timers (A/B/C/D), un contrôleur d'interruption
-//! à 16 canaux, et un USART RS-232.
+//! Atari ST's I/O chip (and many other 68k systems): 8 general-purpose
+//! I/O lines (GPIP), 4 timers (A/B/C/D), a 16-channel interrupt
+//! controller, and an RS-232 USART.
 //!
-//! Ce module modélise la puce **seule**, indépendamment de tout câblage
-//! système : c'est à l'appelant (le "board" Atari ST, pas encore implémenté
-//! dans ce crate) de mapper [`Mfp::read`]/[`Mfp::write`] dans son
-//! [`crate::Bus`], de brancher [`Mfp::iack`] sur `Bus::irq_ack`, et de
-//! relier [`Mfp::interrupt_requested`] à la génération du niveau IPL
-//! (le MFP est câblé sur IPL6 sur ST/STE réel, mais ce choix appartient au
-//! board, pas à la puce).
+//! This module models the chip **alone**, independently of any system
+//! wiring: it is up to the caller (the Atari ST "board", not yet
+//! implemented in this crate) to map [`Mfp::read`]/[`Mfp::write`] into
+//! its [`crate::Bus`], to wire [`Mfp::iack`] to `Bus::irq_ack`, and to
+//! connect [`Mfp::interrupt_requested`] to generating the IPL level
+//! (the MFP is wired to IPL6 on real ST/STE, but that choice belongs
+//! to the board, not the chip).
 //!
-//! ## Limitations connues (v1)
-//! - L'USART est un modèle "au byte" (pas de bit start/stop/parité ni de
-//!   génération de baud rate réelle) : `push_rx_byte`/`take_tx_byte`
-//!   simulent la réception/émission au niveau octet — choix délibéré, RS232
-//!   n'est pas dans le périmètre visé (aucun logiciel testé n'en dépend au
-//!   niveau bit).
-//! - `tick()` suppose une horloge CPU fixe à 8 MHz (ST/STE) pour convertir
-//!   les cycles CPU en cycles d'horloge MFP réelle (2.4576 MHz) — choix
-//!   délibéré cohérent avec le reste du board (`model::MachineProfile`
-//!   documente `cpu_hz` comme informatif seul pour la même raison).
-//! - Si plusieurs périodes de timer s'écoulent en un seul appel `tick()`
-//!   (rare : `tick_delay_timer` traite déjà tous les décréments réellement
-//!   dus, y compris un éventuel rebouclage complet du compteur 8 bits), le
-//!   canal ne s'arme qu'une fois — conforme au silicium réel, où `IPR` est
-//!   un simple bit et pas un compteur d'occurrences : une deuxième
-//!   expiration avant acquittement de la première ne peut de toute façon
-//!   pas être distinguée matériellement.
+//! ## Known limitations (v1)
+//! - The USART is a "per-byte" model (no start/stop/parity bits nor
+//!   real baud rate generation): `push_rx_byte`/`take_tx_byte`
+//!   simulate reception/transmission at the byte level — a deliberate
+//!   choice, RS232 is not in scope (no tested software depends on it
+//!   at the bit level).
+//! - `tick()` assumes a fixed 8 MHz CPU clock (ST/STE) to convert CPU
+//!   cycles into real MFP clock cycles (2.4576 MHz) — a deliberate
+//!   choice consistent with the rest of the board (`model::MachineProfile`
+//!   documents `cpu_hz` as informative only for the same reason).
+//! - If several timer periods elapse in a single `tick()` call (rare:
+//!   `tick_delay_timer` already handles all decrements actually due,
+//!   including a possible full wraparound of the 8-bit counter), the
+//!   channel only arms once — consistent with real silicon, where
+//!   `IPR` is a simple bit and not an occurrence counter: a second
+//!   expiry before the first is acknowledged cannot be distinguished
+//!   in hardware anyway.
 
-/// Offsets des registres dans l'espace d'adressage de la puce (÷2 : sur
-/// Atari ST réel, le MFP est mappé aux adresses impaires 0xFFFA01,
-/// 0xFFFA03… tous les 2 octets — cet offset est l'index logique, à
-/// l'appelant de le convertir depuis/vers l'adresse bus réelle).
+/// Register offsets in the chip's address space (÷2: on real Atari
+/// ST, the MFP is mapped to odd addresses 0xFFFA01, 0xFFFA03… every 2
+/// bytes — this offset is the logical index, up to the caller to
+/// convert it to/from the real bus address).
 pub mod reg {
     pub const GPIP: u8 = 0;
     pub const AER: u8 = 1;
@@ -61,9 +61,9 @@ pub mod reg {
     pub const UDR: u8 = 23;
 }
 
-/// Numéros de canal d'interruption (0-15), fixés par le silicium — table du
-/// datasheet MC68901. Les canaux 8-15 vivent dans les registres "A"
-/// (IERA/IPRA/ISRA/IMRA), les canaux 0-7 dans les registres "B".
+/// Interrupt channel numbers (0-15), fixed by the silicon — table from
+/// the MC68901 datasheet. Channels 8-15 live in the "A" registers
+/// (IERA/IPRA/ISRA/IMRA), channels 0-7 in the "B" registers.
 pub mod channel {
     pub const GPIP0: u8 = 0;
     pub const GPIP1: u8 = 1;
@@ -83,30 +83,31 @@ pub mod channel {
     pub const GPIP7: u8 = 15;
 }
 
-/// Table des diviseurs de prescaler en mode "delay" (valeurs 1-7 du champ
-/// prescale des registres de contrôle timer ; l'index 0 = timer arrêté).
+/// Table of prescaler divisors in "delay" mode (values 1-7 of the
+/// prescale field of the timer control registers; index 0 = timer
+/// stopped).
 const PRESCALE: [u32; 8] = [0, 4, 10, 16, 50, 64, 100, 200];
 
-/// Ratio horloge MFP / horloge CPU pour un ST/STE (CPU à 8 MHz, MFP à
-/// 2.4576 MHz) : 2 457 600 / 8 000 000 = 192/625, réduit en entiers pour
-/// accumulation exacte sans dérive flottante (voir `tick`).
+/// MFP clock / CPU clock ratio for an ST/STE (CPU at 8 MHz, MFP at
+/// 2.4576 MHz): 2,457,600 / 8,000,000 = 192/625, reduced to integers
+/// for exact accumulation without floating-point drift (see `tick`).
 const MFP_CLOCK_NUM: u32 = 192;
 const MFP_CLOCK_DEN: u32 = 625;
 
 #[derive(Debug, Clone)]
 struct Timer {
-    /// Registre de contrôle brut (TACR/TBCR : bits 0-3 ; TCDCR découpe ses
-    /// deux timers sur bits 6-4 et 2-0 — le champ stocké ici est toujours
-    /// déjà aligné sur bits 3-0 par `Mfp::write`).
+    /// Raw control register (TACR/TBCR: bits 0-3; TCDCR splits its two
+    /// timers across bits 6-4 and 2-0 — the field stored here is
+    /// always already aligned to bits 3-0 by `Mfp::write`).
     control: u8,
-    /// Registre de données (valeur de rechargement ; 0 est traité comme 256).
+    /// Data register (reload value; 0 is treated as 256).
     data: u8,
-    /// Valeur courante du compte à rebours (ce que renvoie une lecture du
-    /// registre de données pendant que le timer tourne).
+    /// Current countdown value (what a read of the data register
+    /// returns while the timer is running).
     counter: u8,
-    /// Accumulateur de cycles MFP fractionnaires pour le mode delay (voir
-    /// `MFP_CLOCK_NUM`/`DEN`) — uniquement pour Timer A/B, qui ont aussi un
-    /// mode event-count piloté par `pulse()` plutôt que `tick()`.
+    /// Fractional MFP cycle accumulator for delay mode (see
+    /// `MFP_CLOCK_NUM`/`DEN`) — Timer A/B only, which also have an
+    /// event-count mode driven by `pulse()` rather than `tick()`.
     prescale_acc: u32,
 }
 
@@ -125,15 +126,16 @@ impl Timer {
     }
 
     fn running(&self) -> bool {
-        // 0 = arrêté. 1-7 = mode delay (bits 0-2 = diviseur). 8 (bit 3 seul,
-        // Timer A/B uniquement) = mode event-count, décompté par `pulse()`
-        // et non par le diviseur — donc `!= 0` couvre les deux, pas
-        // seulement `& 0x7`.
+        // 0 = stopped. 1-7 = delay mode (bits 0-2 = divisor). 8 (bit 3
+        // alone, Timer A/B only) = event-count mode, decremented by
+        // `pulse()` and not by the divisor — so `!= 0` covers both,
+        // not just `& 0x7`.
         self.control != 0
     }
 
-    /// Mode "event count" (Timer A/B uniquement) : bit 3 du registre de
-    /// contrôle, décompte sur `pulse()` plutôt que sur l'horloge MFP.
+    /// "Event count" mode (Timer A/B only): bit 3 of the control
+    /// register, decrements on `pulse()` rather than on the MFP
+    /// clock.
     fn event_count_mode(&self) -> bool {
         self.control & 0x8 != 0
     }
@@ -143,35 +145,35 @@ impl Timer {
         self.prescale_acc = 0;
     }
 
-    /// Décrémente le compteur d'un cran ; renvoie `true` s'il vient de
-    /// déclencher (et se recharge alors depuis `data`).
+    /// Decrements the counter by one step; returns `true` if it just
+    /// fired (and reloads from `data` in that case).
     ///
-    /// Le déclenchement a lieu au `N`-ième décrément après un rechargement à
-    /// `data = N` (pas au `N+1`-ième) : le compteur, lu pendant qu'il tourne,
-    /// vaut `N` juste après le rechargement (jamais `N-1`), donc c'est déjà
-    /// en train de compter le premier des `N` intervalles à ce moment — le
-    /// déclenchement doit avoir lieu au décrément qui le ferait passer sous 1,
-    /// pas à un décrément supplémentaire une fois arrivé à 0. L'ancienne
-    /// version testait `counter == 0` en entrée (au lieu de `<= 1`), ce qui
-    /// ajoutait un cran MFP superflu au tout premier intervalle suivant
-    /// chaque écriture du registre de contrôle (TACR/TBCR/TCDCR) — écart
-    /// confirmé par la cartouche de diagnostic usine STe (test "T0 MFP
-    /// timer" : Timer A/B/C/D en ÷200, rechargement 4, dont la fenêtre
-    /// d'attente logicielle est trop serrée pour tolérer ce cran de trop).
+    /// Firing happens on the `N`-th decrement after a reload to
+    /// `data = N` (not the `N+1`-th): the counter, read while running,
+    /// is `N` right after the reload (never `N-1`), so it is already
+    /// counting the first of the `N` intervals at that point — firing
+    /// must happen on the decrement that would take it below 1, not
+    /// on an extra decrement once it reaches 0. The previous version
+    /// tested `counter == 0` on entry (instead of `<= 1`), which added
+    /// one extra MFP step to the very first interval following each
+    /// write to the control register (TACR/TBCR/TCDCR) — a discrepancy
+    /// confirmed by the STe factory diagnostic cartridge (test "T0 MFP
+    /// timer": Timer A/B/C/D at ÷200, reload 4, whose software wait
+    /// window is too tight to tolerate this extra step).
     ///
-    /// Le test doit être une égalité stricte `== 1`, pas `<= 1` : si
-    /// `counter` vaut déjà 0 en entrée (compteur jamais chargé — cas réel
-    /// documenté "data=0 signifie 256", ou compteur resté à sa valeur
-    /// précédente parce que TACR/TBCR a été écrit avant TADR/TBDR, ce que la
-    /// cartouche de diagnostic fait réellement pour armer le son DMA via
-    /// XSINT), le vrai silicium ne déclenche PAS tout de suite : il boucle
-    /// 0→255 (registre 8 bits) et ne déclenche qu'au bout de 256 décréments
-    /// de plus — confirmé dans Hatari (`mfp.c`, `MFP_TimerA_EventCount` :
-    /// `if (TA_MAINCOUNTER == 1) { ... déclenche ... } else { TA_MAINCOUNTER--; }`,
-    /// avec le commentaire explicite sur le rebouclage 0→255 attendu). Avec
-    /// `<= 1`, un compteur resté à 0 déclenchait instantanément dès le tout
-    /// premier pulse — cause du test audio DMA de la cartouche qui semblait
-    /// « sauté »/trop rapide.
+    /// The test must be a strict equality `== 1`, not `<= 1`: if
+    /// `counter` is already 0 on entry (counter never loaded — a real
+    /// documented case, "data=0 means 256", or a counter left at its
+    /// previous value because TACR/TBCR was written before
+    /// TADR/TBDR, which the diagnostic cartridge actually does to arm
+    /// DMA sound via XSINT), real silicon does NOT fire right away: it
+    /// wraps 0→255 (8-bit register) and only fires after 256 more
+    /// decrements — confirmed in Hatari (`mfp.c`, `MFP_TimerA_EventCount`:
+    /// `if (TA_MAINCOUNTER == 1) { ... fire ... } else { TA_MAINCOUNTER--; }`,
+    /// with the explicit comment about the expected 0→255 wraparound).
+    /// With `<= 1`, a counter left at 0 fired instantly on the very
+    /// first pulse — the cause of the diagnostic cartridge's DMA audio
+    /// test appearing "skipped"/too fast.
     fn decrement(&mut self) -> bool {
         if self.counter == 1 {
             self.counter = self.data;
@@ -183,7 +185,7 @@ impl Timer {
     }
 }
 
-/// État complet d'une puce MC68901.
+/// Full state of an MC68901 chip.
 #[derive(Debug, Clone)]
 pub struct Mfp {
     gpip_in: u8,
@@ -215,16 +217,16 @@ impl Default for Mfp {
 }
 
 impl Mfp {
-    /// État après reset matériel : tous les registres à zéro, à l'exception
-    /// de TSR bit7 ("Buffer Empty") qui démarre à 1 — le tampon d'émission
-    /// est réellement vide au reset (aucun octet en attente), donc
-    /// disponible pour en accepter un nouveau. Confirmé nécessaire par la
-    /// cartouche de diagnostic usine STe, dont la routine de sortie
-    /// caractère (RS232, utilisée comme console texte principale) attend ce
-    /// bit à 1 avant d'écrire le tout premier octet dans UDR — avec TSR à 0
-    /// au reset, plus aucune écriture ne pouvait jamais avoir lieu (le seul
-    /// mécanisme qui positionne ce bit est justement une écriture d'UDR),
-    /// bloquant indéfiniment le tout premier caractère affiché.
+    /// State after a hardware reset: all registers at zero, except
+    /// TSR bit 7 ("Buffer Empty") which starts at 1 — the transmit
+    /// buffer really is empty on reset (no byte pending), so it is
+    /// available to accept a new one. Confirmed necessary by the STe
+    /// factory diagnostic cartridge, whose character output routine
+    /// (RS232, used as the main text console) waits for this bit to
+    /// be 1 before writing the very first byte into UDR — with TSR at
+    /// 0 on reset, no write could ever take place (the only mechanism
+    /// that sets this bit is precisely a write to UDR), permanently
+    /// blocking the very first displayed character.
     pub fn new() -> Self {
         Mfp {
             gpip_in: 0,
@@ -250,9 +252,9 @@ impl Mfp {
         }
     }
 
-    // --- Registres -----------------------------------------------------
+    // --- Registers -------------------------------------------------------
 
-    /// Lit le registre logique `offset` (voir [`reg`]).
+    /// Reads the logical register `offset` (see [`reg`]).
     pub fn read(&mut self, offset: u8) -> u8 {
         match offset {
             reg::GPIP => (self.gpip_out & self.ddr) | (self.gpip_in & !self.ddr),
@@ -270,10 +272,10 @@ impl Mfp {
             reg::TACR => self.ta.control,
             reg::TBCR => self.tb.control,
             reg::TCDCR => (self.tc.control << 4) | self.td.control,
-            // Lire le registre de données d'un timer EN MARCHE renvoie le
-            // compte à rebours courant, pas la valeur de rechargement écrite
-            // (comportement réel du MC68901, utilisé par TOS/GEM pour lire
-            // une horloge sans l'arrêter).
+            // Reading the data register of a RUNNING timer returns the
+            // current countdown value, not the written reload value
+            // (real MC68901 behavior, used by TOS/GEM to read a clock
+            // without stopping it).
             reg::TADR => {
                 if self.ta.running() {
                     self.ta.counter
@@ -307,9 +309,9 @@ impl Mfp {
             reg::RSR => self.rsr,
             reg::TSR => self.tsr,
             reg::UDR => {
-                // Lire UDR renvoie l'octet actuellement latché, efface
-                // "buffer full", puis latche le prochain octet en attente
-                // s'il y en a un (pour la lecture suivante).
+                // Reading UDR returns the currently latched byte,
+                // clears "buffer full", then latches the next pending
+                // byte if there is one (for the following read).
                 let value = self.udr;
                 self.rsr &= !RSR_BUFFER_FULL;
                 self.maybe_start_next_rx();
@@ -319,7 +321,7 @@ impl Mfp {
         }
     }
 
-    /// Écrit le registre logique `offset` (voir [`reg`]).
+    /// Writes the logical register `offset` (see [`reg`]).
     pub fn write(&mut self, offset: u8, value: u8) {
         match offset {
             reg::GPIP => self.gpip_out = value,
@@ -327,10 +329,10 @@ impl Mfp {
             reg::DDR => self.ddr = value,
             reg::IERA => self.ier = (self.ier & 0x00FF) | ((value as u16) << 8),
             reg::IERB => self.ier = (self.ier & 0xFF00) | value as u16,
-            // IPR/ISR ne peuvent qu'être effacés par écriture logicielle
-            // (écrire 1 sur un bit n'a aucun effet ; seul écrire 0 efface —
-            // comportement documenté du MC68901, pour acquitter une source
-            // sans risquer d'en armer une autre par erreur).
+            // IPR/ISR can only be cleared by a software write (writing
+            // 1 to a bit has no effect; only writing 0 clears it —
+            // documented MC68901 behavior, so that acknowledging one
+            // source cannot accidentally arm another).
             reg::IPRA => self.ipr &= 0x00FF | ((value as u16) << 8),
             reg::IPRB => self.ipr &= 0xFF00 | value as u16,
             reg::ISRA => self.isr &= 0x00FF | ((value as u16) << 8),
@@ -338,13 +340,13 @@ impl Mfp {
             reg::IMRA => self.imr = (self.imr & 0x00FF) | ((value as u16) << 8),
             reg::IMRB => self.imr = (self.imr & 0xFF00) | value as u16,
             reg::VR => {
-                // Transition bit S (bit 3) de 1 (SEI, "software
-                // end-of-interrupt") vers 0 (EOI automatique) : le silicium
-                // efface ISRA/ISRB EN BLOC — confirmé contre Hatari
-                // (`MFP_VectorReg_WriteByte`, `mfp.c`). Voir la doc de
-                // `Self::iack` pour le sens exact du bit S (INVERSÉ par
-                // rapport à une lecture superficielle du datasheet — bit
-                // posé = SEI, PAS "auto").
+                // Transition of bit S (bit 3) from 1 (SEI, "software
+                // end-of-interrupt") to 0 (automatic EOI): the silicon
+                // clears ISRA/ISRB IN BULK — confirmed against Hatari
+                // (`MFP_VectorReg_WriteByte`, `mfp.c`). See the doc of
+                // `Self::iack` for the exact meaning of bit S (INVERTED
+                // relative to a superficial reading of the datasheet —
+                // bit set = SEI, NOT "auto").
                 if self.vr & 0x08 != 0 && value & 0x08 == 0 {
                     self.isr = 0;
                 }
@@ -391,25 +393,26 @@ impl Mfp {
             reg::SCR => self.scr = value,
             reg::UCR => self.ucr = value,
             reg::RSR => self.rsr = value,
-            // Bits 7 (Buffer Empty) et 6 (Underrun Error) sont des bits de
-            // statut matériel en lecture seule sur le vrai MC68901, non
-            // affectés par une écriture logicielle — seuls les bits de
-            // contrôle 0-5 (Transmitter Enable, Break, End Of Transmission,
-            // Auto Turnaround) le sont. Un remplacement complet du registre
-            // ici effaçait Buffer Empty dès la séquence d'initialisation
-            // standard de l'USART (écriture de TSR=0x01 pour activer
-            // l'émetteur), verrouillant définitivement tout octet suivant :
-            // plus aucune transmission ne pouvait jamais avoir lieu, puisque
-            // seule une écriture d'UDR repose Buffer Empty, et qu'aucune
-            // écriture d'UDR ne peut avoir lieu tant que Buffer Empty est à
-            // zéro. Confirmé par la cartouche de diagnostic usine STe, dont
-            // toute la sortie texte passe par ce port RS232.
+            // Bits 7 (Buffer Empty) and 6 (Underrun Error) are
+            // read-only hardware status bits on the real MC68901, not
+            // affected by a software write — only control bits 0-5
+            // (Transmitter Enable, Break, End Of Transmission, Auto
+            // Turnaround) are. A full register replacement here used
+            // to clear Buffer Empty as early as the USART's standard
+            // initialization sequence (writing TSR=0x01 to enable the
+            // transmitter), permanently locking out every following
+            // byte: no transmission could ever take place again,
+            // since only a write to UDR resets Buffer Empty, and no
+            // write to UDR can take place while Buffer Empty is zero.
+            // Confirmed by the STe factory diagnostic cartridge, whose
+            // entire text output goes through this RS232 port.
             reg::TSR => self.tsr = (self.tsr & 0xC0) | (value & 0x3F),
             reg::UDR => {
                 self.udr = value;
                 self.tx_queue.push_back(value);
-                // Modèle simplifié : la transmission est instantanée (pas de
-                // baud rate simulé), TSR reste "buffer empty" immédiatement.
+                // Simplified model: transmission is instantaneous (no
+                // simulated baud rate), TSR stays "buffer empty"
+                // immediately.
                 self.tsr |= TSR_BUFFER_EMPTY;
                 self.request(channel::TX_EMPTY);
             }
@@ -417,12 +420,12 @@ impl Mfp {
         }
     }
 
-    // --- Timers ----------------------------------------------------------
+    // --- Timers ------------------------------------------------------------
 
-    /// Avance les timers en mode "delay" de `cpu_cycles` cycles CPU (horloge
-    /// ST/STE à 8 MHz — voir la constante `MFP_CLOCK_NUM/DEN`). Les timers
-    /// A/B en mode event-count ne sont PAS avancés ici : voir [`Self::pulse_ta`]/
-    /// [`Self::pulse_tb`].
+    /// Advances the timers in "delay" mode by `cpu_cycles` CPU cycles
+    /// (ST/STE clock at 8 MHz — see the `MFP_CLOCK_NUM/DEN` constant).
+    /// Timers A/B in event-count mode are NOT advanced here: see
+    /// [`Self::pulse_ta`]/[`Self::pulse_tb`].
     pub fn tick(&mut self, cpu_cycles: u32) {
         self.tick_delay_timer(cpu_cycles, TimerId::A);
         self.tick_delay_timer(cpu_cycles, TimerId::B);
@@ -437,7 +440,7 @@ impl Mfp {
         }
         if id == TimerId::A || id == TimerId::B {
             if timer.event_count_mode() {
-                return; // avancé par pulse_ta/pulse_tb, pas par l'horloge
+                return; // advanced by pulse_ta/pulse_tb, not by the clock
             }
         }
         let div = timer.prescale_divisor();
@@ -467,39 +470,40 @@ impl Mfp {
         }
     }
 
-    /// Signale un front sur l'entrée TAI (Timer A en mode event-count).
+    /// Signals an edge on the TAI input (Timer A in event-count mode).
     pub fn pulse_ta(&mut self) {
         if self.ta.running() && self.ta.event_count_mode() && self.ta.decrement() {
             self.request(channel::TIMER_A);
         }
     }
 
-    /// Signale un front sur l'entrée TBI (Timer B en mode event-count).
+    /// Signals an edge on the TBI input (Timer B in event-count mode).
     pub fn pulse_tb(&mut self) {
         if self.tb.running() && self.tb.event_count_mode() && self.tb.decrement() {
             self.request(channel::TIMER_B);
         }
     }
 
-    // --- GPIP / interruptions --------------------------------------------
+    // --- GPIP / interrupts --------------------------------------------------
 
-    /// Applique un niveau logique à une broche GPIP (0-7) configurée en
-    /// entrée (`DDR` bit clair) et déclenche une interruption si le front
-    /// observé correspond au sens programmé dans `AER` (1 = front montant).
+    /// Applies a logic level to a GPIP pin (0-7) configured as an
+    /// input (`DDR` bit clear) and triggers an interrupt if the
+    /// observed edge matches the direction programmed in `AER` (1 =
+    /// rising edge).
     pub fn set_gpip_input(&mut self, pin: u8, level: bool) {
         debug_assert!(pin < 8);
         let mask = 1u8 << pin;
         if self.ddr & mask != 0 {
-            return; // broche configurée en sortie : pas de détection de front
+            return; // pin configured as output: no edge detection
         }
         let was = self.gpip_in & mask != 0;
         if was == level {
-            return; // pas de front
+            return; // no edge
         }
         let rising_wanted = self.aer & mask != 0;
         if level == rising_wanted {
-            // GPIP0-3 → canaux 0-3 ; GPIP4-7 → canaux 6,7,14,15 (table du
-            // datasheet, cf. module `channel`).
+            // GPIP0-3 → channels 0-3; GPIP4-7 → channels 6,7,14,15
+            // (datasheet table, cf. the `channel` module).
             let chan = match pin {
                 0 => channel::GPIP0,
                 1 => channel::GPIP1,
@@ -520,10 +524,10 @@ impl Mfp {
         }
     }
 
-    /// Arme le bit "pending" d'un canal (IPR) s'il est activé (IER).
+    /// Arms the "pending" bit of a channel (IPR) if it is enabled (IER).
     fn request(&mut self, chan: u8) {
         if std::env::var("RUST68_TRACE_MFP_REQUEST").is_ok() {
-            eprintln!("[mfp] request chan={chan} ier={:#06x} arme={}", self.ier, self.ier & (1u16 << chan) != 0);
+            eprintln!("[mfp] request chan={chan} ier={:#06x} armed={}", self.ier, self.ier & (1u16 << chan) != 0);
         }
         let mask = 1u16 << chan;
         if self.ier & mask != 0 {
@@ -531,32 +535,33 @@ impl Mfp {
         }
     }
 
-    /// Vrai si au moins un canal éligible (voir
-    /// [`Self::highest_priority_pending`]) demande service — c'est ce
-    /// signal que le board doit relayer vers `Bus::irq_level` (câblé sur
-    /// IPL6 sur ST/STE réel).
+    /// True if at least one eligible channel (see
+    /// [`Self::highest_priority_pending`]) is requesting service — this
+    /// is the signal the board must relay to `Bus::irq_level` (wired
+    /// to IPL6 on real ST/STE).
     pub fn interrupt_requested(&self) -> bool {
         self.highest_priority_pending().is_some()
     }
 
-    /// Canal actif de plus haute priorité (15 = le plus prioritaire, table
-    /// du datasheet) parmi ceux pending+enabled+non masqués, **à condition
-    /// qu'aucun canal de priorité STRICTEMENT supérieure ne soit déjà "in
-    /// service"** (ISR) — résolution de priorité imbriquée conforme au
-    /// vrai MC68901 : un ISR de priorité inférieure en cours de traitement
-    /// est préemptable par un nouveau canal de priorité supérieure, mais
-    /// bloque (le temps de son propre traitement) tout canal de priorité
-    /// inférieure ou égale, qui reste pending sans jamais générer de
-    /// requête IPL tant que le canal supérieur reste in-service. Confirmé
-    /// contre Hatari (`mfp.c`, `MFP_InterruptRequest`/
-    /// `MFP_CheckPendingInterrupts` : le masque de "canaux de priorité
-    /// supérieure" appliqué à ISR avant d'autoriser une requête) — notre
-    /// numérotation de canal (0-15, `channel` ci-dessus) code déjà l'ordre
-    /// de priorité complet dans un seul entier, donc "canaux de priorité
-    /// supérieure au canal N" est simplement "bits d'index > N" sur `isr`,
-    /// sans distinction A/B à faire séparément.
+    /// The highest-priority active channel (15 = highest priority,
+    /// datasheet table) among those pending+enabled+unmasked, **provided
+    /// that no STRICTLY higher-priority channel is already "in
+    /// service"** (ISR) — nested priority resolution consistent with
+    /// the real MC68901: an ISR of lower priority being serviced is
+    /// preemptable by a new higher-priority channel, but blocks (for
+    /// the duration of its own servicing) any channel of equal or
+    /// lower priority, which remains pending without ever generating
+    /// an IPL request as long as the higher channel remains
+    /// in-service. Confirmed against Hatari (`mfp.c`,
+    /// `MFP_InterruptRequest`/`MFP_CheckPendingInterrupts`: the mask of
+    /// "higher-priority channels" applied to ISR before allowing a
+    /// request) — our channel numbering (0-15, `channel` above)
+    /// already encodes the full priority order in a single integer,
+    /// so "channels of higher priority than channel N" is simply
+    /// "index bits > N" on `isr`, with no need to distinguish A/B
+    /// separately.
     fn highest_priority_pending(&self) -> Option<u8> {
-        let mut higher_mask: u16 = 0; // aucun canal de priorité > 15
+        let mut higher_mask: u16 = 0; // no channel of priority > 15
         for chan in (0..=15u8).rev() {
             let bit = 1u16 << chan;
             if self.ipr & self.imr & bit != 0 && self.isr & higher_mask == 0 {
@@ -567,74 +572,76 @@ impl Mfp {
         None
     }
 
-    /// Cycle d'acquittement d'interruption (IACK) : calcule le vecteur pour
-    /// le canal actif de plus haute priorité, efface son bit pending, et
-    /// arme (ou pas, voir ci-dessous) son bit "in service" selon le bit S
-    /// (bit 3) du VR.
+    /// Interrupt acknowledge cycle (IACK): computes the vector for the
+    /// highest-priority active channel, clears its pending bit, and
+    /// arms (or not, see below) its "in service" bit depending on bit
+    /// S (bit 3) of VR.
     ///
-    /// **Sens du bit S — attention, contre-intuitif** : bit posé (1) =
-    /// **SEI** ("software end-of-interrupt") : ISR s'arme à l'IACK et reste
-    /// posé jusqu'à effacement logiciel explicite (écriture de 0 dans
-    /// ISRA/ISRB) — c'est CE mode qu'utilise la cartouche de diagnostic
-    /// usine STe (test "T0 MFP timer", VR=0x48, bit S posé), dont le
-    /// gestionnaire d'interruption partagé (une seule routine aux 4
-    /// vecteurs Timer A/B/C/D) distingue quel timer a déclenché en lisant
-    /// précisément ces bits ISR avant de les effacer lui-même. Bit à 0 = EOI
-    /// **automatique** : le silicium arme PUIS efface ISR dans le MÊME
-    /// cycle IACK, avant même que le CPU n'ait récupéré le vecteur — ISR
-    /// n'est donc jamais observable posé pour ce canal dans ce mode.
-    /// Confirmé contre Hatari (`mfp.c`, `MFP_ProcessIACK` :
-    /// `if (VR & 0x08) ISR|=Bit; else ISR&=~Bit;` — bit posé = SEI).
+    /// **Meaning of bit S — counter-intuitive, take care**: bit set
+    /// (1) = **SEI** ("software end-of-interrupt"): ISR is armed on
+    /// IACK and stays set until explicitly cleared by software
+    /// (writing 0 into ISRA/ISRB) — this is the mode used by the STe
+    /// factory diagnostic cartridge (test "T0 MFP timer", VR=0x48, bit
+    /// S set), whose shared interrupt handler (a single routine for
+    /// all 4 Timer A/B/C/D vectors) determines which timer fired by
+    /// reading precisely these ISR bits before clearing them itself.
+    /// Bit clear (0) = **automatic** EOI: the silicon arms THEN clears
+    /// ISR in the SAME IACK cycle, before the CPU has even fetched the
+    /// vector — ISR is therefore never observable as set for that
+    /// channel in this mode. Confirmed against Hatari (`mfp.c`,
+    /// `MFP_ProcessIACK`: `if (VR & 0x08) ISR|=Bit; else ISR&=~Bit;` —
+    /// bit set = SEI).
     ///
-    /// Une lecture précédente de ce code assumait l'inverse (bit posé =
-    /// "auto", jamais armé) puis, en la corrigeant suite au test cartouche
-    /// ci-dessus, était passée à "toujours armé quel que soit le bit" au
-    /// lieu de conditionner correctement sur le VRAI sens du bit — un canal
-    /// EOI-automatique (bit S=0) voyait alors son ISR rester bloqué posé
-    /// pour toujours (rien ne l'efface jamais dans ce mode, contrairement
-    /// au mode SEI où le logiciel s'en charge), ce qui, combiné à la
-    /// résolution de priorité imbriquée ci-dessus (un ISR posé bloque tout
-    /// canal de priorité égale/inférieure), pouvait bloquer indéfiniment
-    /// TOUS les canaux MFP de priorité inférieure après le tout premier
-    /// live EOI-automatique — reproduit en pratique par un son qui ne
-    /// s'arrête plus et une souris qui ne répond plus plus correctement
-    /// dès qu'un tel canal s'arme (ex: GEM, Bureau > Informations).
+    /// An earlier reading of this code assumed the opposite (bit set =
+    /// "auto", never armed) then, when fixing it following the
+    /// cartridge test above, moved to "always armed regardless of the
+    /// bit" instead of correctly conditioning on the TRUE meaning of
+    /// the bit — an automatic-EOI channel (bit S=0) would then have
+    /// its ISR remain stuck set forever (nothing ever clears it in
+    /// that mode, unlike SEI mode where software handles it), which,
+    /// combined with the nested priority resolution above (a set ISR
+    /// blocks any channel of equal/lower priority), could block ALL
+    /// lower-priority MFP channels indefinitely after the very first
+    /// live automatic-EOI channel — reproduced in practice by sound
+    /// that never stops and a mouse that no longer responds correctly
+    /// as soon as such a channel fires (e.g. GEM, Desktop > Info).
     ///
-    /// Renvoie le vecteur complet : bits 7-4 = `VR[7:4]` (base programmée
-    /// par le logiciel), bits 3-0 = numéro de canal (0-15 — le bit 3 du VR
-    /// lui-même n'en fait PAS partie : c'est le bit S ci-dessus, un
-    /// contrôle séparé, pas un bit de poids fort du vecteur — une confusion
-    /// facile puisque son adresse bit coïncide avec le bit haut du champ
-    /// canal).
+    /// Returns the full vector: bits 7-4 = `VR[7:4]` (base programmed
+    /// by software), bits 3-0 = channel number (0-15 — VR's own bit 3
+    /// is NOT part of this: it is bit S above, a separate control, not
+    /// a high-order bit of the vector — an easy confusion since its
+    /// bit position coincides with the high bit of the channel field).
     pub fn iack(&mut self) -> u8 {
         let Some(chan) = self.highest_priority_pending() else {
-            // Interruption fantôme (retirée avant l'IACK) : vecteur spurious
-            // standard du 68000 (24), comme le ferait VPA sans MFP.
+            // Spurious interrupt (withdrawn before the IACK): standard
+            // 68000 spurious vector (24), as VPA would produce without
+            // an MFP.
             return 24;
         };
         let mask = 1u16 << chan;
         self.ipr &= !mask;
         if self.vr & 0x08 != 0 {
-            self.isr |= mask; // SEI : reste posé jusqu'à effacement logiciel
+            self.isr |= mask; // SEI: stays set until cleared by software
         } else {
-            self.isr &= !mask; // EOI automatique : armé PUIS effacé dans le même cycle
+            self.isr &= !mask; // automatic EOI: armed THEN cleared in the same cycle
         }
         (self.vr & 0xF0) | chan
     }
 
-    /// Acquitte manuellement un canal en mode "software end-of-interrupt"
-    /// (écriture logicielle de 0 dans ISR, à faire depuis le handler avant
-    /// le RTE — cf. [`Self::write`] sur `reg::ISRA`/`ISRB`, exposé ici comme
-    /// helper direct pour le board).
+    /// Manually acknowledges a channel in "software end-of-interrupt"
+    /// mode (software write of 0 into ISR, to be done from the handler
+    /// before the RTE — cf. [`Self::write`] on `reg::ISRA`/`ISRB`,
+    /// exposed here as a direct helper for the board).
     pub fn end_of_interrupt(&mut self, chan: u8) {
         self.isr &= !(1u16 << chan);
     }
 
-    // --- USART -------------------------------------------------------------
+    // --- USART ---------------------------------------------------------------
 
-    /// Injecte un octet reçu (simulation RS-232 au niveau octet, cf.
-    /// limitations du module). S'il n'y a pas déjà une réception en cours,
-    /// arme immédiatement "buffer full" et le canal RX_FULL.
+    /// Injects a received byte (byte-level RS-232 simulation, cf. the
+    /// module's limitations). If there is not already a reception in
+    /// progress, immediately arms "buffer full" and the RX_FULL
+    /// channel.
     pub fn push_rx_byte(&mut self, byte: u8) {
         self.rx_queue.push_back(byte);
         self.maybe_start_next_rx();
@@ -650,8 +657,8 @@ impl Mfp {
         }
     }
 
-    /// Retire le prochain octet transmis par le programme (écrit dans UDR
-    /// avec direction émission), s'il y en a un.
+    /// Removes the next byte transmitted by the program (written into
+    /// UDR with transmit direction), if there is one.
     pub fn take_tx_byte(&mut self) -> Option<u8> {
         self.tx_queue.pop_front()
     }

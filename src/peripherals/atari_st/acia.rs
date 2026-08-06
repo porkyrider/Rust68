@@ -1,31 +1,31 @@
 //! Motorola MC6850 ACIA (Asynchronous Communications Interface Adapter).
 //!
-//! L'Atari ST embarque **deux** puces ACIA identiques : une pour le
-//! clavier (relié au contrôleur HD6301 du clavier via une liaison série),
-//! une pour le port MIDI (in/out). Les deux partagent le même modèle de
-//! puce — c'est [`crate::systems::atari_st::AtariSt`] qui instancie deux
-//! [`Acia`] séparées et relie leurs sorties IRQ (OR câblé) sur `GPIP4` du
-//! MFP (voir `peripherals::mfp::channel::GPIP4`, câblage réel ST/STE).
+//! The Atari ST has **two** identical ACIA chips: one for the keyboard
+//! (connected to the keyboard's HD6301 controller via a serial link), one
+//! for the MIDI port (in/out). Both share the same chip model —
+//! [`crate::systems::atari_st::AtariSt`] instantiates two separate
+//! [`Acia`] instances and wires their IRQ outputs (wired OR) to `GPIP4` of
+//! the MFP (see `peripherals::mfp::channel::GPIP4`, real ST/STE wiring).
 //!
-//! ## Limitations connues (v1)
-//! - Modèle "au byte" comme `peripherals::mfp` : pas de bit start/stop/
-//!   parité ni de baud rate réel — seuls les registres et les flags de
-//!   statut (RDRF/TDRE/OVRN/FE) sont modélisés fidèlement.
-//! - `DCD`/`CTS` (détection porteuse / clear-to-send) sont câblés
-//!   toujours actifs (pas d'erreur, toujours prêt à émettre) : aucune
-//!   simulation de ligne de handshake externe.
-//! - Pas de simulation de bit de parité (`PE` reste toujours à 0).
+//! ## Known limitations (v1)
+//! - "Byte-level" model like `peripherals::mfp`: no start/stop/parity bit
+//!   or real baud rate — only the registers and status flags
+//!   (RDRF/TDRE/OVRN/FE) are modeled faithfully.
+//! - `DCD`/`CTS` (carrier detect / clear-to-send) are wired always active
+//!   (no error, always ready to transmit): no external handshake line
+//!   simulation.
+//! - No parity bit simulation (`PE` always stays 0).
 
-/// Offsets des deux registres logiques (÷2 par rapport à l'espacement réel
-/// sur le bus — voir `systems::atari_st` pour le mapping d'adresses).
+/// Offsets of the two logical registers (÷2 relative to the real spacing
+/// on the bus — see `systems::atari_st` for the address mapping).
 pub mod reg {
-    /// Écriture : registre de contrôle. Lecture : registre de statut.
+    /// Write: control register. Read: status register.
     pub const CONTROL_STATUS: u8 = 0;
-    /// Écriture : registre d'émission. Lecture : registre de réception.
+    /// Write: transmit register. Read: receive register.
     pub const DATA: u8 = 1;
 }
 
-/// État d'une puce MC6850 ACIA.
+/// State of an MC6850 ACIA chip.
 #[derive(Debug, Clone)]
 pub struct Acia {
     control: u8,
@@ -44,8 +44,8 @@ impl Default for Acia {
 }
 
 impl Acia {
-    /// État après reset matériel : TDRE actif (émetteur prêt), tout le
-    /// reste à zéro/faux — comportement documenté du MC6850.
+    /// State after a hardware reset: TDRE active (transmitter ready),
+    /// everything else zero/false — documented MC6850 behavior.
     pub fn new() -> Self {
         Acia {
             control: 0,
@@ -62,20 +62,20 @@ impl Acia {
         self.control & 0x80 != 0
     }
 
-    /// Bits 6-5 du registre de contrôle : `01` = RTS bas + interruption
-    /// d'émission activée (les 3 autres combinaisons désactivent TIE).
+    /// Bits 6-5 of the control register: `01` = RTS low + transmit
+    /// interrupt enabled (the 3 other combinations disable TIE).
     fn transmit_interrupt_enabled(&self) -> bool {
         (self.control >> 5) & 0x03 == 0b01
     }
 
-    /// Lit le registre logique `offset` (voir [`reg`]).
+    /// Reads the logical register `offset` (see [`reg`]).
     pub fn read(&mut self, offset: u8) -> u8 {
         match offset {
             reg::CONTROL_STATUS => self.status_byte(),
             reg::DATA => {
                 let value = self.rx_data;
-                // Lire la donnée efface RDRF et OVRN (comportement réel du
-                // MC6850 : la lecture acquitte les deux à la fois).
+                // Reading the data clears RDRF and OVRN (real MC6850
+                // behavior: the read acknowledges both at once).
                 self.rdrf = false;
                 self.overrun = false;
                 value
@@ -89,20 +89,20 @@ impl Acia {
             || (self.tdre && self.transmit_interrupt_enabled());
         (self.rdrf as u8)
             | ((self.tdre as u8) << 1)
-            // bit 2 (DCD) et bit 3 (CTS) : toujours 0 (pas de handshake externe simulé)
+            // bit 2 (DCD) and bit 3 (CTS): always 0 (no external handshake simulated)
             | ((self.framing_error as u8) << 4)
             | ((self.overrun as u8) << 5)
-            // bit 6 (PE) : toujours 0 (pas de simulation de parité)
+            // bit 6 (PE): always 0 (no parity simulation)
             | ((irq as u8) << 7)
     }
 
-    /// Écrit le registre logique `offset` (voir [`reg`]).
+    /// Writes the logical register `offset` (see [`reg`]).
     pub fn write(&mut self, offset: u8, value: u8) {
         match offset {
             reg::CONTROL_STATUS => {
                 self.control = value;
-                // Bits 0-1 = 11 : Master Reset (indépendant du reste du
-                // registre de contrôle, qui est quand même mis à jour).
+                // Bits 0-1 = 11: Master Reset (independent of the rest of
+                // the control register, which is still updated).
                 if value & 0x03 == 0x03 {
                     self.rdrf = false;
                     self.tdre = true;
@@ -112,18 +112,18 @@ impl Acia {
             }
             reg::DATA => {
                 self.tx_queue.push_back(value);
-                // Modèle "au byte" instantané (cf. limitations) : TDRE
-                // reste/redevient immédiatement actif.
+                // Instant "byte-level" model (see limitations): TDRE
+                // remains/immediately becomes active again.
                 self.tdre = true;
             }
             _ => {}
         }
     }
 
-    /// Injecte un octet reçu (simulation au niveau octet, cf.
-    /// limitations). Si un octet précédent n'a pas encore été lu (RDRF
-    /// déjà actif), le nouvel octet est **perdu** et `OVRN` s'arme — le
-    /// MC6850 n'a pas de FIFO de réception, un seul registre.
+    /// Injects a received byte (byte-level simulation, see limitations).
+    /// If a previous byte hasn't been read yet (RDRF already active), the
+    /// new byte is **lost** and `OVRN` gets set — the MC6850 has no
+    /// receive FIFO, just a single register.
     pub fn push_rx_byte(&mut self, byte: u8) {
         if self.rdrf {
             self.overrun = true;
@@ -133,15 +133,14 @@ impl Acia {
         self.rdrf = true;
     }
 
-    /// Retire le prochain octet transmis par le programme, s'il y en a
-    /// un.
+    /// Removes the next byte transmitted by the program, if there is one.
     pub fn take_tx_byte(&mut self) -> Option<u8> {
         self.tx_queue.pop_front()
     }
 
-    /// Vrai si cette puce demande une interruption (à combiner en OR avec
-    /// l'autre ACIA par le board — les deux partagent la même broche
-    /// GPIP du MFP sur ST/STE réel).
+    /// True if this chip is requesting an interrupt (to be OR-combined
+    /// with the other ACIA by the board — both share the same MFP GPIP
+    /// pin on real ST/STE hardware).
     pub fn irq_requested(&self) -> bool {
         (self.rdrf && self.receive_interrupt_enabled())
             || (self.tdre && self.transmit_interrupt_enabled())

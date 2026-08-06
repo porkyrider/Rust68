@@ -1,107 +1,107 @@
-//! Émulation du contrôleur IKBD (HD6301) clavier/souris/joystick.
+//! Emulation of the IKBD (HD6301) keyboard/mouse/joystick controller.
 //!
-//! Sur ST/STE réel, le HD6301 dialogue avec le CPU via l'ACIA clavier
-//! (`AtariSt::acia_keyboard`) à 7812,5 bauds. Protocole (sortant, IKBD →
-//! CPU) :
-//! - Frappe clavier : `0xNN` (scancode 0x01-0x72)
-//! - Relâchement : `0x80 | 0xNN`
-//! - Mouvement souris relatif (mode par défaut, `$08`) : `0xF8|boutons,
-//!   dx, dy` — envoyé automatiquement à chaque mouvement.
-//! - Position souris absolue (mode `$09`, voir [`Ikbd::mouse_mode_absolute`]) :
-//!   `0xF7, boutons, xmsb, xlsb, ymsb, ylsb` — **PAS envoyé automatiquement
-//!   sur mouvement** (comportement réel du silicium, confirmé contre
-//!   Hatari) : seulement en réponse à `$0D`, ou sur appui/relâchement de
-//!   bouton si `$07` l'a demandé.
+//! On real ST/STE, the HD6301 talks to the CPU via the keyboard ACIA
+//! (`AtariSt::acia_keyboard`) at 7812.5 baud. Protocol (outgoing, IKBD →
+//! CPU):
+//! - Key press: `0xNN` (scancode 0x01-0x72)
+//! - Key release: `0x80 | 0xNN`
+//! - Relative mouse movement (default mode, `$08`): `0xF8|buttons,
+//!   dx, dy` — sent automatically on every movement.
+//! - Absolute mouse position (mode `$09`, see [`Ikbd::mouse_mode_absolute`]):
+//!   `0xF7, buttons, xmsb, xlsb, ymsb, ylsb` — **NOT sent automatically
+//!   on movement** (real silicon behavior, confirmed against
+//!   Hatari): only in response to `$0D`, or on button press/release
+//!   if `$07` requested it.
 //!
-//! Commandes (entrant, CPU → IKBD via l'émission de l'ACIA) : `0x80 0x01`
-//! (reset), `0x07` (action souris), `0x08`/`0x09` (mode relatif/absolu),
-//! `0x0D` (interroge la position absolue), `0x0E` (charge la position
-//! interne), etc. — voir [`Ikbd::receive_cmd`].
+//! Commands (incoming, CPU → IKBD via the ACIA transmitter): `0x80 0x01`
+//! (reset), `0x07` (mouse action), `0x08`/`0x09` (relative/absolute mode),
+//! `0x0D` (interrogate absolute position), `0x0E` (load internal
+//! position), etc. — see [`Ikbd::receive_cmd`].
 //!
-//! Ce module ne modélise pas le joystick (Rust68 n'a pas de frontend
-//! manette actuellement) : les commandes qui s'y rapportent sont
-//! reconnues et consomment le bon nombre d'octets de paramètres (pour ne
-//! pas désynchroniser le flux de commandes suivant), mais n'ont aucun
-//! effet.
+//! This module does not model the joystick (Rust68 currently has no
+//! gamepad frontend): the related commands are recognized and consume
+//! the correct number of parameter bytes (so as not to desynchronize
+//! the subsequent command stream), but have no effect.
 
 use std::collections::VecDeque;
 
-/// Cycles CPU (68000 à 8 MHz) entre un reset (mise sous tension ou
-/// commande `0x80 0x01`) et l'arrivée effective de la réponse
-/// d'autotest `0xF1` de l'IKBD.
+/// CPU cycles (68000 at 8 MHz) between a reset (power-on or the
+/// `0x80 0x01` command) and the actual arrival of the IKBD's `0xF1`
+/// self-test response.
 ///
-/// Livrer `0xF1` de façon synchrone (immédiatement au reset) fait
-/// arriver l'octet avant que le TOS ait fini de configurer IERB/IMRB du
-/// MFP : l'interruption ACIA correspondante, en attente mais encore
-/// masquée à cet instant, est alors silencieusement effacée par
-/// l'écriture ultérieure (normale) du TOS dans IERB qui active le canal
-/// ACIA. Comme l'octet n'est de ce fait jamais lu, `RDRF` de l'ACIA
-/// reste plein en permanence, bloquant tout octet suivant (clavier ET
-/// souris) derrière lui pour toujours — plus aucune interruption IKBD
-/// ne peut plus jamais arriver.
+/// Delivering `0xF1` synchronously (immediately on reset) makes the
+/// byte arrive before the TOS has finished configuring the MFP's
+/// IERB/IMRB: the corresponding ACIA interrupt, pending but still
+/// masked at that point, is then silently cleared by the TOS's
+/// subsequent (normal) write to IERB that enables the ACIA channel.
+/// Since the byte is therefore never read, the ACIA's `RDRF` stays
+/// permanently full, blocking every following byte (keyboard AND
+/// mouse) behind it forever — no IKBD interrupt can ever arrive
+/// again.
 ///
-/// Valeur choisie empiriquement (voir le projet compagnon Stay, qui a
-/// isolé et corrigé exactement cette régression) : suffisamment grande
-/// pour retomber après que le TOS ait terminé la configuration
-/// IERB/IMRB de son initialisation clavier/souris.
+/// Value chosen empirically (see the companion project Stay, which
+/// isolated and fixed exactly this regression): large enough to fall
+/// due after the TOS has finished the IERB/IMRB setup of its
+/// keyboard/mouse initialization.
 const IKBD_RESET_CYCLES: u32 = 5_000_000;
 
-/// État complet d'un IKBD HD6301 émulé.
+/// Full state of an emulated HD6301 IKBD.
 pub struct Ikbd {
-    /// File de sortie : octets en attente de livraison à l'ACIA (RX, côté CPU).
+    /// Output queue: bytes waiting to be delivered to the ACIA (RX, CPU side).
     tx_queue: VecDeque<u8>,
-    /// Tampon de commande entrante (CPU → IKBD via l'émission de l'ACIA).
+    /// Incoming command buffer (CPU → IKBD via the ACIA transmitter).
     cmd_buf: Vec<u8>,
-    /// Nombre d'octets de paramètre encore attendus avant d'exécuter la commande en cours.
+    /// Number of parameter bytes still expected before executing the current command.
     cmd_remaining: usize,
 
-    // État souris.
+    // Mouse state.
     mouse_x: i32,
     mouse_y: i32,
     mouse_buttons: u8,
-    /// Sens de l'axe Y : 1 = origine en haut (vers le bas = positif), -1 = origine en bas.
+    /// Direction of the Y axis: 1 = origin at the top (downward = positive), -1 = origin at the bottom.
     y_axis: i8,
-    /// `true` si la souris est en mode ABSOLU (`$09`), `false` = relatif
-    /// (`$08`, par défaut) — voir la doc de [`Self::mouse_move`].
-    /// **Bug réel corrigé** : `$09` était reconnu (bon nombre d'octets de
-    /// paramètre consommés) mais totalement ignoré — la souris restait en
-    /// mode relatif pour toujours, envoyant des paquets `0xF8` que GEM,
-    /// une fois basculé en mode absolu pour une boîte de dialogue modale
-    /// (ex: Bureau > Informations), n'attend plus du tout — désynchronisant
-    /// son analyseur de flux série et produisant un mouvement de curseur
-    /// en apparence "tourné" (les octets `dx`/`dy` mal réinterprétés) tant
-    /// que la boîte de dialogue reste ouverte. Confirmé contre Hatari
-    /// (`ikbd.c`, `IKBD_Cmd_AbsMouseMode`/`IKBD_SendAutoKeyboardCommands` :
-    /// en mode absolu, silicium réel n'envoie JAMAIS de paquet automatique
-    /// sur mouvement — seulement sur interrogation `$0D`, ou sur
-    /// appui/relâchement de bouton si `$07` l'a demandé).
+    /// `true` if the mouse is in ABSOLUTE mode (`$09`), `false` = relative
+    /// (`$08`, default) — see the doc of [`Self::mouse_move`].
+    /// **Real bug fixed**: `$09` was recognized (correct number of
+    /// parameter bytes consumed) but completely ignored — the mouse
+    /// remained in relative mode forever, sending `0xF8` packets that
+    /// GEM, once switched to absolute mode for a modal dialog box
+    /// (e.g. Desktop > Info), no longer expects at all — desynchronizing
+    /// its serial stream parser and producing apparently "rotated"
+    /// cursor movement (the `dx`/`dy` bytes misinterpreted) for as long
+    /// as the dialog box stays open. Confirmed against Hatari
+    /// (`ikbd.c`, `IKBD_Cmd_AbsMouseMode`/`IKBD_SendAutoKeyboardCommands`:
+    /// in absolute mode, real silicon NEVER sends an automatic packet
+    /// on movement — only on `$0D` interrogation, or on button
+    /// press/release if `$07` requested it).
     mouse_mode_absolute: bool,
-    /// Bornes courantes (`$09`, MSB en premier) du mode absolu — aussi
-    /// utilisées comme bornes de blocage de [`Self::mouse_x`]/`mouse_y` en
-    /// PERMANENCE (silicium réel : une seule position interne suivie en
-    /// continu, bornée par ces limites, quel que soit le mode de rapport
-    /// actif — voir Hatari, `IKBD_UpdateInternalMousePosition`). Valeurs
-    /// par défaut inchangées par rapport au comportement historique
-    /// (639/399) tant qu'aucune commande `$09` n'a encore été reçue.
+    /// Current bounds (`$09`, MSB first) of absolute mode — also
+    /// used as clamping bounds for [`Self::mouse_x`]/`mouse_y` at ALL
+    /// times (real silicon: a single internal position tracked
+    /// continuously, clamped by these limits, regardless of the
+    /// currently active reporting mode — see Hatari,
+    /// `IKBD_UpdateInternalMousePosition`). Default values unchanged
+    /// from historical behavior (639/399) as long as no `$09` command
+    /// has been received yet.
     abs_max_x: u16,
     abs_max_y: u16,
-    /// Dernier octet de paramètre de la commande `$07` ("mouse action") —
-    /// bits 0-1 : rapporter la position absolue sur appui/relâchement de
-    /// bouton (seul mécanisme de rapport AUTOMATIQUE en mode absolu, voir
+    /// Last parameter byte of the `$07` ("mouse action") command —
+    /// bits 0-1: report absolute position on button press/release
+    /// (the only AUTOMATIC reporting mechanism in absolute mode, see
     /// [`Self::mouse_mode_absolute`]).
     mouse_action: u8,
 
-    /// Cycles restants avant la livraison d'une réponse `0xF1` de reset en
-    /// attente (voir [`IKBD_RESET_CYCLES`]). `None` = aucun reset en cours.
+    /// Cycles remaining before delivering a pending reset `0xF1`
+    /// response (see [`IKBD_RESET_CYCLES`]). `None` = no reset in progress.
     reset_pending_cycles: Option<u32>,
-    /// Octets clavier/souris survenus pendant un reset en cours (voir
-    /// [`Self::reset_pending_cycles`]), mis en attente pour être livrés
-    /// juste après `0xF1` plutôt qu'avant. Sur le vrai HD6301, le
-    /// contrôleur exécute son autotest et ne scanne pas le clavier durant
-    /// ce délai ; livrer un scancode avant `0xF1` fait croire au logiciel
-    /// hôte (ex. la cartouche de diagnostic, test K1) que le clavier ne
-    /// répond pas correctement, et le fait basculer en mode RS232 de
-    /// secours ("clavier HS").
+    /// Keyboard/mouse bytes that occurred during an ongoing reset (see
+    /// [`Self::reset_pending_cycles`]), held back to be delivered
+    /// right after `0xF1` rather than before. On real HD6301
+    /// hardware, the controller runs its self-test and does not scan
+    /// the keyboard during this delay; delivering a scancode before
+    /// `0xF1` makes host software (e.g. the diagnostic cartridge,
+    /// test K1) believe the keyboard is not responding correctly, and
+    /// causes it to fall back to RS232 mode ("keyboard dead").
     pending_during_reset: VecDeque<u8>,
 }
 
@@ -119,16 +119,16 @@ impl Ikbd {
             abs_max_x: 639,
             abs_max_y: 399,
             mouse_action: 0,
-            // Autotest de mise sous tension : différé comme un reset logiciel
-            // (voir la doc de IKBD_RESET_CYCLES), pas disponible dès le cycle 0.
+            // Power-on self-test: deferred like a software reset (see
+            // the doc of IKBD_RESET_CYCLES), not available from cycle 0.
             reset_pending_cycles: Some(IKBD_RESET_CYCLES),
             pending_during_reset: VecDeque::new(),
         }
     }
 
-    /// Fait progresser le délai de réponse au reset, s'il y en a un en
-    /// cours. À appeler une fois par tick de bus avec le nombre de cycles
-    /// écoulés, avant [`Self::pop_tx`].
+    /// Advances the reset response delay, if one is in progress. To be
+    /// called once per bus tick with the number of elapsed cycles,
+    /// before [`Self::pop_tx`].
     pub fn tick(&mut self, cycles: u32) {
         if let Some(remaining) = self.reset_pending_cycles {
             if cycles >= remaining {
@@ -141,13 +141,13 @@ impl Ikbd {
         }
     }
 
-    /// Retire le prochain octet à injecter dans l'ACIA (RX), s'il y en a un.
+    /// Removes the next byte to inject into the ACIA (RX), if there is one.
     pub fn pop_tx(&mut self) -> Option<u8> {
         self.tx_queue.pop_front()
     }
 
-    /// Reçoit un octet de commande envoyé par le CPU (via l'émission de
-    /// l'ACIA clavier).
+    /// Receives a command byte sent by the CPU (via the keyboard
+    /// ACIA's transmitter).
     pub fn receive_cmd(&mut self, byte: u8) {
         if self.cmd_remaining > 0 {
             self.cmd_buf.push(byte);
@@ -162,31 +162,31 @@ impl Ikbd {
         self.cmd_buf.push(byte);
 
         match byte {
-            0x80 => self.cmd_remaining = 1, // reset : attend le paramètre 0x01
-            0x07 => self.cmd_remaining = 1, // action des boutons souris
-            0x08 => {}                       // mode souris relatif (pas de paramètre)
-            0x09 => self.cmd_remaining = 4, // mode souris absolu
-            0x0A => self.cmd_remaining = 2, // touches clavier pour la souris
-            0x0B => self.cmd_remaining = 2, // seuil souris
-            0x0C => self.cmd_remaining = 2, // échelle souris
-            0x0D => {}                       // interroge la position absolue (répond directement)
-            0x0E => self.cmd_remaining = 5, // règle la position interne
-            0x0F => self.y_axis = -1,       // Y=0 en bas
-            0x10 => self.y_axis = 1,        // Y=0 en haut
-            0x11 => {}                       // démarre la transmission clavier
-            0x12 => {}                       // souris désactivée
-            0x13 => {}                       // arrête la transmission clavier
-            // 0x14-0x1A : commandes joystick — non modélisées (pas de
-            // frontend manette), mais le compte d'octets de paramètres
-            // doit rester correct pour ne pas désynchroniser le flux.
+            0x80 => self.cmd_remaining = 1, // reset: expects parameter 0x01
+            0x07 => self.cmd_remaining = 1, // mouse button action
+            0x08 => {}                       // relative mouse mode (no parameter)
+            0x09 => self.cmd_remaining = 4, // absolute mouse mode
+            0x0A => self.cmd_remaining = 2, // mouse keycodes
+            0x0B => self.cmd_remaining = 2, // mouse threshold
+            0x0C => self.cmd_remaining = 2, // mouse scale
+            0x0D => {}                       // interrogate absolute position (responds directly)
+            0x0E => self.cmd_remaining = 5, // set internal position
+            0x0F => self.y_axis = -1,       // Y=0 at bottom
+            0x10 => self.y_axis = 1,        // Y=0 at top
+            0x11 => {}                       // start keyboard transmission
+            0x12 => {}                       // mouse disabled
+            0x13 => {}                       // stop keyboard transmission
+            // 0x14-0x1A: joystick commands — not modeled (no gamepad
+            // frontend), but the parameter byte count must remain
+            // correct so as not to desynchronize the stream.
             0x14 | 0x15 | 0x16 | 0x18 | 0x1A => {}
             0x17 => self.cmd_remaining = 1,
             0x19 => self.cmd_remaining = 6,
-            0x1B => self.cmd_remaining = 6, // règle l'horloge
-            0x1C => {}                       // lit l'horloge
-            0x20 => self.cmd_remaining = 3, // charge en mémoire
-            0x21 => self.cmd_remaining = 2, // lit la mémoire
-            0x22 => self.cmd_remaining = 2, // exécute
+            0x1B => self.cmd_remaining = 6, // set the clock
+            0x1C => {}                       // read the clock
+            0x20 => self.cmd_remaining = 3, // load into memory
+            0x21 => self.cmd_remaining = 2, // read memory
+            0x22 => self.cmd_remaining = 2, // execute
             _ => {}
         }
 
@@ -198,7 +198,7 @@ impl Ikbd {
     fn execute_cmd(&mut self) {
         match self.cmd_buf[0] {
             0x80 => {
-                // Reset logiciel : commande 0x80 + paramètre 0x01.
+                // Software reset: command 0x80 + parameter 0x01.
                 if self.cmd_buf.get(1) == Some(&0x01) {
                     self.mouse_buttons = 0;
                     self.y_axis = 1;
@@ -206,32 +206,33 @@ impl Ikbd {
                     self.reset_pending_cycles = Some(IKBD_RESET_CYCLES);
                 }
             }
-            // Action souris ($07) : bits 0-1 = rapporter la position
-            // absolue sur appui/relâchement de bouton (SEUL mécanisme de
-            // rapport automatique en mode absolu, voir
-            // `Self::mouse_mode_absolute`) — reste sans effet en mode
-            // relatif (déjà rapporté sur chaque mouvement).
+            // Mouse action ($07): bits 0-1 = report absolute position
+            // on button press/release (the ONLY automatic reporting
+            // mechanism in absolute mode, see
+            // `Self::mouse_mode_absolute`) — has no effect in relative
+            // mode (already reported on every movement).
             0x07 => self.mouse_action = self.cmd_buf.get(1).copied().unwrap_or(0),
-            // Mode relatif ($08) : pas de paramètre.
+            // Relative mode ($08): no parameter.
             0x08 => self.mouse_mode_absolute = false,
-            // Mode absolu ($09) : bornes MaxX/MaxY, MSB en premier — voir
-            // la doc de `Self::mouse_mode_absolute`. Ne touche PAS
-            // `mouse_x`/`mouse_y` eux-mêmes (silicium réel : le bornage ne
-            // s'applique qu'au PROCHAIN mouvement, pas rétroactivement).
+            // Absolute mode ($09): MaxX/MaxY bounds, MSB first — see
+            // the doc of `Self::mouse_mode_absolute`. Does NOT touch
+            // `mouse_x`/`mouse_y` themselves (real silicon: the
+            // clamping only applies to the NEXT movement, not
+            // retroactively).
             0x09 => {
                 self.mouse_mode_absolute = true;
                 self.abs_max_x = ((self.cmd_buf[1] as u16) << 8) | self.cmd_buf[2] as u16;
                 self.abs_max_y = ((self.cmd_buf[3] as u16) << 8) | self.cmd_buf[4] as u16;
             }
-            // Interroge la position absolue → 0xF7 + boutons + x(2) + y(2).
+            // Interrogate absolute position → 0xF7 + buttons + x(2) + y(2).
             0x0D => {
                 let bytes = self.abs_report_bytes();
                 self.tx_queue.extend(bytes);
             }
-            // Charge la position interne ($0E) : octet de remplissage +
-            // X(2)/Y(2), MSB en premier — GEM s'en sert typiquement juste
-            // après $09 pour recentrer le curseur dans les bornes de la
-            // boîte de dialogue avant que l'utilisateur ne bouge la souris.
+            // Load internal position ($0E): filler byte + X(2)/Y(2),
+            // MSB first — GEM typically uses this right after $09 to
+            // recenter the cursor within the dialog box's bounds
+            // before the user moves the mouse.
             0x0E => {
                 let x = ((self.cmd_buf[2] as u16) << 8) | self.cmd_buf[3] as u16;
                 let y = ((self.cmd_buf[4] as u16) << 8) | self.cmd_buf[5] as u16;
@@ -243,9 +244,9 @@ impl Ikbd {
         self.cmd_buf.clear();
     }
 
-    /// Les 6 octets du rapport de position absolue (`0xF7` + boutons + x(2)
-    /// + y(2), MSB en premier) — partagé entre la réponse à `$0D` et le
-    /// rapport automatique sur bouton en mode absolu (voir
+    /// The 6 bytes of the absolute position report (`0xF7` + buttons +
+    /// x(2) + y(2), MSB first) — shared between the `$0D` response and
+    /// the automatic on-button report in absolute mode (see
     /// [`Self::mouse_move`]).
     fn abs_report_bytes(&self) -> [u8; 6] {
         let x = self.mouse_x as u16;
@@ -253,21 +254,21 @@ impl Ikbd {
         [0xF7, self.mouse_buttons, (x >> 8) as u8, x as u8, (y >> 8) as u8, y as u8]
     }
 
-    // ── Événements venant de l'hôte ─────────────────────────────────────
+    // ── Events coming from the host ──────────────────────────────────────
 
-    /// Signale l'appui d'une touche (make). `scancode` est le scancode IKBD Atari.
+    /// Signals a key press (make). `scancode` is the Atari IKBD scancode.
     pub fn key_make(&mut self, scancode: u8) {
         self.push_output(scancode);
     }
 
-    /// Signale le relâchement d'une touche (break). Code = `0x80 | make`.
+    /// Signals a key release (break). Code = `0x80 | make`.
     pub fn key_break(&mut self, scancode: u8) {
         self.push_output(0x80 | scancode);
     }
 
-    /// Route un octet clavier/souris vers `tx_queue`, ou vers
-    /// `pending_during_reset` si un reset est en cours (voir la doc de ce
-    /// champ) pour qu'il n'arrive jamais avant le `0xF1` d'autotest.
+    /// Routes a keyboard/mouse byte to `tx_queue`, or to
+    /// `pending_during_reset` if a reset is in progress (see the doc of
+    /// that field) so that it never arrives before the `0xF1` self-test.
     fn push_output(&mut self, byte: u8) {
         if self.reset_pending_cycles.is_some() {
             self.pending_during_reset.push_back(byte);
@@ -276,21 +277,21 @@ impl Ikbd {
         }
     }
 
-    /// Signale un mouvement relatif de la souris et l'état des boutons.
+    /// Signals a relative mouse movement and the button state.
     pub fn mouse_move(&mut self, dx: i8, dy: i8, buttons: u8) {
         let buttons_changed = buttons != self.mouse_buttons;
         self.mouse_buttons = buttons;
         let eff_dy = if self.y_axis < 0 { dy.wrapping_neg() } else { dy };
-        // Position interne suivie en PERMANENCE, bornée par `abs_max_x`/`_y`
-        // — silicium réel, quel que soit le mode de rapport actif (voir la
-        // doc de `Self::abs_max_x`).
+        // Internal position tracked at ALL times, clamped by
+        // `abs_max_x`/`_y` — real silicon, regardless of the currently
+        // active reporting mode (see the doc of `Self::abs_max_x`).
         self.mouse_x = (self.mouse_x + dx as i32).clamp(0, self.abs_max_x as i32);
         self.mouse_y = (self.mouse_y + eff_dy as i32).clamp(0, self.abs_max_y as i32);
         if self.mouse_mode_absolute {
-            // Mode absolu : AUCUN rapport automatique sur mouvement
-            // (silicium réel) — seulement sur appui/relâchement de bouton
-            // si `$07` l'a demandé (bits 0-1), le reste passe par une
-            // interrogation `$0D` explicite. Voir la doc de
+            // Absolute mode: NO automatic report on movement (real
+            // silicon) — only on button press/release if `$07`
+            // requested it (bits 0-1), everything else goes through an
+            // explicit `$0D` interrogation. See the doc of
             // `Self::mouse_mode_absolute`.
             if buttons_changed && self.mouse_action & 0x03 != 0 {
                 let bytes = self.abs_report_bytes();
@@ -328,46 +329,46 @@ mod tests {
     }
 
     #[test]
-    fn reset_response_est_differee_pas_immediate() {
+    fn reset_response_is_deferred_not_immediate() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES - 1);
-        assert!(drain(&mut ikbd).is_empty(), "0xF1 ne doit pas arriver avant le délai complet");
+        assert!(drain(&mut ikbd).is_empty(), "0xF1 must not arrive before the full delay");
         ikbd.tick(1);
         assert_eq!(drain(&mut ikbd), vec![0xF1]);
     }
 
     #[test]
-    fn touche_pressee_pendant_un_reset_arrive_apres_0xf1_pas_avant() {
-        // Reproduit le scénario cartouche de diagnostic (test K1) : une
-        // touche pressée pendant la fenêtre de reset ne doit jamais
-        // devancer le 0xF1 d'autotest, sous peine de faire croire au test
-        // que le clavier ne répond pas (bascule RS232 "clavier HS").
+    fn key_pressed_during_reset_arrives_after_0xf1_not_before() {
+        // Reproduces the diagnostic cartridge scenario (test K1): a key
+        // pressed during the reset window must never precede the
+        // `0xF1` self-test byte, or it will make the test believe the
+        // keyboard is not responding (RS232 "keyboard dead" fallback).
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES / 2);
-        ikbd.key_make(0x1E); // touche 'A' pressée en plein milieu du reset
+        ikbd.key_make(0x1E); // 'A' key pressed right in the middle of the reset
         assert!(
             drain(&mut ikbd).is_empty(),
-            "le scancode ne doit pas être livré avant la fin du reset"
+            "the scancode must not be delivered before the end of the reset"
         );
         ikbd.tick(IKBD_RESET_CYCLES / 2);
         assert_eq!(drain(&mut ikbd), vec![0xF1, 0x1E]);
     }
 
     #[test]
-    fn commande_reset_relance_le_delai() {
+    fn reset_command_restarts_the_delay() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
         drain(&mut ikbd);
 
         ikbd.receive_cmd(0x80);
         ikbd.receive_cmd(0x01);
-        assert!(drain(&mut ikbd).is_empty(), "0xF1 doit de nouveau être différé après un reset logiciel");
+        assert!(drain(&mut ikbd).is_empty(), "0xF1 must again be deferred after a software reset");
         ikbd.tick(IKBD_RESET_CYCLES);
         assert_eq!(drain(&mut ikbd), vec![0xF1]);
     }
 
     #[test]
-    fn paquet_mouvement_relatif_format_standard() {
+    fn relative_movement_packet_standard_format() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
         drain(&mut ikbd);
@@ -376,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn aucun_paquet_si_rien_ne_change() {
+    fn no_packet_if_nothing_changes() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
         drain(&mut ikbd);
@@ -385,17 +386,17 @@ mod tests {
     }
 
     #[test]
-    fn axe_y_inverse_par_commande_0x0f() {
+    fn y_axis_inverted_by_command_0x0f() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
         drain(&mut ikbd);
-        ikbd.receive_cmd(0x0F); // Y=0 en bas
+        ikbd.receive_cmd(0x0F); // Y=0 at bottom
         ikbd.mouse_move(0, 10, 0);
         assert_eq!(drain(&mut ikbd), vec![0xF8, 0, (-10i8) as u8]);
     }
 
     #[test]
-    fn interrogation_position_absolue_0x0d() {
+    fn absolute_position_interrogation_0x0d() {
         let mut ikbd = Ikbd::new();
         ikbd.mouse_move(100, 50, 0b11);
         drain(&mut ikbd);
@@ -403,7 +404,7 @@ mod tests {
         assert_eq!(drain(&mut ikbd), vec![0xF7, 0b11, 0x00, 100, 0x00, 50]);
     }
 
-    // --- Mode absolu ($09), bug réel corrigé ------------------------------
+    // --- Absolute mode ($09), real bug fixed -------------------------------
 
     fn send_cmd(ikbd: &mut Ikbd, bytes: &[u8]) {
         for &b in bytes {
@@ -412,26 +413,25 @@ mod tests {
     }
 
     #[test]
-    fn mode_absolu_n_envoie_aucun_paquet_automatique_sur_mouvement() {
-        // Cœur du bug corrigé : silicium réel, en mode absolu, n'envoie
-        // JAMAIS de paquet automatique sur mouvement (ni `0xF8` relatif, ni
-        // `0xF7` absolu) — seulement sur interrogation `$0D` ou sur
-        // bouton si `$07` l'a demandé. Une régression qui réintroduirait
-        // un envoi automatique ici recréerait exactement le bug GEM
-        // (curseur "tourné" pendant qu'une boîte de dialogue modale est
-        // ouverte).
+    fn absolute_mode_sends_no_automatic_packet_on_movement() {
+        // Core of the fixed bug: real silicon, in absolute mode, NEVER
+        // sends an automatic packet on movement (neither relative
+        // `0xF8` nor absolute `0xF7`) — only on `$0D` interrogation or
+        // on button if `$07` requested it. A regression reintroducing
+        // an automatic send here would recreate exactly the GEM bug
+        // ("rotated" cursor while a modal dialog box is open).
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
         drain(&mut ikbd);
         send_cmd(&mut ikbd, &[0x09, 0x03, 0x1F, 0x01, 0x8F]); // max_x=0x031F, max_y=0x018F
-        drain(&mut ikbd); // la commande elle-même ne répond rien
+        drain(&mut ikbd); // the command itself yields no response
 
         ikbd.mouse_move(5, -3, 0b01);
-        assert!(drain(&mut ikbd).is_empty(), "aucun paquet automatique en mode absolu");
+        assert!(drain(&mut ikbd).is_empty(), "no automatic packet in absolute mode");
     }
 
     #[test]
-    fn mode_absolu_suit_quand_meme_la_position_interrogeable_via_0x0d() {
+    fn absolute_mode_still_tracks_position_queryable_via_0x0d() {
         let mut ikbd = Ikbd::new();
         send_cmd(&mut ikbd, &[0x09, 0x03, 0x1F, 0x01, 0x8F]);
         drain(&mut ikbd);
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_absolu_borne_la_position_a_max_x_max_y() {
+    fn absolute_mode_clamps_position_to_max_x_max_y() {
         let mut ikbd = Ikbd::new();
         send_cmd(&mut ikbd, &[0x09, 0x00, 0x0A, 0x00, 0x05]); // max_x=10, max_y=5
         drain(&mut ikbd);
@@ -453,26 +453,26 @@ mod tests {
         ikbd.mouse_move(100, 100, 0);
         drain(&mut ikbd);
         ikbd.receive_cmd(0x0D);
-        assert_eq!(drain(&mut ikbd), vec![0xF7, 0, 0x00, 10, 0x00, 5], "bornée à max_x/max_y, pas 639/399");
+        assert_eq!(drain(&mut ikbd), vec![0xF7, 0, 0x00, 10, 0x00, 5], "clamped to max_x/max_y, not 639/399");
     }
 
     #[test]
-    fn mode_absolu_rapporte_automatiquement_sur_bouton_si_0x07_le_demande() {
+    fn absolute_mode_reports_automatically_on_button_if_0x07_requested_it() {
         let mut ikbd = Ikbd::new();
-        ikbd.tick(IKBD_RESET_CYCLES); // le rapport automatique passe par push_output, gaté pendant un reset
+        ikbd.tick(IKBD_RESET_CYCLES); // the automatic report goes through push_output, gated during a reset
         send_cmd(&mut ikbd, &[0x09, 0x03, 0x1F, 0x01, 0x8F]);
-        send_cmd(&mut ikbd, &[0x07, 0x03]); // action souris : bits 0-1 posés
+        send_cmd(&mut ikbd, &[0x07, 0x03]); // mouse action: bits 0-1 set
         drain(&mut ikbd);
 
-        ikbd.mouse_move(0, 0, 0b01); // changement de bouton, pas de mouvement
+        ikbd.mouse_move(0, 0, 0b01); // button change, no movement
         assert_eq!(drain(&mut ikbd), vec![0xF7, 0b01, 0x00, 0, 0x00, 0]);
     }
 
     #[test]
-    fn mode_absolu_sans_action_0x07_ne_rapporte_rien_sur_bouton() {
+    fn absolute_mode_without_0x07_action_reports_nothing_on_button() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
-        send_cmd(&mut ikbd, &[0x09, 0x03, 0x1F, 0x01, 0x8F]); // pas de $07
+        send_cmd(&mut ikbd, &[0x09, 0x03, 0x1F, 0x01, 0x8F]); // no $07
         drain(&mut ikbd);
 
         ikbd.mouse_move(0, 0, 0b01);
@@ -480,20 +480,20 @@ mod tests {
     }
 
     #[test]
-    fn retour_en_mode_relatif_via_0x08_restaure_les_paquets_automatiques() {
+    fn returning_to_relative_mode_via_0x08_restores_automatic_packets() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
         send_cmd(&mut ikbd, &[0x09, 0x03, 0x1F, 0x01, 0x8F]);
         drain(&mut ikbd);
-        ikbd.receive_cmd(0x08); // retour au mode relatif
+        ikbd.receive_cmd(0x08); // back to relative mode
         drain(&mut ikbd);
 
         ikbd.mouse_move(5, -3, 0b01);
-        assert_eq!(drain(&mut ikbd), vec![0xF9, 5, (-3i8) as u8], "mode relatif restauré");
+        assert_eq!(drain(&mut ikbd), vec![0xF9, 5, (-3i8) as u8], "relative mode restored");
     }
 
     #[test]
-    fn commande_0x0e_charge_directement_la_position_interne() {
+    fn command_0x0e_loads_internal_position_directly() {
         let mut ikbd = Ikbd::new();
         send_cmd(&mut ikbd, &[0x0E, 0x00, 0x00, 0x64, 0x00, 0x32]); // x=100, y=50
         drain(&mut ikbd);
@@ -502,13 +502,13 @@ mod tests {
     }
 
     #[test]
-    fn commande_joystick_avec_parametres_ne_desynchronise_pas_la_suite() {
+    fn joystick_command_with_parameters_does_not_desync_the_rest() {
         let mut ikbd = Ikbd::new();
         ikbd.tick(IKBD_RESET_CYCLES);
         drain(&mut ikbd);
-        // 0x19 attend 6 octets de paramètres (curseur joystick) — non
-        // modélisé, mais doit bien être absorbé pour que la commande
-        // suivante (interrogation position absolue) soit lue correctement.
+        // 0x19 expects 6 parameter bytes (joystick cursor) — not
+        // modeled, but must be properly absorbed so that the next
+        // command (absolute position interrogation) is read correctly.
         ikbd.receive_cmd(0x19);
         for b in 0..6 {
             ikbd.receive_cmd(b);

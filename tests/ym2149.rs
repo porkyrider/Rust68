@@ -1,5 +1,5 @@
 #![cfg(feature = "atari-st")]
-//! Tests unitaires du YM2149 (`rust68::peripherals::atari_st::ym2149`).
+//! Unit tests for the YM2149 (`rust68::peripherals::atari_st::ym2149`).
 
 use rust68::peripherals::atari_st::ym2149::{Ym2149, bus_offset, mix_channels_model, reg};
 
@@ -18,97 +18,97 @@ fn read_reg(chip: &mut Ym2149, r: u8) -> u8 {
 }
 
 #[test]
-fn registres_masques_selon_leur_largeur_reelle() {
+fn registers_masked_according_to_their_real_width() {
     let mut chip = Ym2149::new();
     write_reg(&mut chip, reg::TONE_A_COARSE, 0xFF);
-    assert_eq!(read_reg(&mut chip, reg::TONE_A_COARSE), 0x0F, "coarse tone : 4 bits");
+    assert_eq!(read_reg(&mut chip, reg::TONE_A_COARSE), 0x0F, "coarse tone: 4 bits");
 
     write_reg(&mut chip, reg::NOISE_PERIOD, 0xFF);
-    assert_eq!(read_reg(&mut chip, reg::NOISE_PERIOD), 0x1F, "période de bruit : 5 bits");
+    assert_eq!(read_reg(&mut chip, reg::NOISE_PERIOD), 0x1F, "noise period: 5 bits");
 
     write_reg(&mut chip, reg::ENVELOPE_SHAPE, 0xFF);
-    assert_eq!(read_reg(&mut chip, reg::ENVELOPE_SHAPE), 0x0F, "forme d'enveloppe : 4 bits");
+    assert_eq!(read_reg(&mut chip, reg::ENVELOPE_SHAPE), 0x0F, "envelope shape: 4 bits");
 
     write_reg(&mut chip, reg::TONE_A_FINE, 0xFF);
-    assert_eq!(read_reg(&mut chip, reg::TONE_A_FINE), 0xFF, "fine tone : 8 bits complets");
+    assert_eq!(read_reg(&mut chip, reg::TONE_A_FINE), 0xFF, "fine tone: full 8 bits");
 }
 
 #[test]
-fn selecteur_de_registre_lisible() {
+fn register_selector_is_readable() {
     let mut chip = Ym2149::new();
     select(&mut chip, 5);
     assert_eq!(chip.read(bus_offset::SELECT), 5);
 }
 
 #[test]
-fn tonalite_bascule_au_rythme_programme() {
+fn tone_toggles_at_the_programmed_rate() {
     let mut chip = Ym2149::new();
-    // Période = 1 : bascule à chaque cycle puce (= 4 cycles CPU).
+    // Period = 1: toggles every chip cycle (= 4 CPU cycles).
     write_reg(&mut chip, reg::TONE_A_FINE, 1);
     write_reg(&mut chip, reg::TONE_A_COARSE, 0);
-    // Mixer : tonalité A activée (bit0=0), bruit A désactivé (bit3=1).
+    // Mixer: tone A enabled (bit0=0), noise A disabled (bit3=1).
     write_reg(&mut chip, reg::MIXER, 0b0000_1000);
-    write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F); // volume max fixe
+    write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F); // fixed max volume
 
     let mut levels = Vec::new();
     for _ in 0..6 {
-        // Le compteur interne du silicium avance à clock/8 : avec
-        // période=1, la bascule survient tous les 8 cycles puce.
+        // The silicon's internal counter runs at clock/8: with
+        // period=1, the toggle occurs every 8 chip cycles.
         for _ in 0..8 {
-            chip.tick(4); // 1 cycle puce
+            chip.tick(4); // 1 chip cycle
         }
         levels.push(chip.channel_level(0));
     }
-    // Période minimale (1) : bascule au bout de 8 cycles puce, puis
-    // alterne 31 (VOLUME_4_TO_5[0x0F], pas un simple ×2 — voir
-    // `Ym2149::channel_level`) / 0 tous les 8 cycles suivants.
+    // Minimum period (1): toggles after 8 chip cycles, then
+    // alternates 31 (VOLUME_4_TO_5[0x0F], not a simple x2 — see
+    // `Ym2149::channel_level`) / 0 every 8 subsequent cycles.
     assert_eq!(levels, vec![31, 0, 31, 0, 31, 0]);
 }
 
 #[test]
-fn take_averaged_levels_moyenne_les_bascules_intermediaires() {
-    // Anti-repliement (aliasing) : `channel_level` est un échantillonnage
-    // ponctuel de l'état instantané ; si de nombreuses bascules ont eu lieu
-    // depuis le dernier appel (tonalité aiguë tickée en un seul gros bloc de
-    // cycles CPU, comme le fait le binaire SDL2 une fois par instruction),
-    // `channel_level` seul ne verrait que l'état final, pas la moyenne
-    // réelle du signal — d'où l'existence de `take_averaged_levels`.
+fn take_averaged_levels_averages_the_intermediate_toggles() {
+    // Anti-aliasing: `channel_level` is a point-in-time sample of the
+    // instantaneous state; if many toggles have occurred since the last
+    // call (a high-pitched tone ticked in one large block of CPU cycles,
+    // as the SDL2 binary does once per instruction), `channel_level`
+    // alone would only see the final state, not the actual signal
+    // average — hence the existence of `take_averaged_levels`.
     let mut chip = Ym2149::new();
-    write_reg(&mut chip, reg::TONE_A_FINE, 1); // bascule tous les 8 cycles puce
+    write_reg(&mut chip, reg::TONE_A_FINE, 1); // toggles every 8 chip cycles
     write_reg(&mut chip, reg::TONE_A_COARSE, 0);
-    write_reg(&mut chip, reg::MIXER, 0b0000_1000); // tonalité A active, bruit A coupé
-    write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F); // niveau 31 quand "haut" (VOLUME_4_TO_5[0x0F])
+    write_reg(&mut chip, reg::MIXER, 0b0000_1000); // tone A active, noise A off
+    write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F); // level 31 when "high" (VOLUME_4_TO_5[0x0F])
 
-    // Un seul gros tick couvrant un nombre ENTIER de périodes complètes (80
-    // cycles puce = 320 cycles CPU = 5 × 16 cycles, période=1 basculant
-    // tous les 8 cycles puce) : la moyenne doit valoir exactement 50% du
-    // niveau max (31), pas juste l'état final ponctuel après la boucle.
+    // One single large tick covering a WHOLE number of full periods (80
+    // chip cycles = 320 CPU cycles = 5 x 16 cycles, period=1 toggling
+    // every 8 chip cycles): the average must be exactly 50% of the
+    // max level (31), not just the point-in-time final state after the loop.
     chip.tick(320);
     let levels = chip.take_averaged_levels();
-    assert!((levels[0] - 15.5).abs() < 0.01, "moyenne attendue = 15.5 (50% de 31), obtenu {}", levels[0]);
+    assert!((levels[0] - 15.5).abs() < 0.01, "expected average = 15.5 (50% of 31), got {}", levels[0]);
 
-    // L'accumulateur est remis à zéro : un appel immédiatement après sans
-    // nouveau tick() ne doit pas réutiliser l'ancienne moyenne.
-    let levels_apres_reset = chip.take_averaged_levels();
-    assert_eq!(levels_apres_reset[0], chip.channel_level(0) as f32, "accumulateur vide -> retombe sur l'état instantané");
+    // The accumulator is reset to zero: a call immediately after without
+    // a new tick() must not reuse the previous average.
+    let levels_after_reset = chip.take_averaged_levels();
+    assert_eq!(levels_after_reset[0], chip.channel_level(0) as f32, "empty accumulator -> falls back to the instantaneous state");
 }
 
 #[test]
-fn mixer_coupe_tonalite_ou_bruit_selon_les_bits() {
+fn mixer_cuts_tone_or_noise_according_to_the_bits() {
     let mut chip = Ym2149::new();
     write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F);
-    // Tonalité et bruit tous deux désactivés (bits 0 et 3 à 1) : le canal
-    // doit rester au niveau plein (portillon "activé" = 1 en interne).
+    // Both tone and noise disabled (bits 0 and 3 set to 1): the channel
+    // must stay at full level (the internal "gate" is "open" = 1).
     write_reg(&mut chip, reg::MIXER, 0b0000_1001);
     chip.tick(100);
-    assert_eq!(chip.channel_level(0), 31, "tone+bruit coupés : porte toujours ouverte");
+    assert_eq!(chip.channel_level(0), 31, "tone+noise cut: gate always open");
 }
 
 #[test]
-fn bruit_produit_une_sequence_non_triviale() {
+fn noise_produces_a_non_trivial_sequence() {
     let mut chip = Ym2149::new();
     write_reg(&mut chip, reg::NOISE_PERIOD, 1);
-    write_reg(&mut chip, reg::MIXER, 0b0000_0001); // tone A coupée, bruit A actif
+    write_reg(&mut chip, reg::MIXER, 0b0000_0001); // tone A cut, noise A active
     write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F);
 
     let mut seen_zero = false;
@@ -121,56 +121,56 @@ fn bruit_produit_une_sequence_non_triviale() {
             seen_nonzero = true;
         }
     }
-    assert!(seen_zero && seen_nonzero, "le LFSR doit produire les deux niveaux");
+    assert!(seen_zero && seen_nonzero, "the LFSR must produce both levels");
 }
 
-/// Mixer avec tonalité ET bruit désactivés (portes toujours ouvertes) pour
-/// isoler le niveau d'amplitude/enveloppe du canal A dans les tests.
+/// Mixer with both tone AND noise disabled (gates always open) to
+/// isolate channel A's amplitude/envelope level in tests.
 const MIXER_GATES_OPEN_A: u8 = 0b0000_1001;
 
 #[test]
-fn enveloppe_mode_active_sur_bit4_amplitude() {
+fn envelope_mode_activated_via_amplitude_bit4() {
     let mut chip = Ym2149::new();
     write_reg(&mut chip, reg::MIXER, MIXER_GATES_OPEN_A);
     write_reg(&mut chip, reg::ENVELOPE_FINE, 1);
     write_reg(&mut chip, reg::ENVELOPE_COARSE, 0);
-    // Forme "attack seul, continue=1, alternate=0, hold=0" -> dents de scie montantes
+    // Shape "attack only, continue=1, alternate=0, hold=0" -> rising sawtooth
     write_reg(&mut chip, reg::ENVELOPE_SHAPE, 0b1100);
-    write_reg(&mut chip, reg::AMPLITUDE_A, 0x10); // bit4 = mode enveloppe
+    write_reg(&mut chip, reg::AMPLITUDE_A, 0x10); // bit4 = envelope mode
 
-    // Juste après le reset (écriture du registre de forme), le niveau doit
-    // être au minimum de la rampe montante.
+    // Right after the reset (writing the shape register), the level must
+    // be at the minimum of the rising ramp.
     assert_eq!(chip.channel_level(0), 0);
 }
 
 #[test]
-fn enveloppe_attack_sans_continue_se_fige_a_31_apres_une_rampe() {
+fn envelope_attack_without_continue_freezes_at_31_after_one_ramp() {
     let mut chip = Ym2149::new();
     write_reg(&mut chip, reg::MIXER, MIXER_GATES_OPEN_A);
     write_reg(&mut chip, reg::ENVELOPE_FINE, 1);
     write_reg(&mut chip, reg::ENVELOPE_COARSE, 0);
-    // continue=0, attack=1 : une seule rampe montante puis fige à 31 (max).
+    // continue=0, attack=1: a single rising ramp then freezes at 31 (max).
     write_reg(&mut chip, reg::ENVELOPE_SHAPE, 0b0100);
     write_reg(&mut chip, reg::AMPLITUDE_A, 0x10);
 
-    // 32 paliers pour compléter la rampe (période=1 → 8 cycles puce par
-    // palier, le compteur d'enveloppe avançant à clock/8 comme celui de
-    // tonalité, chaque cycle puce = 4 cycles CPU).
+    // 32 steps to complete the ramp (period=1 -> 8 chip cycles per
+    // step, the envelope counter running at clock/8 like the tone
+    // counter, each chip cycle = 4 CPU cycles).
     for _ in 0..(32 * 8) {
         chip.tick(4);
     }
-    // L'enveloppe a sa propre échelle 0-31 (résolution double de l'ampli
-    // fixe 0-15), renvoyée telle quelle par channel_level en mode
-    // enveloppe (pas de ×2 ici, contrairement au mode ampli fixe).
-    assert_eq!(chip.channel_level(0), 31, "figé au maximum de la rampe");
+    // The envelope has its own 0-31 scale (double the resolution of the
+    // fixed 0-15 amplitude), returned as-is by channel_level in envelope
+    // mode (no x2 here, unlike fixed amplitude mode).
+    assert_eq!(chip.channel_level(0), 31, "frozen at the top of the ramp");
 
-    // Continuer à avancer ne doit plus rien changer.
+    // Advancing further must no longer change anything.
     chip.tick(400);
     assert_eq!(chip.channel_level(0), 31);
 }
 
 #[test]
-fn ecrire_le_registre_de_forme_relance_l_enveloppe() {
+fn writing_the_shape_register_restarts_the_envelope() {
     let mut chip = Ym2149::new();
     write_reg(&mut chip, reg::MIXER, MIXER_GATES_OPEN_A);
     write_reg(&mut chip, reg::ENVELOPE_FINE, 1);
@@ -179,70 +179,70 @@ fn ecrire_le_registre_de_forme_relance_l_enveloppe() {
     for _ in 0..10 {
         chip.tick(4);
     }
-    // Réécrire (même valeur ou non) doit repartir de zéro.
+    // Rewriting (same value or not) must restart from zero.
     write_reg(&mut chip, reg::ENVELOPE_SHAPE, 0b0100);
     write_reg(&mut chip, reg::AMPLITUDE_A, 0x10);
-    assert_eq!(chip.channel_level(0), 0, "l'enveloppe doit être repartie de zéro");
+    assert_eq!(chip.channel_level(0), 0, "the envelope must have restarted from zero");
 }
 
 #[test]
-fn port_a_bascule_entre_entree_et_sortie_selon_ddr() {
+fn port_a_toggles_between_input_and_output_according_to_ddr() {
     let mut chip = Ym2149::new();
-    // DDR port A = entrée (bit6 de MIXER = 0).
+    // Port A DDR = input (bit6 of MIXER = 0).
     write_reg(&mut chip, reg::MIXER, 0);
     chip.set_port_a_input(0x42);
     assert_eq!(read_reg(&mut chip, reg::IO_PORT_A), 0x42);
 
-    // Bascule en sortie (bit6 = 1) : la lecture reflète maintenant le latch
-    // écrit, pas l'entrée externe.
+    // Switches to output (bit6 = 1): the read now reflects the written
+    // latch, not the external input.
     write_reg(&mut chip, reg::MIXER, 0b0100_0000);
     write_reg(&mut chip, reg::IO_PORT_A, 0x99);
     assert_eq!(read_reg(&mut chip, reg::IO_PORT_A), 0x99);
 }
 
-// --- Mixage non-linéaire 3 canaux (façon Hatari) --------------------------
+// --- Non-linear 3-channel mixing (Hatari-style) --------------------------
 
 #[test]
-fn silence_total_donne_un_niveau_quasi_nul() {
+fn total_silence_gives_a_near_zero_level() {
     assert!(mix_channels_model([0.0, 0.0, 0.0]) < 0.01);
 }
 
 #[test]
-fn trois_canaux_au_maximum_donnent_le_niveau_maximum() {
+fn three_channels_at_maximum_give_the_maximum_level() {
     let level = mix_channels_model([31.0, 31.0, 31.0]);
-    assert!((level - 65535.0).abs() < 1.0, "attendu ~65535, obtenu {level}");
+    assert!((level - 65535.0).abs() < 1.0, "expected ~65535, got {level}");
 }
 
 #[test]
-fn le_mixage_sature_au_lieu_de_sommer_lineairement() {
-    // Propriété centrale du modèle non-linéaire : combiner 3 canaux à
-    // pleine amplitude ne doit PAS donner 3× le niveau d'un seul canal
-    // (le DAC réel sature) — une simple somme linéaire donnerait
-    // exactement 3× par construction.
+fn mixing_saturates_instead_of_summing_linearly() {
+    // Central property of the non-linear model: combining 3 channels at
+    // full amplitude must NOT give 3x the level of a single channel
+    // (the real DAC saturates) — a plain linear sum would give exactly
+    // 3x by construction.
     let one_channel = mix_channels_model([31.0, 0.0, 0.0]);
     let three_channels = mix_channels_model([31.0, 31.0, 31.0]);
     assert!(
         three_channels < one_channel * 3.0,
-        "3 canaux ({three_channels}) devrait saturer sous 3× 1 canal ({})",
+        "3 channels ({three_channels}) should saturate below 3x 1 channel ({})",
         one_channel * 3.0
     );
-    // Toujours strictement croissant (plus de canaux actifs = plus fort),
-    // juste pas proportionnellement.
+    // Still strictly increasing (more active channels = louder),
+    // just not proportionally.
     assert!(three_channels > one_channel);
 }
 
 #[test]
-fn le_mixage_est_croissant_avec_le_niveau_d_un_canal() {
+fn mixing_increases_with_a_channels_level() {
     let low = mix_channels_model([5.0, 0.0, 0.0]);
     let high = mix_channels_model([25.0, 0.0, 0.0]);
-    assert!(high > low, "un niveau de canal plus élevé doit donner une sortie plus forte");
+    assert!(high > low, "a higher channel level must give a louder output");
 }
 
 #[test]
-fn interpolation_fractionnaire_reste_entre_les_niveaux_entiers_voisins() {
-    // `take_averaged_levels` renvoie des niveaux FRACTIONNAIRES (moyenne
-    // temporelle) — le modèle doit rester monotone/borné pour une valeur
-    // intermédiaire, pas juste pour des entiers.
+fn fractional_interpolation_stays_between_neighboring_integer_levels() {
+    // `take_averaged_levels` returns FRACTIONAL levels (time average) —
+    // the model must remain monotonic/bounded for an intermediate value,
+    // not just for integers.
     let at_10 = mix_channels_model([10.0, 0.0, 0.0]);
     let at_10_5 = mix_channels_model([10.5, 0.0, 0.0]);
     let at_11 = mix_channels_model([11.0, 0.0, 0.0]);

@@ -1,14 +1,14 @@
-//! Puces du système Atari ST/STE : MFP 68901, GLUE, ACIA (clavier/MIDI),
-//! YM2149 (PSG), Shifter (vidéo), WD1772 (disquette), Blitter (STE), lecteur
-//! `.stx`.
+//! Atari ST/STE system chips: MFP 68901, GLUE, ACIA (keyboard/MIDI),
+//! YM2149 (PSG), Shifter (video), WD1772 (floppy disk), Blitter (STE),
+//! `.stx` reader.
 //!
-//! Ce module ne fait pas partie du CPU MC68000 lui-même : il rassemble les
-//! puces d'un système particulier, que l'appelant câble dans son
-//! implémentation de [`crate::Bus`] (mapping mémoire, génération d'IPL…) —
-//! voir [`crate::systems::atari_st`]. Compilé uniquement avec la feature
-//! Cargo `atari-st` (aucune activée par défaut), pour que le cœur 68000
-//! seul reste utilisable sans rapatrier ni compiler de code spécifique à
-//! un système particulier.
+//! This module is not part of the MC68000 CPU itself: it gathers the chips
+//! of a particular system, which the caller wires into its
+//! [`crate::Bus`] implementation (memory map, IPL generation…) — see
+//! [`crate::systems::atari_st`]. Compiled only with the `atari-st` Cargo
+//! feature (none enabled by default), so that the 68000 core alone remains
+//! usable without pulling in or compiling code specific to a particular
+//! system.
 
 pub mod acia;
 pub mod blitter;

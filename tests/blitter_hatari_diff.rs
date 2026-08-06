@@ -1,26 +1,25 @@
 #![cfg(feature = "atari-st")]
-//! Test différentiel : compare `Blitter::execute` à un portage direct, en
-//! Rust, de la machine à états de Hatari (`src/blitter.c`,
+//! Differential test: compares `Blitter::execute` to a direct Rust port
+//! of Hatari's state machine (`src/blitter.c`,
 //! `Blitter_ProcessWord`/`Blitter_SourceShift`/`Blitter_SourceFetch`/
-//! `Blitter_LOP_*`), sur un large balayage de configurations (HOP, OP,
-//! skew, FXSR, NFSR, direction, X_COUNT/Y_COUNT, masques).
+//! `Blitter_LOP_*`), over a wide sweep of configurations (HOP, OP,
+//! skew, FXSR, NFSR, direction, X_COUNT/Y_COUNT, masks).
 //!
-//! Contrairement aux tests unitaires de `tests/blitter.rs` (qui vérifient
-//! des propriétés isolées), celui-ci compare directement, octet par octet,
-//! la mémoire écrite par les deux implémentations pour un très grand
-//! nombre de combinaisons — objectif : trouver une divergence qu'une
-//! relecture manuelle du code n'a pas révélée (corruption encore observée
-//! en pratique sur TOS 1.62/STE malgré une relecture croisée exhaustive du
-//! code face à `hatari_blitter.c`).
+//! Unlike the unit tests in `tests/blitter.rs` (which check isolated
+//! properties), this one directly compares, byte by byte, the memory
+//! written by both implementations for a very large number of
+//! combinations — goal: find a divergence that manual code review
+//! did not reveal (corruption still observed in practice on
+//! TOS 1.62/STE despite an exhaustive cross-review of the code against
+//! `hatari_blitter.c`).
 
 use rust68::peripherals::atari_st::blitter::{Blitter, reg};
 use rust68::Bus;
 
-/// Bus de test léger (par opposition à `FlatBus`, qui alloue 16 Mo — bien
-/// trop coûteux répété sur plusieurs milliers de configurations dans le
-/// balayage ci-dessous). Adressage modulo la taille du tampon : suffisant
-/// puisque toutes les adresses utilisées restent dans une plage étroite
-/// autour de `SRC_BASE`/`DST_BASE`.
+/// Lightweight test bus (as opposed to `FlatBus`, which allocates 16 MB —
+/// far too costly repeated over several thousand configurations in the
+/// sweep below). Addressing modulo the buffer size: sufficient since all
+/// addresses used stay within a narrow range around `SRC_BASE`/`DST_BASE`.
 struct SmallBus {
     mem: Vec<u8>,
 }
@@ -55,8 +54,8 @@ fn write_long(bl: &mut Blitter, offset: u32, value: u32) {
 struct Cfg {
     hop: u8,
     op: u8,
-    skew_reg: u8, // octet brut : bit7=FXSR, bit6=NFSR, bits3-0=décalage
-    control_line: u8, // bits 3-0 du CONTROL initial (numéro de ligne halftone)
+    skew_reg: u8, // raw byte: bit7=FXSR, bit6=NFSR, bits3-0=shift
+    control_line: u8, // bits 3-0 of the initial CONTROL (halftone line number)
     smudge: bool,
     src_x_inc: i16,
     src_y_inc: i16,
@@ -69,9 +68,10 @@ struct Cfg {
 }
 
 fn apply_op_reference(op: u8, s: u16, d: u16) -> u16 {
-    // Traduction directe des fonctions Blitter_LOP_0..F de hatari_blitter.c
-    // (pas la formule "bit-index 3-((s<<1)|d)" utilisée par notre
-    // implémentation — vérification indépendante des deux approches).
+    // Direct translation of the Blitter_LOP_0..F functions from
+    // hatari_blitter.c (not the "bit-index 3-((s<<1)|d)" formula used
+    // by our implementation — independent verification of both
+    // approaches).
     match op & 0x0F {
         0x0 => 0,
         0x1 => s & d,
@@ -93,21 +93,21 @@ fn apply_op_reference(op: u8, s: u16, d: u16) -> u16 {
     }
 }
 
-/// Portage direct de la machine à états de `Blitter_ProcessWord` (Hatari
-/// `src/blitter.c`). Traite le blit dans son intégralité (equivalent à
-/// enchaîner tous les appels non-HOG jusqu'à la fin, ce qui ne change rien
-/// au résultat final puisque notre propre modèle est de toute façon
-/// synchrone/instantané).
+/// Direct port of the `Blitter_ProcessWord` state machine (Hatari
+/// `src/blitter.c`). Processes the blit in its entirety (equivalent to
+/// chaining all non-HOG calls through to the end, which does not change
+/// the final result since our own model is synchronous/instantaneous
+/// anyway).
 fn hatari_reference_execute(cfg: &Cfg, src_addr0: u32, dst_addr0: u32, bus: &mut impl Bus) {
     let mut buffer = 0u32;
     hatari_reference_execute_chained(cfg, src_addr0, dst_addr0, bus, &mut buffer);
 }
 
-/// Comme [`hatari_reference_execute`], mais `buffer` (le registre à
-/// décalage source) est fourni par l'appelant et mis à jour en place —
-/// permet de tester un ENCHAÎNEMENT de blits logiquement séparés qui
-/// partagent le même registre matériel persistant (voir
-/// `sequence_chainee_avec_nfsr_et_skew`), plutôt qu'un unique blit isolé.
+/// Like [`hatari_reference_execute`], but `buffer` (the source shift
+/// register) is supplied by the caller and updated in place — allows
+/// testing a CHAIN of logically separate blits that share the same
+/// persistent hardware register (see `chained_sequence_with_nfsr_and_skew`),
+/// rather than a single isolated blit.
 fn hatari_reference_execute_chained(
     cfg: &Cfg,
     src_addr0: u32,
@@ -247,9 +247,9 @@ const SRC_BASE: u32 = 0x2000;
 const DST_BASE: u32 = 0x5000;
 
 fn run_case(cfg: Cfg) -> Option<String> {
-    // Mémoire source : motif varié (pas uniforme) pour que toute erreur de
-    // décalage/lecture se voie. Mémoire destination : autre motif varié
-    // (pas 0 partout) pour exercer réellement les masques/OP dépendant de D.
+    // Source memory: varied pattern (not uniform) so that any shift/read
+    // error is visible. Destination memory: another varied pattern (not
+    // all zero) to genuinely exercise masks/OPs that depend on D.
     let make_bus = || {
         let mut bus = SmallBus::new();
         for i in 0..64u32 {
@@ -264,7 +264,7 @@ fn run_case(cfg: Cfg) -> Option<String> {
     let mut bus_real = make_bus();
     let mut bus_ref = make_bus();
 
-    // --- Notre implémentation, via l'API registre publique ---
+    // --- Our implementation, via the public register API ---
     let mut bl = Blitter::new();
     bl.write(reg::HOP, cfg.hop);
     bl.write(reg::OP, cfg.op);
@@ -283,13 +283,13 @@ fn run_case(cfg: Cfg) -> Option<String> {
     write_long(&mut bl, reg::SRC_ADDR, SRC_BASE);
     write_long(&mut bl, reg::DST_ADDR, DST_BASE);
     write_word(&mut bl, reg::X_COUNT, cfg.x_count);
-    write_word(&mut bl, reg::Y_COUNT, cfg.y_count); // arme le blit (dernier registre écrit)
+    write_word(&mut bl, reg::Y_COUNT, cfg.y_count); // arms the blit (last register written)
     bl.execute(&mut bus_real);
 
-    // --- Référence Hatari ---
+    // --- Hatari reference ---
     hatari_reference_execute(&cfg, SRC_BASE, DST_BASE, &mut bus_ref);
 
-    // --- Comparaison de toute la zone mémoire potentiellement touchée ---
+    // --- Comparison of the whole potentially touched memory area ---
     let span = 64 * 2;
     for base in [SRC_BASE, DST_BASE] {
         for off in 0..span {
@@ -306,7 +306,7 @@ fn run_case(cfg: Cfg) -> Option<String> {
 }
 
 #[test]
-fn balayage_differentiel_vs_hatari() {
+fn differential_sweep_vs_hatari() {
     let halftone_uniform_ffff = [0xFFFFu16; 16];
     let mut halftone_checker = [0u16; 16];
     for (i, h) in halftone_checker.iter_mut().enumerate() {
@@ -351,7 +351,7 @@ fn balayage_differentiel_vs_hatari() {
                                         failures.push(msg);
                                         if failures.len() >= 15 {
                                             panic!(
-                                                "{} divergence(s) sur {total} cas testés, ex.:\n{}",
+                                                "{} divergence(s) out of {total} cases tested, e.g.:\n{}",
                                                 failures.len(),
                                                 failures.join("\n")
                                             );
@@ -368,23 +368,22 @@ fn balayage_differentiel_vs_hatari() {
 
     assert!(
         failures.is_empty(),
-        "{} divergence(s) sur {total} cas testés :\n{}",
+        "{} divergence(s) out of {total} cases tested:\n{}",
         failures.len(),
         failures.join("\n")
     );
 }
 
-/// Rejoue une SÉQUENCE de blits étroits (X_COUNT=1..3) NFSR+skew non nul,
-/// direction négative — motif exact observé en pratique lors du dessin
-/// d'une icône ou d'un glyphe colonne par colonne sur TOS 1.62/STE (voir
-/// commentaire de `Blitter::execute` sur la persistance de `buffer`) — sur
-/// la MÊME instance de `Blitter` (donc `buffer` persiste réellement entre
-/// les appels, contrairement à `balayage_differentiel_vs_hatari` qui teste
-/// chaque configuration isolément avec un `Blitter::new()` frais). Objectif
-/// : trouver une divergence spécifique à l'ENCHAÎNEMENT que le balayage à
-/// blits isolés ne peut pas révéler.
+/// Replays a SEQUENCE of narrow blits (X_COUNT=1..3) with NFSR+nonzero
+/// skew, negative direction — the exact pattern observed in practice when
+/// drawing an icon or a glyph column by column on TOS 1.62/STE (see the
+/// comment on `Blitter::execute` about `buffer` persistence) — on the
+/// SAME `Blitter` instance (so `buffer` genuinely persists between calls,
+/// unlike `differential_sweep_vs_hatari` which tests each configuration
+/// in isolation with a fresh `Blitter::new()`). Goal: find a divergence
+/// specific to CHAINING that the isolated-blit sweep cannot reveal.
 #[test]
-fn sequence_chainee_avec_nfsr_et_skew() {
+fn chained_sequence_with_nfsr_and_skew() {
     let halftone = [0xFFFFu16; 16];
     let base_cfg = Cfg {
         hop: 2,
@@ -396,21 +395,21 @@ fn sequence_chainee_avec_nfsr_et_skew() {
         src_y_inc: -2,
         dst_x_inc: -8,
         dst_y_inc: -144,
-        x_count: 0, // écrasé par appel
-        y_count: 0, // écrasé par appel
+        x_count: 0, // overwritten per call
+        y_count: 0, // overwritten per call
         endmask: [0xF000, 0xFFFF, 0x0FFF],
         halftone,
     };
 
-    // Rejoue exactement les X_COUNT observés dans la trace réelle
-    // (3,2,1,3,2,1,3) pour un des quatre plans de bits de l'icône.
+    // Replays exactly the X_COUNT values observed in the real trace
+    // (3,2,1,3,2,1,3) for one of the icon's four bitplanes.
     let x_counts = [3u16, 2, 1, 3, 2, 1, 3];
 
     let mut bl = Blitter::new();
     let mut bus_real = SmallBus::new();
     let mut bus_ref = SmallBus::new();
-    // Mémoire source variée (pas uniforme) pour exercer réellement le
-    // registre à décalage.
+    // Varied source memory (not uniform) to genuinely exercise the
+    // shift register.
     for i in 0..128u32 {
         let sv = (0x1357u32.wrapping_mul(i + 1) & 0xFFFF) as u16;
         bus_real.write16(SRC_BASE + i * 2, sv);
@@ -428,10 +427,11 @@ fn sequence_chainee_avec_nfsr_et_skew() {
         let cfg = Cfg {
             x_count: xc,
             y_count: 4,
-            // Motif réel observé : le tout premier appel de la chaîne
-            // utilise SKEW=0 (pas de NFSR), les suivants SKEW=0x44
-            // (NFSR=1, décalage=4) — le buffer persistant hérite donc
-            // d'un état amorcé SANS décalage avant de commencer à décaler.
+            // Real pattern observed: the very first call of the chain
+            // uses SKEW=0 (no NFSR), subsequent ones use SKEW=0x44
+            // (NFSR=1, shift=4) — the persistent buffer therefore
+            // inherits a state primed WITHOUT a shift before starting
+            // to shift.
             skew_reg: if call_idx == 0 { 0x00 } else { 0x44 },
             ..base_cfg
         };
@@ -461,13 +461,13 @@ fn sequence_chainee_avec_nfsr_et_skew() {
             let (vr, vh) = (bus_real.read8(a), bus_ref.read8(a));
             if vr != vh {
                 panic!(
-                    "divergence après appel #{call_idx} (x_count={xc}) addr={a:#06x} rust68={vr:#04x} hatari_ref={vh:#04x}"
+                    "divergence after call #{call_idx} (x_count={xc}) addr={a:#06x} rust68={vr:#04x} hatari_ref={vh:#04x}"
                 );
             }
         }
 
-        // Prépare le prochain appel de la séquence : adresses décroissantes
-        // (direction négative), comme dans la trace réelle.
+        // Prepares the next call in the sequence: decreasing addresses
+        // (negative direction), as in the real trace.
         src_addr = src_addr.wrapping_sub(16);
         dst_addr = dst_addr.wrapping_sub(16);
     }

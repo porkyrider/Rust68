@@ -1,39 +1,37 @@
-//! DMA Sound (STE) — lecture d'échantillons PCM 8 bits signés depuis la RAM,
-//! au rythme d'une des 4 fréquences matérielles (6258/12517/25033/50066 Hz),
-//! en mono ou stéréo.
+//! DMA Sound (STE) — plays signed 8-bit PCM samples from RAM, at one of 4
+//! hardware sample rates (6258/12517/25033/50066 Hz), mono or stereo.
 //!
-//! Reproduit le comportement fonctionnel de Hatari (`dmaSnd.c`), simplifié :
-//! pas de FIFO 8 octets — seuls l'avancement du compteur de trame, la
-//! boucle/arrêt de fin de trame, et la conversion de fréquence vers le
-//! taux de sortie hôte sont modélisés. Le filtre passe-bas/LMC1992
-//! (bass/treble) EST modélisé, mais côté `Microwire` (voir sa doc de
-//! module), en aval du mixage PSG+DMA Sound — pas ici, qui ne fournit que
-//! les échantillons PCM bruts.
+//! Reproduces Hatari's functional behavior (`dmaSnd.c`), simplified: no 8-
+//! byte FIFO — only frame counter advancement, end-of-frame loop/stop, and
+//! frequency conversion to the host output rate are modeled. The low-pass
+//! LMC1992 filter (bass/treble) IS modeled, but on the `Microwire` side
+//! (see its module doc), downstream of the PSG+DMA Sound mix — not here,
+//! which only supplies raw PCM samples.
 //!
-//! **FIFO 8 octets, délibérément pas modélisé** : sur silicium réel, la
-//! RAM est lue par blocs de 8 octets une fois par HBL (pas en continu au
-//! rythme de la fréquence d'échantillonnage) — Hatari le modélise
-//! fidèlement (`DmaSnd_FIFO_Refill`/`DmaSnd_FIFO_PullByte`, `dmaSnd.c`) car
-//! cette granularité HBL a un effet audible réel sur les rares logiciels
-//! qui réécrivent le tampon d'échantillons PENDANT la lecture (Hatari cite
-//! nommément "Mental Hangover" et "Power Up Plus") : selon que la RAM est
-//! relue au rythme HBL ou au moment exact de chaque échantillon consommé
-//! (ce que fait ce module), l'écriture en direct devient audible avec un
-//! décalage différent (jusqu'à ~1 HBL). Effet réel mais étroit (aucun cas
-//! connu dans ce projet aujourd'hui) ; Steem SSE lui-même ne modélise pas
-//! de FIFO pour le DMA Sound STE (son "FIFO" à lui est celui du contrôleur
-//! DMA disquette/ACSI, un périphérique différent) — à reconsidérer si un
-//! jeu/démo concret révèle un problème, pas anticipé sans cas connu.
+//! **8-byte FIFO, deliberately not modeled**: on real silicon, RAM is read
+//! in 8-byte blocks once per HBL (not continuously at the sample-rate
+//! pace) — Hatari models this faithfully (`DmaSnd_FIFO_Refill`/
+//! `DmaSnd_FIFO_PullByte`, `dmaSnd.c`) because this HBL granularity has a
+//! real audible effect on the rare pieces of software that rewrite the
+//! sample buffer WHILE it's playing (Hatari names "Mental Hangover" and
+//! "Power Up Plus" specifically): depending on whether RAM is re-read at
+//! the HBL rate or at the exact moment each sample is consumed (what this
+//! module does), the live write becomes audible with a different offset
+//! (up to ~1 HBL). A real but narrow effect (no known case in this
+//! project today); Steem SSE itself doesn't model a FIFO for STE DMA
+//! Sound either (its own "FIFO" is that of the floppy/ACSI DMA
+//! controller, a different peripheral) — to be reconsidered if a concrete
+//! game/demo reveals an issue, not anticipated without a known case.
 //!
-//! ## Registres (adresses relatives à `STE_DMA_SOUND_BASE` = `0xFF8900`)
-//! Voir [`reg`]. Le Microwire (`$FF8920`/`$FF8922`/`$FF8924`) est un
-//! périphérique séparé (LMC1992), géré ailleurs (voir
-//! `AtariSt::STE_MICROWIRE_DATA`) — pas ici.
+//! ## Registers (addresses relative to `STE_DMA_SOUND_BASE` = `0xFF8900`)
+//! See [`reg`]. The Microwire (`$FF8920`/`$FF8922`/`$FF8924`) is a
+//! separate peripheral (LMC1992), handled elsewhere (see
+//! `AtariSt::STE_MICROWIRE_DATA`) — not here.
 
-/// Offsets des registres, relatifs à `STE_DMA_SOUND_BASE`.
+/// Register offsets, relative to `STE_DMA_SOUND_BASE`.
 pub mod reg {
-    /// `$FF8900`/`$FF8901` : contrôle DMA (mot, seul l'octet bas compte
-    /// réellement sur silicium réel — bit0=lecture en cours, bit1=boucle).
+    /// `$FF8900`/`$FF8901`: DMA control (word, only the low byte actually
+    /// matters on real silicon — bit0=play in progress, bit1=loop).
     pub const CONTROL_LOW: u32 = 0x01;
     pub const FRAME_START_HIGH: u32 = 0x03;
     pub const FRAME_START_MID: u32 = 0x05;
@@ -44,8 +42,8 @@ pub mod reg {
     pub const FRAME_END_HIGH: u32 = 0x0F;
     pub const FRAME_END_MID: u32 = 0x11;
     pub const FRAME_END_LOW: u32 = 0x13;
-    /// `$FF8921` : mode son (bit7 = mono si posé, sinon stéréo ; bits1-0 =
-    /// fréquence, voir [`super::SAMPLE_RATES_HZ`]).
+    /// `$FF8921`: sound mode (bit7 = mono if set, otherwise stereo;
+    /// bits1-0 = frequency, see [`super::SAMPLE_RATES_HZ`]).
     pub const SOUND_MODE: u32 = 0x21;
 }
 
@@ -53,45 +51,44 @@ const CTRL_PLAY: u8 = 0x01;
 const CTRL_LOOP: u8 = 0x02;
 const MODE_MONO: u8 = 0x80;
 
-/// Fréquences d'échantillonnage matérielles (Hz), indexées par les bits 1-0
-/// de [`reg::SOUND_MODE`] — 8 010 613 Hz / 160, divisé par 8/4/2/1.
-/// Confirmé par la communauté Atari (voir aussi `DmaSndSampleRates` chez
-/// Hatari, `dmaSnd.c`).
+/// Hardware sample rates (Hz), indexed by bits 1-0 of [`reg::SOUND_MODE`]
+/// — 8,010,613 Hz / 160, divided by 8/4/2/1. Confirmed by the Atari
+/// community (see also Hatari's `DmaSndSampleRates`, `dmaSnd.c`).
 const SAMPLE_RATES_HZ: [u32; 4] = [6258, 12517, 25033, 50066];
 
-/// État complet du contrôleur DMA Sound (STE).
+/// Full state of the DMA Sound (STE) controller.
 #[derive(Debug, Clone)]
 pub struct DmaSound {
     control: u8,
     sound_mode: u8,
     frame_start: u32,
     frame_end: u32,
-    /// Adresse courante de lecture — avance à chaque octet consommé,
-    /// indépendamment du rythme de génération audio (voir
+    /// Current playback address — advances with each byte consumed,
+    /// independently of the audio generation rate (see
     /// [`Self::next_sample`]).
     frame_counter: u32,
-    /// Accumulateur de conversion de fréquence, format fixe 32.32 (comme
-    /// Hatari) : `(fréquence_dma << 32) / fréquence_hôte` ajouté à chaque
-    /// échantillon de sortie généré ; sa partie entière indique combien de
-    /// nouveaux octets consommer avant le prochain échantillon de sortie.
+    /// Frequency conversion accumulator, 32.32 fixed-point format (like
+    /// Hatari): `(dma_frequency << 32) / host_frequency` added for each
+    /// output sample generated; its integer part indicates how many new
+    /// bytes to consume before the next output sample.
     freq_acc: u64,
-    /// Dernier octet lu pour chaque canal (tenu entre deux avancées de
-    /// l'accumulateur — c'est ce qui est effectivement mixé en sortie).
+    /// Last byte read for each channel (held between two accumulator
+    /// advances — this is what's actually mixed into the output).
     held_left: i8,
     held_right: i8,
-    /// Force une lecture immédiate au tout prochain [`Self::next_sample`],
-    /// sans attendre que l'accumulateur de fréquence ait franchi un cran —
-    /// sinon, quand la fréquence DMA est inférieure à celle de sortie hôte
-    /// (ex: 6258 Hz vers 44100 Hz), les tout premiers échantillons de
-    /// sortie resteraient à 0 (silence) au lieu du premier octet réel, le
-    /// temps que l'accumulateur atteigne son premier cran.
+    /// Forces an immediate read on the very next [`Self::next_sample`],
+    /// without waiting for the frequency accumulator to cross a step —
+    /// otherwise, when the DMA frequency is lower than the host output
+    /// frequency (e.g. 6258 Hz to 44100 Hz), the very first output
+    /// samples would stay at 0 (silence) instead of the real first byte,
+    /// until the accumulator reaches its first step.
     just_started: bool,
-    /// Nombre de fronts XSINT survenus depuis le dernier
-    /// [`Self::take_xsint_pulses`] — signal matériel réel câblé sur
-    /// l'entrée de comptage d'événements du Timer A du MFP (voir la doc de
-    /// [`Self::end_of_frame`]), utilisé par certains logiciels (dont la
-    /// cartouche de diagnostic usine STe, test Audio) pour compter les
-    /// bouclages de trame plutôt que de sonder un registre directement.
+    /// Number of XSINT edges that occurred since the last
+    /// [`Self::take_xsint_pulses`] — a real hardware signal wired to the
+    /// MFP's Timer A event-counting input (see the doc of
+    /// [`Self::end_of_frame`]), used by some software (including the STE
+    /// factory diagnostic cartridge's Audio test) to count frame loops
+    /// rather than polling a register directly.
     xsint_pulses: u32,
 }
 
@@ -111,10 +108,9 @@ impl DmaSound {
         }
     }
 
-    /// Retire et renvoie le nombre de fronts XSINT accumulés depuis le
-    /// dernier appel — à appeler une fois par `tick()` du board pour
-    /// relayer chacun vers `Mfp::pulse_ta()` (voir la doc de
-    /// [`Self::end_of_frame`]).
+    /// Removes and returns the number of XSINT edges accumulated since
+    /// the last call — to be called once per board `tick()` to relay each
+    /// one to `Mfp::pulse_ta()` (see the doc of [`Self::end_of_frame`]).
     pub fn take_xsint_pulses(&mut self) -> u32 {
         std::mem::take(&mut self.xsint_pulses)
     }
@@ -131,7 +127,7 @@ impl DmaSound {
         self.control & CTRL_PLAY != 0
     }
 
-    /// Lit le registre logique `offset` (voir [`reg`]).
+    /// Reads the logical register `offset` (see [`reg`]).
     pub fn read(&self, offset: u32) -> u8 {
         match offset {
             reg::CONTROL_LOW => self.control,
@@ -143,7 +139,7 @@ impl DmaSound {
         }
     }
 
-    /// Écrit le registre logique `offset` (voir [`reg`]).
+    /// Writes the logical register `offset` (see [`reg`]).
     pub fn write(&mut self, offset: u32, value: u8) {
         match offset {
             reg::CONTROL_LOW => {
@@ -155,8 +151,8 @@ impl DmaSound {
             }
             reg::FRAME_START_HIGH => self.frame_start = (self.frame_start & 0x00FFFF) | ((value as u32) << 16),
             reg::FRAME_START_MID => self.frame_start = (self.frame_start & 0xFF00FF) | ((value as u32) << 8),
-            // Bit0 câblé à masse : adresses de trame toujours alignées mot,
-            // comme les registres d'adresse du Blitter (voir sa doc).
+            // Bit0 wired to ground: frame addresses always word-aligned,
+            // like the Blitter's address registers (see its doc).
             reg::FRAME_START_LOW => self.frame_start = (self.frame_start & 0xFFFF00) | (value as u32 & 0xFE),
             reg::FRAME_END_HIGH => self.frame_end = (self.frame_end & 0x00FFFF) | ((value as u32) << 16),
             reg::FRAME_END_MID => self.frame_end = (self.frame_end & 0xFF00FF) | ((value as u32) << 8),
@@ -166,10 +162,9 @@ impl DmaSound {
         }
     }
 
-    /// Démarre une nouvelle trame : recopie début/fin dans le compteur de
-    /// lecture. Si début == fin et boucle désactivée, arrête immédiatement
-    /// (comportement vérifié sur silicium réel, voir Hatari
-    /// `DmaSnd_StartNewFrame`).
+    /// Starts a new frame: copies start/end into the playback counter. If
+    /// start == end and looping is disabled, stops immediately (behavior
+    /// verified on real silicon, see Hatari's `DmaSnd_StartNewFrame`).
     fn start_new_frame(&mut self) {
         self.frame_counter = self.frame_start;
         if self.frame_start == self.frame_end && self.control & CTRL_LOOP == 0 {
@@ -179,11 +174,11 @@ impl DmaSound {
         }
     }
 
-    /// Fin de trame atteinte pendant la lecture : boucle (nouvelle trame) ou
-    /// arrête, selon le bit de répétition. Compte toujours comme un front
-    /// XSINT (voir [`Self::take_xsint_pulses`]), même en boucle : sur
-    /// silicium réel, XSINT bascule brièvement à CHAQUE fin de trame, que la
-    /// lecture continue ou s'arrête ensuite.
+    /// End of frame reached during playback: loops (new frame) or stops,
+    /// depending on the repeat bit. Always counts as an XSINT edge (see
+    /// [`Self::take_xsint_pulses`]), even when looping: on real silicon,
+    /// XSINT toggles briefly at EVERY end of frame, whether playback then
+    /// continues or stops.
     fn end_of_frame(&mut self) {
         self.xsint_pulses += 1;
         if self.control & CTRL_LOOP != 0 {
@@ -193,10 +188,10 @@ impl DmaSound {
         }
     }
 
-    /// Consomme un octet à `self.frame_counter` dans `ram`, avance le
-    /// compteur, et gère la fin de trame. Renvoie 0 (silence) si la lecture
-    /// est arrêtée ou l'adresse hors de la RAM installée (silencieux,
-    /// jamais de bus error — accès DMA, voir la doc de
+    /// Consumes a byte at `self.frame_counter` in `ram`, advances the
+    /// counter, and handles end of frame. Returns 0 (silence) if playback
+    /// is stopped or the address is outside installed RAM (silent, never
+    /// a bus error — DMA access, see the doc of
     /// `AtariSt::in_floating_st_ram`).
     fn pull_byte(&mut self, ram: &[u8]) -> i8 {
         if !self.playing() {
@@ -210,11 +205,10 @@ impl DmaSound {
         byte
     }
 
-    /// Génère l'échantillon stéréo suivant (L, R), déjà à `host_rate_hz`
-    /// (conversion de fréquence 32.32 fixe depuis la fréquence DMA en
-    /// cours, voir [`Self::freq_acc`]) — à appeler une fois par échantillon
-    /// de sortie audio, quel que soit l'état de lecture (silence si
-    /// arrêté).
+    /// Generates the next stereo sample (L, R), already at `host_rate_hz`
+    /// (32.32 fixed-point frequency conversion from the current DMA
+    /// frequency, see [`Self::freq_acc`]) — to be called once per audio
+    /// output sample, regardless of playback state (silence if stopped).
     pub fn next_sample(&mut self, ram: &[u8], host_rate_hz: u32) -> (i8, i8) {
         if !self.playing() {
             self.held_left = 0;
@@ -257,7 +251,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demarre_arrete_immediatement_si_debut_egale_fin_sans_boucle() {
+    fn stops_immediately_when_start_equals_end_without_loop() {
         let mut dma = DmaSound::new();
         dma.write(reg::FRAME_START_HIGH, 0x00);
         dma.write(reg::FRAME_START_MID, 0x10);
@@ -265,20 +259,20 @@ mod tests {
         dma.write(reg::FRAME_END_HIGH, 0x00);
         dma.write(reg::FRAME_END_MID, 0x10);
         dma.write(reg::FRAME_END_LOW, 0x00);
-        dma.write(reg::CONTROL_LOW, 0x01); // PLAY, pas de boucle
-        assert!(!dma.playing(), "début == fin sans boucle : arrêt immédiat");
+        dma.write(reg::CONTROL_LOW, 0x01); // PLAY, no loop
+        assert!(!dma.playing(), "start == end without loop: immediate stop");
     }
 
     #[test]
-    fn lit_des_echantillons_mono_et_boucle() {
+    fn reads_mono_samples_and_loops() {
         let ram = vec![0x10, 0x20, 0x30, 0x40, 0x00, 0x00, 0x00, 0x00];
         let mut dma = DmaSound::new();
         dma.write(reg::FRAME_START_LOW, 0x00);
-        dma.write(reg::FRAME_END_LOW, 0x04); // 4 octets : 0x10,0x20,0x30,0x40
+        dma.write(reg::FRAME_END_LOW, 0x04); // 4 bytes: 0x10,0x20,0x30,0x40
         dma.write(reg::SOUND_MODE, 0x83); // mono, 50066 Hz (bits1-0=11)
         dma.write(reg::CONTROL_LOW, 0x03); // PLAY + LOOP
 
-        // host_rate == dma_rate : un octet consommé par échantillon de sortie.
+        // host_rate == dma_rate: one byte consumed per output sample.
         let (l0, r0) = dma.next_sample(&ram, 50066);
         assert_eq!((l0, r0), (0x10, 0x10));
         let (l1, _) = dma.next_sample(&ram, 50066);
@@ -287,24 +281,24 @@ mod tests {
         assert_eq!(l2, 0x30);
         let (l3, _) = dma.next_sample(&ram, 50066);
         assert_eq!(l3, 0x40);
-        // Fin de trame atteinte après le 4e octet -> boucle, repart à 0x10.
+        // End of frame reached after the 4th byte -> loops, restarts at 0x10.
         let (l4, _) = dma.next_sample(&ram, 50066);
         assert_eq!(l4, 0x10);
-        assert!(dma.playing(), "boucle active : ne doit jamais s'arrêter");
+        assert!(dma.playing(), "loop active: must never stop");
     }
 
     #[test]
-    fn arrete_a_la_fin_de_trame_sans_boucle() {
+    fn stops_at_end_of_frame_without_loop() {
         let ram = vec![0x11, 0x22];
         let mut dma = DmaSound::new();
         dma.write(reg::FRAME_START_LOW, 0x00);
         dma.write(reg::FRAME_END_LOW, 0x02);
         dma.write(reg::SOUND_MODE, 0x83); // mono, 50066 Hz
-        dma.write(reg::CONTROL_LOW, 0x01); // PLAY, pas de boucle
+        dma.write(reg::CONTROL_LOW, 0x01); // PLAY, no loop
 
         assert_eq!(dma.next_sample(&ram, 50066).0, 0x11);
         assert_eq!(dma.next_sample(&ram, 50066).0, 0x22);
-        assert!(!dma.playing(), "fin de trame sans boucle : arrêt");
-        assert_eq!(dma.next_sample(&ram, 50066), (0, 0), "silence une fois arrêté");
+        assert!(!dma.playing(), "end of frame without loop: stops");
+        assert_eq!(dma.next_sample(&ram, 50066), (0, 0), "silence once stopped");
     }
 }

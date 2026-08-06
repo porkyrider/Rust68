@@ -1,11 +1,11 @@
-//! Tests unitaires du mode trace (bit T du SR, `Cpu::trace_pending` /
+//! Unit tests for trace mode (the T bit of the SR, `Cpu::trace_pending` /
 //! `Cpu::take_trace_exception`).
 //!
-//! TomHarte capture volontairement l'effet d'une seule instruction sans
-//! enchaîner sur la trace (voir `tests/tomharte.rs` : NOP avec T=1 en
-//! entrée a un `final.sr` identique, aucun frame poussé) — ce fichier est
-//! donc le seul filet de sécurité pour ce mécanisme, sur le même principe
-//! que `tests/interrupts.rs`.
+//! TomHarte deliberately captures the effect of a single instruction without
+//! chaining into the trace (see `tests/tomharte.rs`: a NOP with T=1 on
+//! entry has an identical `final.sr`, no frame pushed) — this file is
+//! therefore the only safety net for this mechanism, on the same principle
+//! as `tests/interrupts.rs`.
 
 use rust68::{Bus, Cpu, FlatBus, sr};
 
@@ -24,7 +24,7 @@ fn setup(words: &[u16]) -> (Cpu, FlatBus) {
 }
 
 #[test]
-fn pas_de_trace_si_t_est_a_zero() {
+fn no_trace_if_t_is_zero() {
     let (mut cpu, mut bus) = setup(&[0x4E71]); // NOP
     cpu.sr &= !sr::T;
     cpu.step(&mut bus).unwrap();
@@ -32,105 +32,105 @@ fn pas_de_trace_si_t_est_a_zero() {
 }
 
 #[test]
-fn step_ne_prend_pas_la_trace_lui_meme_mais_pose_trace_pending() {
-    // Reproduit exactement le cas TomHarte "NOP avec T=1 en entrée" :
-    // l'effet direct de l'instruction (SR, PC, RAM) doit être identique à
-    // T=0, seul trace_pending doit signaler que la trace est due.
+fn step_does_not_take_the_trace_itself_but_sets_trace_pending() {
+    // Reproduces exactly the TomHarte case "NOP with T=1 on entry":
+    // the instruction's direct effect (SR, PC, RAM) must be identical to
+    // T=0, only trace_pending must signal that the trace is due.
     let (mut cpu, mut bus) = setup(&[0x4E71]); // NOP
     cpu.sr |= sr::T;
-    let sr_avant = cpu.sr;
-    let sp_avant = cpu.sp();
+    let sr_before = cpu.sr;
+    let sp_before = cpu.sp();
 
     let cycles = cpu.step(&mut bus).unwrap();
 
-    assert_eq!(cycles, 4, "coût inchangé : la trace n'est pas prise dans step()");
+    assert_eq!(cycles, 4, "unchanged cost: the trace is not taken within step()");
     assert_eq!(cpu.pc, 0x0402);
-    assert_eq!(cpu.sr, sr_avant, "SR inchangé par step() lui-même");
-    assert_eq!(cpu.sp(), sp_avant, "aucun frame poussé par step() lui-même");
+    assert_eq!(cpu.sr, sr_before, "SR unchanged by step() itself");
+    assert_eq!(cpu.sp(), sp_before, "no frame pushed by step() itself");
     assert!(cpu.trace_pending);
 }
 
 #[test]
-fn take_trace_exception_pousse_le_frame_et_efface_t() {
+fn take_trace_exception_pushes_the_frame_and_clears_t() {
     let (mut cpu, mut bus) = setup(&[0x4E71]);
     cpu.sr |= sr::T;
-    bus.write32(0x0024, 0x0000_0900); // vecteur 9 (trace) * 4 = 0x24
-    let sr_avant = cpu.sr;
+    bus.write32(0x0024, 0x0000_0900); // vector 9 (trace) * 4 = 0x24
+    let sr_before = cpu.sr;
     cpu.step(&mut bus).unwrap();
-    let pc_apres_nop = cpu.pc;
+    let pc_after_nop = cpu.pc;
 
     let cycles = cpu.take_trace_exception(&mut bus);
 
     assert_eq!(cycles, Some(34));
-    assert_eq!(cpu.pc, 0x0900, "saut au handler du vecteur 9");
-    assert_eq!(cpu.sr & sr::T, 0, "T doit être effacé en entrant dans le handler");
-    // Frame standard 6 octets : SP-6 = SR sauvegardé, SP-2 (longword) = PC de retour.
-    assert_eq!(bus.read16(cpu.sp()), sr_avant);
-    assert_eq!(bus.read32(cpu.sp().wrapping_add(2)), pc_apres_nop);
-    assert!(!cpu.trace_pending, "consommé par take_trace_exception");
+    assert_eq!(cpu.pc, 0x0900, "jump to the vector 9 handler");
+    assert_eq!(cpu.sr & sr::T, 0, "T must be cleared when entering the handler");
+    // Standard 6-byte frame: SP-6 = saved SR, SP-2 (longword) = return PC.
+    assert_eq!(bus.read16(cpu.sp()), sr_before);
+    assert_eq!(bus.read32(cpu.sp().wrapping_add(2)), pc_after_nop);
+    assert!(!cpu.trace_pending, "consumed by take_trace_exception");
 }
 
 #[test]
-fn take_trace_exception_ne_fait_rien_si_rien_n_est_en_attente() {
+fn take_trace_exception_does_nothing_if_nothing_is_pending() {
     let (mut cpu, mut bus) = setup(&[0x4E71]);
     cpu.sr &= !sr::T;
     cpu.step(&mut bus).unwrap();
-    let pc_avant = cpu.pc;
+    let pc_before = cpu.pc;
     assert_eq!(cpu.take_trace_exception(&mut bus), None);
-    assert_eq!(cpu.pc, pc_avant, "aucun effet si aucune trace n'est due");
+    assert_eq!(cpu.pc, pc_before, "no effect if no trace is due");
 }
 
 #[test]
-fn une_instruction_qui_pose_t_elle_meme_ne_se_trace_qu_apres_la_suivante() {
-    // ORI #$8000,SR (0x007C + immédiat) puis un NOP. Vérifié empiriquement
-    // contre Hatari (2026-08-04, `Rick_Dangerous.stx` : une routine TOS qui
-    // pose T via ORI to SR pour piloter une boucle de déchiffrement
-    // instruction par instruction) : le silicium réel exécute ENCORE
-    // l'instruction suivante avant que la trace ne devienne effective —
-    // même mécanisme matériel que le délai du masque IPL (voir
-    // `Cpu::sr_write_pending_delay`). L'ancienne hypothèse ("dès la fin de
-    // CETTE instruction") n'avait jamais été vérifiée contre une référence
-    // et causait un double bus fault que Hatari n'a jamais sur ce jeu.
+fn an_instruction_that_sets_t_itself_only_traces_after_the_next_one() {
+    // ORI #$8000,SR (0x007C + immediate) then a NOP. Empirically verified
+    // against Hatari (2026-08-04, `Rick_Dangerous.stx`: a TOS routine that
+    // sets T via ORI to SR to drive an instruction-by-instruction
+    // decryption loop): real silicon STILL executes the following
+    // instruction before the trace becomes effective — the same hardware
+    // mechanism as the IPL mask delay (see
+    // `Cpu::sr_write_pending_delay`). The old assumption ("right at the end
+    // of THIS instruction") had never been verified against a reference
+    // and caused a double bus fault that Hatari never has on this game.
     let (mut cpu, mut bus) = setup(&[0x007C, 0x8000, 0x4E71]);
     cpu.sr &= !sr::T;
 
     cpu.step(&mut bus).unwrap(); // ORI #$8000,SR
-    assert!(cpu.sr & sr::T != 0, "T doit être posé par ORI to SR");
+    assert!(cpu.sr & sr::T != 0, "T must be set by ORI to SR");
     assert!(
         !cpu.trace_pending,
-        "pas encore : c'est CETTE instruction qui vient de poser T"
+        "not yet: it is THIS instruction that just set T"
     );
 
     cpu.step(&mut bus).unwrap(); // NOP
     assert!(
         cpu.trace_pending,
-        "la trace se déclenche après l'instruction SUIVANT celle qui a posé T"
+        "the trace triggers after the instruction FOLLOWING the one that set T"
     );
 }
 
 #[test]
-fn trap_n_active_pas_trace_pending_meme_avec_t_initialement_pose() {
-    // take_exception (appelé par TRAP) efface T en entrant dans son propre
-    // frame : trace_pending ne doit donc PAS se poser en plus.
+fn trap_does_not_set_trace_pending_even_with_t_initially_set() {
+    // take_exception (called by TRAP) clears T when entering its own
+    // frame: trace_pending must therefore NOT be set in addition.
     let (mut cpu, mut bus) = setup(&[0x4E40]); // TRAP #0
-    bus.write32(0x0080, 0x0000_0900); // vecteur 32 (TRAP #0) * 4 = 0x80
+    bus.write32(0x0080, 0x0000_0900); // vector 32 (TRAP #0) * 4 = 0x80
     cpu.sr |= sr::T;
 
     cpu.step(&mut bus).unwrap();
 
-    assert_eq!(cpu.pc, 0x0900, "TRAP a bien sauté à son propre handler");
-    assert_eq!(cpu.sr & sr::T, 0, "T effacé par l'entrée d'exception de TRAP");
+    assert_eq!(cpu.pc, 0x0900, "TRAP did jump to its own handler");
+    assert_eq!(cpu.sr & sr::T, 0, "T cleared by TRAP's exception entry");
     assert!(
         !cpu.trace_pending,
-        "pas de trace supplémentaire : l'exception de TRAP a déjà géré T"
+        "no additional trace: TRAP's exception already handled T"
     );
 }
 
 #[test]
-fn rte_qui_depile_un_sr_avec_t_pose_ne_declenche_la_trace_qu_apres_la_suivante() {
+fn rte_popping_an_sr_with_t_set_only_triggers_the_trace_after_the_next_instruction() {
     let (mut cpu, mut bus) = setup(&[0x4E73]); // RTE
-    bus.write16(0x0800, 0x4E71); // NOP à l'adresse de retour
-    // Empile un frame de retour : SR (avec T=1, superviseur) puis PC=0x0800.
+    bus.write16(0x0800, 0x4E71); // NOP at the return address
+    // Push a return frame: SR (with T=1, supervisor) then PC=0x0800.
     let sp = cpu.sp() - 6;
     cpu.set_sp(sp);
     bus.write16(sp, sr::T | rust68::sr::S);
@@ -142,12 +142,12 @@ fn rte_qui_depile_un_sr_avec_t_pose_ne_declenche_la_trace_qu_apres_la_suivante()
     assert!(cpu.sr & sr::T != 0);
     assert!(
         !cpu.trace_pending,
-        "pas encore : c'est CETTE instruction (RTE) qui vient de restaurer T=1"
+        "not yet: it is THIS instruction (RTE) that just restored T=1"
     );
 
     cpu.step(&mut bus).unwrap(); // NOP
     assert!(
         cpu.trace_pending,
-        "la trace se déclenche après l'instruction SUIVANT le RTE qui a restauré T"
+        "the trace triggers after the instruction FOLLOWING the RTE that restored T"
     );
 }

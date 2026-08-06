@@ -1,9 +1,8 @@
-//! Systèmes complets bâtis sur le cœur 68000 et les puces de
-//! [`crate::peripherals`] : implémentent [`crate::Bus`] pour un mapping
-//! mémoire et un câblage d'interruption réels. Un sous-module par système,
-//! chacun derrière sa propre feature Cargo (voir [`atari_st`]) — le cœur
-//! 68000 seul reste utilisable sans rapatrier ni compiler de code
-//! spécifique à un système particulier.
+//! Complete systems built on the 68000 core and the [`crate::peripherals`]
+//! chips: implement [`crate::Bus`] for a real memory map and interrupt
+//! wiring. One submodule per system, each behind its own Cargo feature (see
+//! [`atari_st`]) — the 68000 core alone remains usable without pulling in or
+//! compiling any code specific to a particular system.
 
 #[cfg(feature = "atari-st")]
 pub mod atari_st;

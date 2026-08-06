@@ -1,29 +1,30 @@
-//! Bruitage mécanique du lecteur de disquette (moteur, pas, recherche) —
-//! porté du projet compagnon Stay (`stay_sound::DriveSound`, lui-même
-//! calqué sur Steem SSE `floppy_drive.cpp` : `SoundVBL`/`SoundCheckCommand`/
-//! `SoundStep`) : un échantillon de démarrage joue une fois quand le moteur
-//! s'allume, un bourdonnement en boucle joue tant qu'il tourne, une commande
-//! Step sur une seule piste joue un clic bref, et un Seek/Restore
-//! multi-piste joue un bourdonnement de recherche en boucle pour toute la
-//! durée du déplacement plutôt qu'un clic par piste.
+//! Mechanical floppy drive noise (motor, step, seek) — ported from the
+//! companion Stay project (`stay_sound::DriveSound`, itself modeled on
+//! Steem SSE's `floppy_drive.cpp`: `SoundVBL`/`SoundCheckCommand`/
+//! `SoundStep`): a startup sample plays once when the motor turns on, a
+//! looping hum plays while it's running, a Step command on a single track
+//! plays a short click, and a multi-track Seek/Restore plays a looping
+//! seek hum for the entire duration of the move rather than one click per
+//! track.
 //!
-//! Ce module ne sait rien du WD1772 ni du disque : c'est à l'appelant de
-//! consommer [`crate::peripherals::atari_st::wd1772::Wd1772::take_sound_events`]
-//! et d'appeler la méthode [`DriveSound`] correspondante à chaque
-//! évènement (voir `bin/atari_st_sdl2.rs`).
+//! This module knows nothing about the WD1772 or the disk: it's up to the
+//! caller to consume
+//! [`crate::peripherals::atari_st::wd1772::Wd1772::take_sound_events`]
+//! and call the corresponding [`DriveSound`] method for each event (see
+//! `bin/atari_st_sdl2.rs`).
 //!
-//! Les échantillons eux-mêmes sont chargés séparément (voir [`wav`]) et
-//! injectés via [`DriveSound::set_sample`] — ce module n'a aucun accès au
-//! système de fichiers, et reste silencieux (une voix jamais remplie ne se
-//! déclenche simplement jamais) si un slot n'est jamais rempli : un jeu
-//! d'échantillons absent ou non livré dégrade proprement plutôt que de
-//! faire échouer quoi que ce soit.
+//! The samples themselves are loaded separately (see [`wav`]) and
+//! injected via [`DriveSound::set_sample`] — this module has no
+//! filesystem access, and stays silent (a voice that's never filled
+//! simply never triggers) if a slot is never filled: a missing or
+//! undelivered sample set degrades gracefully rather than causing
+//! anything to fail.
 
 use super::wd1772::SoundEvent;
 
-/// Parseur WAV minimal (RIFF/PCM), juste assez pour charger les fichiers
-/// mono 8 ou 16 bits non compressés du jeu `3rdparty/DriveSound` de Steem
-/// SSE (le même que celui utilisé par Stay).
+/// Minimal WAV parser (RIFF/PCM), just enough to load the uncompressed
+/// mono 8 or 16-bit files from Steem SSE's `3rdparty/DriveSound` set (the
+/// same one used by Stay).
 pub mod wav {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum WavError {
@@ -39,22 +40,21 @@ pub mod wav {
     impl std::fmt::Display for WavError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                WavError::NotWav => write!(f, "pas un fichier RIFF/WAVE"),
-                WavError::MissingFmt => write!(f, "bloc 'fmt ' manquant"),
-                WavError::MissingData => write!(f, "bloc 'data' manquant"),
-                WavError::UnsupportedFormat(tag) => write!(f, "format non pris en charge (PCM seulement), tag={tag}"),
-                WavError::UnsupportedBitDepth(bits) => write!(f, "profondeur non prise en charge (8 ou 16 bits), obtenu {bits}"),
-                WavError::UnsupportedChannels(ch) => write!(f, "nombre de canaux non pris en charge (mono seulement), obtenu {ch}"),
-                WavError::Truncated => write!(f, "fichier tronqué"),
+                WavError::NotWav => write!(f, "not a RIFF/WAVE file"),
+                WavError::MissingFmt => write!(f, "missing 'fmt ' chunk"),
+                WavError::MissingData => write!(f, "missing 'data' chunk"),
+                WavError::UnsupportedFormat(tag) => write!(f, "unsupported format (PCM only), tag={tag}"),
+                WavError::UnsupportedBitDepth(bits) => write!(f, "unsupported bit depth (8 or 16 bits only), got {bits}"),
+                WavError::UnsupportedChannels(ch) => write!(f, "unsupported channel count (mono only), got {ch}"),
+                WavError::Truncated => write!(f, "truncated file"),
             }
         }
     }
 
-    /// Parse un WAV mono PCM 8 ou 16 bits. Renvoie (échantillons en i16,
-    /// fréquence d'échantillonnage). Le PCM 8 bits est non signé dans le
-    /// format WAV (0..255, silence = 128) et est remis à l'échelle i16
-    /// signée ici pour que l'appelant n'ait jamais à se soucier de la
-    /// profondeur d'origine.
+    /// Parses a mono PCM 8 or 16-bit WAV. Returns (samples as i16, sample
+    /// rate). 8-bit PCM is unsigned in the WAV format (0..255, silence =
+    /// 128) and is rescaled to signed i16 here so the caller never has to
+    /// worry about the original bit depth.
     pub fn load_wav_mono_i16(data: &[u8]) -> Result<(Vec<i16>, u32), WavError> {
         if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
             return Err(WavError::NotWav);
@@ -90,16 +90,16 @@ pub mod wav {
                 _ => {}
             }
 
-            // Les blocs sont alignés sur un mot : saute l'octet de bourrage
-            // si `chunk_len` est impair.
+            // Chunks are word-aligned: skip the padding byte if
+            // `chunk_len` is odd.
             pos = body_end + (chunk_len & 1);
         }
 
         let (format_tag, channels, sample_rate, bits_per_sample) = fmt.ok_or(WavError::MissingFmt)?;
         let pcm = pcm.ok_or(WavError::MissingData)?;
 
-        // 1 = PCM, 0xFFFE = WAVE_FORMAT_EXTENSIBLE (toujours du PCM en
-        // pratique pour les fichiers mono simples ciblés ici).
+        // 1 = PCM, 0xFFFE = WAVE_FORMAT_EXTENSIBLE (always PCM in practice
+        // for the simple mono files targeted here).
         if format_tag != 1 && format_tag != 0xFFFE {
             return Err(WavError::UnsupportedFormat(format_tag));
         }
@@ -155,9 +155,9 @@ impl Voice {
         self.active = false;
     }
 
-    /// Rééchantillonnage au plus proche voisin d'un échantillon de sortie
-    /// depuis `data`, selon la position de lecture courante de cette voix —
-    /// un bourdonnement/clic mécanique n'a besoin de rien de plus fin.
+    /// Nearest-neighbor resampling of an output sample from `data`,
+    /// according to this voice's current playback position — a mechanical
+    /// hum/click doesn't need anything finer.
     fn next(&mut self, data: &[i16]) -> i32 {
         if !self.active || data.is_empty() {
             return 0;
@@ -178,15 +178,15 @@ impl Voice {
     }
 }
 
-/// Mélangeur de bruitage mécanique du lecteur — voir la doc du module.
+/// Drive mechanical noise mixer — see the module doc.
 pub struct DriveSound {
     samples: [Sample; NUM_SLOTS],
     voices: [Voice; NUM_SLOTS],
     output_rate: u32,
-    /// Atténuation globale pour que ça reste une ambiance mécanique de
-    /// fond plutôt que de rivaliser avec la musique PSG/DMA — Stay/Steem
-    /// SSE atténue fortement de la même façon par rapport à la pleine
-    /// échelle (`floppy_drive.cpp`, `SoundVolume`).
+    /// Overall attenuation so it stays a background mechanical ambience
+    /// rather than competing with the PSG/DMA music — Stay/Steem SSE
+    /// attenuates heavily the same way relative to full scale
+    /// (`floppy_drive.cpp`, `SoundVolume`).
     volume_shift: u32,
 }
 
@@ -196,7 +196,7 @@ impl DriveSound {
             samples: [Sample::default(), Sample::default(), Sample::default(), Sample::default()],
             voices: [Voice::new(), Voice::new(), Voice::new(), Voice::new()],
             output_rate,
-            volume_shift: 2, // ÷4
+            volume_shift: 2, // /4
         }
     }
 
@@ -209,8 +209,8 @@ impl DriveSound {
         native as f64 / self.output_rate as f64
     }
 
-    // ── Déclencheurs, appelés par l'appelant qui draine la file
-    // `Wd1772::take_sound_events` ────────────────────────────────────────
+    // ── Triggers, called by the caller draining the
+    // `Wd1772::take_sound_events` queue ─────────────────────────────────
 
     fn motor_on(&mut self) {
         let r = self.rate_ratio(Slot::Start);
@@ -235,12 +235,12 @@ impl DriveSound {
 
     fn seek_end(&mut self) {
         self.voices[Slot::Seek as usize].stop();
-        self.step_click(); // Steem/Stay : un dernier clic plus doux termine un seek.
+        self.step_click(); // Steem/Stay: one final, softer click ends a seek.
     }
 
-    /// Applique un lot d'évènements (voir
+    /// Applies a batch of events (see
     /// [`crate::peripherals::atari_st::wd1772::Wd1772::take_sound_events`])
-    /// aux voix correspondantes.
+    /// to the corresponding voices.
     pub fn handle_events(&mut self, events: &[SoundEvent]) {
         for event in events {
             match event {
@@ -253,9 +253,9 @@ impl DriveSound {
         }
     }
 
-    /// Mélange `n` échantillons mono de bruitage additivement dans `out`
-    /// (marge i32, comme pour le mélange PSG+DMA — l'appelant écrête vers
-    /// i16 après avoir additionné toutes les sources).
+    /// Additively mixes `n` mono noise samples into `out` (i32 headroom,
+    /// as for the PSG+DMA mix — the caller clips to i16 after summing all
+    /// sources).
     pub fn mix_into(&mut self, out: &mut [i32]) {
         for slot_idx in 0..NUM_SLOTS {
             let data = &self.samples[slot_idx].data;

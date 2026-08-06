@@ -1,18 +1,18 @@
 #![cfg(feature = "atari-st")]
-//! Tests unitaires du GLUE (`rust68::peripherals::atari_st::glue`).
+//! Unit tests for the GLUE (`rust68::peripherals::atari_st::glue`).
 
 use rust68::peripherals::atari_st::glue::{Glue, VideoMode};
 
 #[test]
-fn pas_de_hbl_avant_la_fin_de_ligne() {
+fn no_hbl_before_end_of_line() {
     let mut glue = Glue::new(VideoMode::Pal50);
-    glue.tick(511); // 1 cycle avant la fin de ligne (512 cycles PAL)
+    glue.tick(511); // 1 cycle before end of line (512 cycles PAL)
     assert!(!glue.hbl_pending());
     assert_eq!(glue.current_line(), 0);
 }
 
 #[test]
-fn hbl_arme_a_la_fin_de_chaque_ligne() {
+fn hbl_arms_at_the_end_of_each_line() {
     let mut glue = Glue::new(VideoMode::Pal50);
     glue.tick(512);
     assert!(glue.hbl_pending());
@@ -27,152 +27,152 @@ fn hbl_arme_a_la_fin_de_chaque_ligne() {
 }
 
 #[test]
-fn vbl_arme_a_la_transition_visible_blanking_pas_au_bouclage() {
-    // Sur silicium réel, VBL survient au DÉBUT du blanking vertical (juste
-    // après la dernière ligne visible), pas au bouclage complet de la trame
-    // (`line` revenant à 0) — tout le reste du blanking s'écoule ENSUITE,
-    // avant que la ligne visible 0 de la trame suivante ne soit affichée.
-    // Confondre les deux ferait rendre cette ligne 0 dans le même souffle
-    // que l'armement de VBL, sans laisser au logiciel la moindre chance de
-    // prendre l'interruption avant qu'elle ne soit déjà consommée.
+fn vbl_arms_at_the_visible_to_blanking_transition_not_at_wraparound() {
+    // On real silicon, VBL occurs at the START of vertical blanking (right
+    // after the last visible line), not at the full frame wraparound
+    // (`line` going back to 0) — the rest of the blanking period elapses
+    // AFTERWARDS, before visible line 0 of the next frame is displayed.
+    // Conflating the two would render this line 0 in the same breath as
+    // VBL being armed, leaving software no chance at all to take the
+    // interrupt before it is already consumed.
     //
-    // Numérotation absolue Hatari (`VIDEO_START_HBL_50HZ`=63,
-    // `VIDEO_END_HBL_50HZ`=263) : un vrai blanking HAUT de 63 lignes
-    // précède la première ligne affichée (nécessaire pour la suppression
-    // de bordure haute STE, voir `peripherals::atari_st::shifter`), donc
-    // les 200 lignes affichées vont de la ligne absolue 63 à 262 inclus,
-    // pas 0 à 199 — seule la RÉPARTITION du blanking change (63 avant +
-    // 50 après au lieu de 0 avant + 113 après), pas son total (113).
+    // Hatari's absolute numbering (`VIDEO_START_HBL_50HZ`=63,
+    // `VIDEO_END_HBL_50HZ`=263): a real TOP blanking of 63 lines precedes
+    // the first displayed line (needed for STE top-border removal, see
+    // `peripherals::atari_st::shifter`), so the 200 displayed lines run
+    // from absolute line 63 to 262 inclusive, not 0 to 199 — only the
+    // DISTRIBUTION of blanking changes (63 before + 50 after instead of 0
+    // before + 113 after), not its total (113).
     let mut glue = Glue::new(VideoMode::Pal50);
-    assert_eq!(glue.display_line(), None, "encore dans le blanking haut au tout début");
+    assert_eq!(glue.display_line(), None, "still in the top blanking right at the start");
 
-    // 262 lignes complètes (dernière ligne affichée, absolue 261, PAL) :
-    // pas encore de VBL.
+    // 262 full lines (last displayed line, absolute 261, PAL):
+    // no VBL yet.
     glue.tick(512 * 262);
     assert_eq!(glue.current_line(), 262);
-    assert_eq!(glue.display_line(), Some(199), "dernière des 200 lignes affichées");
+    assert_eq!(glue.display_line(), Some(199), "last of the 200 displayed lines");
     assert!(!glue.vbl_pending());
     assert_eq!(glue.frame_count(), 0);
 
-    // La ligne absolue 263 (transition vers le blanking vertical bas)
-    // déclenche VBL.
+    // Absolute line 263 (transition into the bottom vertical blanking)
+    // triggers VBL.
     glue.tick(512);
     assert!(glue.vbl_pending());
-    assert!(glue.hbl_pending(), "toute fin de ligne est aussi une fin de ligne (HBL)");
+    assert!(glue.hbl_pending(), "any end of line is also an end of line (HBL)");
     assert_eq!(glue.current_line(), 263);
-    assert_eq!(glue.display_line(), None, "entrée dans le blanking bas");
-    assert_eq!(glue.frame_count(), 0, "la trame ne bascule qu'au bouclage complet (313 lignes)");
+    assert_eq!(glue.display_line(), None, "entering the bottom blanking");
+    assert_eq!(glue.frame_count(), 0, "the frame only rolls over on full wraparound (313 lines)");
 
     glue.ack_vbl();
     assert!(!glue.vbl_pending());
 
-    // Le reste du blanking bas (50 lignes) fait boucler la ligne et avancer
-    // frame_count(), sans réarmer VBL (déjà consommé plus haut) — puis le
-    // blanking haut de la trame suivante (63 lignes) doit s'écouler avant
-    // qu'une ligne affichée ne réapparaisse.
+    // The rest of the bottom blanking (50 lines) makes the line wrap and
+    // frame_count() advance, without re-arming VBL (already consumed
+    // above) — then the top blanking of the next frame (63 lines) must
+    // elapse before a displayed line reappears.
     glue.tick(512 * 50);
-    assert_eq!(glue.current_line(), 0, "la ligne boucle à 0 en début de trame suivante");
+    assert_eq!(glue.current_line(), 0, "the line wraps to 0 at the start of the next frame");
     assert_eq!(glue.frame_count(), 1);
     assert!(!glue.vbl_pending());
-    assert_eq!(glue.display_line(), None, "blanking haut de la nouvelle trame");
+    assert_eq!(glue.display_line(), None, "top blanking of the new frame");
 
     glue.tick(512 * 63);
-    assert_eq!(glue.display_line(), Some(0), "première ligne affichée de la nouvelle trame");
+    assert_eq!(glue.display_line(), Some(0), "first displayed line of the new frame");
 }
 
 #[test]
-fn ntsc_utilise_des_constantes_differentes() {
+fn ntsc_uses_different_constants() {
     let mut pal = Glue::new(VideoMode::Pal50);
     let mut ntsc = Glue::new(VideoMode::Ntsc60);
     pal.tick(508);
     ntsc.tick(508);
-    assert!(!pal.hbl_pending(), "508 cycles < 512 (PAL) : pas encore de HBL");
-    assert!(ntsc.hbl_pending(), "508 cycles = exactement une ligne NTSC");
+    assert!(!pal.hbl_pending(), "508 cycles < 512 (PAL): no HBL yet");
+    assert!(ntsc.hbl_pending(), "508 cycles = exactly one NTSC line");
 }
 
 #[test]
-fn plusieurs_lignes_en_un_seul_tick() {
+fn several_lines_in_a_single_tick() {
     let mut glue = Glue::new(VideoMode::Pal50);
-    glue.tick(512 * 5 + 100); // 5 lignes complètes + reliquat
+    glue.tick(512 * 5 + 100); // 5 full lines + remainder
     assert_eq!(glue.current_line(), 5);
     assert!(glue.hbl_pending());
 }
 
 #[test]
-fn write_sync_vers_60hz_tot_dans_le_blanking_haut_supprime_la_bordure_haute() {
-    // $FF820A, bit1=0 = sélection 60Hz. Survenant encore dans le blanking
-    // haut nominal (avant la ligne 63 PAL) et à un cycle assez précoce
-    // dans la ligne, ce switch tire le début de la fenêtre affichée à la
-    // position de départ NOMINALE du mode 60Hz (34) — révélant les lignes
-    // 34..63, normalement en blanking (voir Hatari, `video.c`,
-    // `Video_Update_Glue_State`).
+fn write_sync_to_60hz_early_in_top_blanking_removes_the_top_border() {
+    // $FF820A, bit1=0 = 60Hz selection. Occurring while still within the
+    // nominal top blanking (before PAL line 63) and early enough within
+    // the line cycle-wise, this switch pulls the start of the displayed
+    // window to the NOMINAL start position of the 60Hz mode (34) —
+    // revealing lines 34..63, normally in blanking (see Hatari,
+    // `video.c`, `Video_Update_Glue_State`).
     let mut glue = Glue::new(VideoMode::Pal50);
-    assert_eq!(glue.display_line(), None, "encore en bordure avant l'écriture");
+    assert_eq!(glue.display_line(), None, "still in the border before the write");
 
-    glue.write_sync(0x00); // bit1=0 : 60Hz
+    glue.write_sync(0x00); // bit1=0: 60Hz
     assert_eq!(glue.read_sync(), 0x00);
 
-    // Les lignes 34..63 sont maintenant affichées (avant : bordure).
+    // Lines 34..63 are now displayed (previously: border).
     glue.tick(512 * 34);
     assert_eq!(
         glue.display_line(),
         Some(0),
-        "ligne 34 : premier pixel de la bordure haute supprimée"
+        "line 34: first pixel of the removed top border"
     );
-    glue.tick(512 * 29); // atteint la ligne 63, position nominale normale
+    glue.tick(512 * 29); // reaches line 63, normal nominal position
     assert_eq!(
         glue.display_line(),
         Some(29),
-        "ligne 63 : jonction avec la fenêtre nominale (63-34=29 lignes révélées)"
+        "line 63: junction with the nominal window (63-34=29 revealed lines)"
     );
 }
 
 #[test]
-fn write_sync_vers_60hz_en_fin_d_affichage_supprime_la_bordure_basse() {
-    // Même registre, mais le switch survient cette fois sur l'avant-
-    // dernière/dernière ligne affichée nominale (262 en PAL, juste avant
-    // la transition VBL à 263) : étend la fenêtre de
-    // `VIDEO_HEIGHT_BOTTOM_50HZ` (47) lignes supplémentaires au lieu de
-    // déplacer son début.
+fn write_sync_to_60hz_at_end_of_display_removes_the_bottom_border() {
+    // Same register, but this time the switch occurs on the nominal
+    // second-to-last/last displayed line (262 in PAL, right before the
+    // VBL transition at 263): it extends the window by
+    // `VIDEO_HEIGHT_BOTTOM_50HZ` (47) additional lines instead of
+    // shifting its start.
     let mut glue = Glue::new(VideoMode::Pal50);
-    glue.tick(512 * 262); // dernière ligne affichée nominale (262, PAL)
+    glue.tick(512 * 262); // last nominal displayed line (262, PAL)
     assert_eq!(glue.display_line(), Some(199));
 
-    glue.write_sync(0x00); // bit1=0 : 60Hz, tôt dans cette ligne (cycles_in_line=0)
+    glue.write_sync(0x00); // bit1=0: 60Hz, early in this line (cycles_in_line=0)
 
-    // Sans la suppression, VBL se déclencherait à la ligne 263 (juste
-    // après) : elle reste ici en attente jusqu'à la ligne 310 (263+47).
-    glue.tick(512); // ligne 263 : bordure basse supprimée, doit rester affichée
-    assert_eq!(glue.display_line(), Some(200), "bordure basse supprimée : encore affichée");
-    assert!(!glue.vbl_pending(), "VBL différé tant que la bordure basse reste supprimée");
+    // Without the removal, VBL would trigger at line 263 (right after):
+    // it stays pending here until line 310 (263+47).
+    glue.tick(512); // line 263: bottom border removed, must remain displayed
+    assert_eq!(glue.display_line(), Some(200), "bottom border removed: still displayed");
+    assert!(!glue.vbl_pending(), "VBL deferred as long as the bottom border stays removed");
 
-    glue.tick(512 * 46); // jusqu'à la ligne 309 (dernière ligne étendue)
+    glue.tick(512 * 46); // up to line 309 (last extended line)
     assert_eq!(glue.display_line(), Some(246));
     assert!(!glue.vbl_pending());
 
-    glue.tick(512); // ligne 310 : fin de la fenêtre étendue, VBL désormais armé
+    glue.tick(512); // line 310: end of the extended window, VBL now armed
     assert!(glue.vbl_pending());
     assert_eq!(glue.display_line(), None);
 }
 
 #[test]
-fn write_sync_vers_50hz_ou_hors_fenetre_de_cycle_n_a_aucun_effet() {
-    // Un switch VERS 50Hz (bit1=1) ne doit jamais étendre la fenêtre — ni
-    // un switch vers 60Hz survenant trop tard dans la ligne (au-delà du
-    // seuil de "gating", voir la doc de `Glue::write_sync`).
+fn write_sync_to_50hz_or_outside_the_cycle_window_has_no_effect() {
+    // A switch TO 50Hz (bit1=1) must never extend the window — nor should
+    // a switch to 60Hz occurring too late within the line (past the
+    // "gating" threshold, see the doc of `Glue::write_sync`).
     let mut glue = Glue::new(VideoMode::Pal50);
-    glue.write_sync(0x02); // bit1=1 : 50Hz, aucun effet possible
+    glue.write_sync(0x02); // bit1=1: 50Hz, no possible effect
     glue.tick(512 * 34);
-    assert_eq!(glue.display_line(), None, "50Hz : la bordure haute n'a pas dû être supprimée");
+    assert_eq!(glue.display_line(), None, "50Hz: the top border must not have been removed");
 
     let mut glue2 = Glue::new(VideoMode::Pal50);
-    glue2.tick(510); // au-delà du seuil de cycle (504), toujours ligne 0 (< 512)
+    glue2.tick(510); // past the cycle threshold (504), still line 0 (< 512)
     assert_eq!(glue2.current_line(), 0);
     glue2.write_sync(0x00);
     glue2.tick(512 * 34 - 510);
     assert_eq!(
         glue2.display_line(),
         None,
-        "switch trop tardif dans la ligne : aucun effet"
+        "switch too late within the line: no effect"
     );
 }

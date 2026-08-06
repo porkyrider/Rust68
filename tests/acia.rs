@@ -1,82 +1,82 @@
 #![cfg(feature = "atari-st")]
-//! Tests unitaires du MC6850 ACIA (`rust68::peripherals::atari_st::acia`).
+//! Unit tests for the MC6850 ACIA (`rust68::peripherals::atari_st::acia`).
 
 use rust68::peripherals::atari_st::acia::{Acia, reg};
 
 #[test]
-fn etat_initial_emetteur_pret_recepteur_vide() {
+fn initial_state_transmitter_ready_receiver_empty() {
     let mut acia = Acia::new();
     let status = acia.read(reg::CONTROL_STATUS);
-    assert_eq!(status & 0x01, 0, "RDRF doit être à 0 au reset");
-    assert_eq!(status & 0x02, 0x02, "TDRE doit être à 1 au reset (émetteur prêt)");
+    assert_eq!(status & 0x01, 0, "RDRF must be 0 at reset");
+    assert_eq!(status & 0x02, 0x02, "TDRE must be 1 at reset (transmitter ready)");
 }
 
 #[test]
-fn reception_arme_rdrf_et_lecture_l_efface() {
+fn reception_arms_rdrf_and_read_clears_it() {
     let mut acia = Acia::new();
     acia.push_rx_byte(0x41);
-    assert_eq!(acia.read(reg::CONTROL_STATUS) & 0x01, 0x01, "RDRF armé");
+    assert_eq!(acia.read(reg::CONTROL_STATUS) & 0x01, 0x01, "RDRF armed");
     assert_eq!(acia.read(reg::DATA), 0x41);
-    assert_eq!(acia.read(reg::CONTROL_STATUS) & 0x01, 0, "RDRF effacé par la lecture");
+    assert_eq!(acia.read(reg::CONTROL_STATUS) & 0x01, 0, "RDRF cleared by the read");
 }
 
 #[test]
-fn overrun_si_octet_non_lu_avant_le_suivant() {
+fn overrun_if_byte_not_read_before_the_next_one() {
     let mut acia = Acia::new();
     acia.push_rx_byte(0x41);
-    acia.push_rx_byte(0x42); // non lu : doit être perdu, pas mis en file
+    acia.push_rx_byte(0x42); // not read: must be lost, not queued
     let status = acia.read(reg::CONTROL_STATUS);
-    assert_eq!(status & 0x20, 0x20, "OVRN doit s'armer");
-    assert_eq!(acia.read(reg::DATA), 0x41, "le premier octet reste disponible");
+    assert_eq!(status & 0x20, 0x20, "OVRN must arm");
+    assert_eq!(acia.read(reg::DATA), 0x41, "the first byte remains available");
 
-    // La lecture efface OVRN en même temps que RDRF.
-    let status_apres = acia.read(reg::CONTROL_STATUS);
-    assert_eq!(status_apres & 0x20, 0, "OVRN effacé par la lecture");
+    // The read clears OVRN along with RDRF.
+    let status_after = acia.read(reg::CONTROL_STATUS);
+    assert_eq!(status_after & 0x20, 0, "OVRN cleared by the read");
 }
 
 #[test]
-fn transmission_au_niveau_octet() {
+fn byte_level_transmission() {
     let mut acia = Acia::new();
     acia.write(reg::DATA, 0x55);
-    assert_eq!(acia.read(reg::CONTROL_STATUS) & 0x02, 0x02, "TDRE reste actif");
+    assert_eq!(acia.read(reg::CONTROL_STATUS) & 0x02, 0x02, "TDRE remains active");
     assert_eq!(acia.take_tx_byte(), Some(0x55));
     assert_eq!(acia.take_tx_byte(), None);
 }
 
 #[test]
-fn interruption_reception_soumise_a_rie() {
+fn reception_interrupt_gated_by_rie() {
     let mut acia = Acia::new();
     acia.push_rx_byte(0x10);
-    assert!(!acia.irq_requested(), "RIE non activé par défaut : pas d'IRQ");
+    assert!(!acia.irq_requested(), "RIE not enabled by default: no IRQ");
 
-    acia.write(reg::CONTROL_STATUS, 0x80); // RIE seul (bit7), reste à 0
+    acia.write(reg::CONTROL_STATUS, 0x80); // RIE alone (bit7), remains at 0
     acia.push_rx_byte(0x10);
-    assert!(acia.irq_requested(), "RIE actif + RDRF : IRQ demandée");
+    assert!(acia.irq_requested(), "RIE active + RDRF: IRQ requested");
 }
 
 #[test]
-fn interruption_emission_soumise_a_tie() {
+fn transmission_interrupt_gated_by_tie() {
     let mut acia = Acia::new();
-    // TDRE est actif dès le reset, mais TIE (bits 6-5 = 01) ne l'est pas.
+    // TDRE is active right from reset, but TIE (bits 6-5 = 01) is not.
     assert!(!acia.irq_requested());
 
-    acia.write(reg::CONTROL_STATUS, 0b0010_0000); // bits6-5 = 01 : TIE actif
-    assert!(acia.irq_requested(), "TIE actif + TDRE : IRQ demandée");
+    acia.write(reg::CONTROL_STATUS, 0b0010_0000); // bits6-5 = 01: TIE active
+    assert!(acia.irq_requested(), "TIE active + TDRE: IRQ requested");
 
-    acia.write(reg::CONTROL_STATUS, 0b0100_0000); // bits6-5 = 10 : TIE inactif
+    acia.write(reg::CONTROL_STATUS, 0b0100_0000); // bits6-5 = 10: TIE inactive
     assert!(!acia.irq_requested());
 }
 
 #[test]
-fn master_reset_efface_les_flags_de_statut() {
+fn master_reset_clears_the_status_flags() {
     let mut acia = Acia::new();
     acia.push_rx_byte(0x10);
     acia.push_rx_byte(0x20); // overrun
     assert_ne!(acia.read(reg::CONTROL_STATUS) & 0x21, 0);
 
-    acia.write(reg::CONTROL_STATUS, 0x03); // bits0-1 = 11 : master reset
+    acia.write(reg::CONTROL_STATUS, 0x03); // bits0-1 = 11: master reset
     let status = acia.read(reg::CONTROL_STATUS);
-    assert_eq!(status & 0x01, 0, "RDRF effacé par master reset");
-    assert_eq!(status & 0x20, 0, "OVRN effacé par master reset");
-    assert_eq!(status & 0x02, 0x02, "TDRE réarmé par master reset");
+    assert_eq!(status & 0x01, 0, "RDRF cleared by master reset");
+    assert_eq!(status & 0x20, 0, "OVRN cleared by master reset");
+    assert_eq!(status & 0x02, 0x02, "TDRE re-armed by master reset");
 }

@@ -1,90 +1,90 @@
-//! Lecteur minimal de disquettes au format `.stx` (Pasti).
+//! Minimal reader for `.stx` (Pasti) floppy disk images.
 //!
-//! Écrit initialement sans spécification officielle (disposition déduite
-//! empiriquement), puis corrigé et recoupé après consultation de la
-//! documentation publique du format (Pasti/STX, info-coach.fr et
-//! atari.8bitchip.info) suite à un bug réel découvert sur une image
-//! protégée réelle (voir la doc de `sector_data_ref` ci-dessous : le
-//! secteur 1 piste 0 de `Rick_Dangerous.stx`, un jeu commercial connu,
-//! ressortait entièrement à zéro). Les bits "fuzzy" eux-mêmes sont
-//! maintenant simulés (voir [`StxImage::read_sector`], 2026-08-04 — trouvé
-//! en retraçant un DoubleFault tardif de `Rick_Dangerous.stx` jusqu'à cette
-//! zone jamais réécrite). `bit_position` (position réelle du champ ID sur
-//! la piste physique) est exposé via [`FloppyDisk::sector_bit_position`]
-//! depuis 2026-08-05 — trouvé en retraçant un facteur ~2x de lenteur face à
-//! Hatari sur un gros transfert séquentiel : sans cette donnée, la latence
-//! de recherche était estimée par un espacement uniforme entre secteurs,
-//! faux sur une piste au formatage non standard (secteurs plus nombreux et
-//! rapprochés qu'une piste normale, technique de protection courante).
-//! `read_time` et l'image de piste brute complète restent ignorés — voir
-//! les limitations plus bas.
+//! Initially written without an official specification (layout inferred
+//! empirically), then fixed and cross-checked after consulting the
+//! format's public documentation (Pasti/STX, info-coach.fr and
+//! atari.8bitchip.info) following a real bug found on a real protected
+//! image (see the doc of `sector_data_ref` below: sector 1, track 0 of
+//! `Rick_Dangerous.stx`, a well-known commercial game, came out entirely
+//! zeroed). The "fuzzy" bits themselves are now simulated (see
+//! [`StxImage::read_sector`], 2026-08-04 — found by tracing a late
+//! DoubleFault in `Rick_Dangerous.stx` back to this never-rewritten
+//! area). `bit_position` (the real position of the ID field on the
+//! physical track) has been exposed via [`FloppyDisk::sector_bit_position`]
+//! since 2026-08-05 — found by tracing a ~2x slowdown factor compared to
+//! Hatari on a large sequential transfer: without this data, the seek
+//! latency was estimated from uniform spacing between sectors, which is
+//! wrong on a track with non-standard formatting (more sectors packed
+//! closer together than a normal track, a common protection technique).
+//! `read_time` and the full raw track image remain ignored — see the
+//! limitations below.
 //!
-//! ## Disposition
-//! - En-tête fichier (16 octets) : magique `"RSY\0"`, version u16 LE,
-//!   outil u16 LE, réservé u16 LE, nombre de pistes u8, révision u8,
-//!   réservé u32.
-//! - Un enregistrement de piste (TDR, 16 octets) par piste, les
-//!   enregistrements se suivant séquentiellement (chaque TDR commence à
-//!   `position précédente + block_size précédent`) :
+//! ## Layout
+//! - File header (16 bytes): magic `"RSY\0"`, version u16 LE,
+//!   tool u16 LE, reserved u16 LE, track count u8, revision u8,
+//!   reserved u32.
+//! - One track record (TDR, 16 bytes) per track, the records following
+//!   one another sequentially (each TDR starts at
+//!   `previous position + previous block_size`):
 //!   `block_size: u32 LE`, `fuzzy_size: u32 LE`, `sector_count: u16 LE`,
 //!   `flags: u16 LE`, `track_length: u16 LE`, `track_number: u8` (bits
-//!   0-6 = numéro de piste, bit 7 = face), `track_type: u8`.
-//! - `sector_count` enregistrements de secteur (SDR, 16 octets) suivent
-//!   immédiatement le TDR : `data_offset: u32 LE`, `bit_position: u16 LE`,
-//!   `read_time: u16 LE`, `track: u8`, `head: u8`, `sector: u8` (le
-//!   numéro logique, potentiellement non séquentiel — entrelacement du
-//!   secteur), `size_code: u8` (taille = `128 << size_code`), `crc1: u8`,
+//!   0-6 = track number, bit 7 = side), `track_type: u8`.
+//! - `sector_count` sector records (SDR, 16 bytes) immediately follow
+//!   the TDR: `data_offset: u32 LE`, `bit_position: u16 LE`,
+//!   `read_time: u16 LE`, `track: u8`, `head: u8`, `sector: u8` (the
+//!   logical number, potentially non-sequential — sector
+//!   interleaving), `size_code: u8` (size = `128 << size_code`), `crc1: u8`,
 //!   `crc2: u8`, `fdc_status: u8`, `reserved: u8`.
-//! - Juste après la table de SDR, un bloc de `fuzzy_size` octets (masque de
-//!   bits instables pour les secteurs à protection par "fuzzy bits") — peut
-//!   être absent (`fuzzy_size == 0`). `data_offset` de chaque SDR est
-//!   relatif à la fin de CE bloc (fin de la table de SDR si absent), PAS au
-//!   début du TDR ni au début du fichier — voir [`StxImage::parse`]
-//!   (`sector_data_ref`). Une éventuelle image de piste brute (capture
-//!   WD1772 complète, présente quand le bit 6 de `flags` est posé) peut
-//!   suivre le bloc fuzzy avant les données de secteur proprement dites,
-//!   mais `data_offset` la traverse déjà tout seul : inutile de la localiser
-//!   séparément pour extraire un secteur `size_code == 2`.
+//! - Right after the SDR table, a block of `fuzzy_size` bytes (mask of
+//!   unstable bits for sectors protected with "fuzzy bits") — may be
+//!   absent (`fuzzy_size == 0`). Each SDR's `data_offset` is relative to
+//!   the end of THIS block (end of the SDR table if absent), NOT to the
+//!   start of the TDR nor the start of the file — see [`StxImage::parse`]
+//!   (`sector_data_ref`). An optional raw track image (full WD1772
+//!   capture, present when bit 6 of `flags` is set) may follow the fuzzy
+//!   block before the actual sector data, but `data_offset` already
+//!   skips over it on its own: no need to locate it separately to extract
+//!   a `size_code == 2` sector.
 //!
-//! ## Limitations (lecteur minimal)
-//! - Seuls les secteurs `size_code == 2` (512 octets, taille standard
-//!   GEMDOS/ST) sont extraits ; les autres tailles sont ignorées.
-//! - Une charge utile de secteur qui déborderait de la fin du fichier
-//!   (image tronquée) est silencieusement ignorée (le secteur n'est pas
-//!   ajouté) plutôt que de faire échouer tout le parsing — seul un TDR ou
-//!   un SDR incomplet est traité comme une erreur fatale ([`StxError::Truncated`]).
-//! - Les pistes sans secteurs discrets (capture de flux brut pour
-//!   protection avancée, `sector_count == 0`) ne fournissent aucune
-//!   donnée : `read_sector` renverra `None`.
-//! - `sectors_per_track()` renvoie le maximum observé sur l'ensemble du
-//!   disque ; certaines pistes réelles en ont moins (piste de protection
-//!   avec un nombre de secteurs différent de la norme) — une lecture
-//!   multi-secteurs (bit M du WD1772) peut donc échouer prématurément sur
-//!   ces pistes-là plutôt que de s'arrêter proprement en fin de piste.
-//! - Lecture seule : `write_sector` est ignoré (pas de ré-écriture du
-//!   fichier `.stx`, voir [`StxImage::write_protected`]).
+//! ## Limitations (minimal reader)
+//! - Only `size_code == 2` sectors (512 bytes, standard GEMDOS/ST size)
+//!   are extracted; other sizes are ignored.
+//! - A sector payload that would overflow past the end of the file
+//!   (truncated image) is silently ignored (the sector is not added)
+//!   rather than failing the whole parse — only an incomplete TDR or
+//!   SDR is treated as a fatal error ([`StxError::Truncated`]).
+//! - Tracks without discrete sectors (raw stream capture for advanced
+//!   protection, `sector_count == 0`) provide no data at all:
+//!   `read_sector` will return `None`.
+//! - `sectors_per_track()` returns the maximum observed across the whole
+//!   disk; some real tracks have fewer (a protection track with a sector
+//!   count different from the norm) — a multi-sector read (WD1772 bit M)
+//!   may therefore fail prematurely on those tracks instead of stopping
+//!   cleanly at the end of the track.
+//! - Read-only: `write_sector` is ignored (no rewriting of the `.stx`
+//!   file, see [`StxImage::write_protected`]).
 
 use super::wd1772::{FloppyDisk, SECTOR_SIZE};
 
 struct StxSector {
     sector: u8,
     data: [u8; SECTOR_SIZE],
-    /// Position réelle (en bits, depuis l'impulsion d'index) du champ ID de
-    /// ce secteur sur la piste physique d'origine — capturée telle quelle
-    /// par l'outil ayant produit l'image `.stx`, voir
+    /// Real position (in bits, from the index pulse) of this sector's ID
+    /// field on the original physical track — captured as-is by the tool
+    /// that produced the `.stx` image, see
     /// [`FloppyDisk::sector_bit_position`].
     bit_position: u16,
-    /// Masque de bits "fuzzy" (protection par bits physiquement instables) :
-    /// un octet de masque par octet de `data`, bit à 1 = position stable
-    /// (garder le bit réel de `data`), bit à 0 = position instable (chaque
-    /// lecture doit renvoyer une valeur imprévisible sur ce bit-là, comme sur
-    /// le média magnétique réel). `None` pour un secteur ordinaire (immense
-    /// majorité). Voir [`StxImage::read_sector`] pour l'application.
+    /// "Fuzzy" bit mask (protection using physically unstable bits): one
+    /// mask byte per byte of `data`, bit set to 1 = stable position (keep
+    /// the real bit from `data`), bit set to 0 = unstable position (each
+    /// read must return an unpredictable value on that bit, just like the
+    /// real magnetic medium). `None` for an ordinary sector (the vast
+    /// majority). See [`StxImage::read_sector`] for how this is applied.
     fuzzy_mask: Option<[u8; SECTOR_SIZE]>,
-    /// Bit 3 (`STX_SECTOR_FLAG_CRC`) de `fdc_status` : CRC d'ID délibérément
-    /// faux (technique de protection — souvent posé EN MÊME TEMPS que
-    /// `fuzzy_mask` sur le même secteur, cf. `Rick_Dangerous.stx` pistes
-    /// 0-4, secteurs 11-12). Voir [`FloppyDisk::sector_has_crc_error`].
+    /// Bit 3 (`STX_SECTOR_FLAG_CRC`) of `fdc_status`: deliberately wrong ID
+    /// CRC (a protection technique — often set AT THE SAME TIME as
+    /// `fuzzy_mask` on the same sector, cf. `Rick_Dangerous.stx` tracks
+    /// 0-4, sectors 11-12). See [`FloppyDisk::sector_has_crc_error`].
     has_crc_error: bool,
 }
 
@@ -94,31 +94,31 @@ struct StxTrack {
     sectors: Vec<StxSector>,
 }
 
-/// Erreur de parsing d'une image `.stx`.
+/// Error while parsing a `.stx` image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StxError {
-    /// L'en-tête ne commence pas par la signature `"RSY\0"`.
+    /// The header does not start with the `"RSY\0"` signature.
     BadMagic,
-    /// Le fichier est plus court que ce que ses propres champs annoncent.
+    /// The file is shorter than what its own fields announce.
     Truncated,
 }
 
-/// Image disque `.stx` chargée en mémoire, exposée comme [`FloppyDisk`].
+/// `.stx` disk image loaded in memory, exposed as [`FloppyDisk`].
 pub struct StxImage {
     tracks: Vec<StxTrack>,
     num_tracks: u8,
     num_sides: u8,
     sectors_per_track: u8,
-    /// État d'un petit xorshift64 pour simuler les bits "fuzzy" (voir
-    /// [`Self::read_sector`]) — `Cell` car `FloppyDisk::read_sector` prend
-    /// `&self`, pas `&mut self` (une vraie disquette ne se "modifie" pas en
-    /// la lisant), mais chaque lecture doit tout de même faire progresser
-    /// l'état pour varier d'un appel à l'autre.
+    /// State of a small xorshift64 used to simulate "fuzzy" bits (see
+    /// [`Self::read_sector`]) — `Cell` because `FloppyDisk::read_sector`
+    /// takes `&self`, not `&mut self` (a real floppy disk isn't "modified"
+    /// by reading it), but each read still needs to advance the state so
+    /// it varies from one call to the next.
     fuzzy_rng: std::cell::Cell<u64>,
 }
 
 impl StxImage {
-    /// Parse une image `.stx` déjà chargée en mémoire.
+    /// Parses a `.stx` image already loaded in memory.
     pub fn parse(data: &[u8]) -> Result<Self, StxError> {
         if data.len() < 16 || &data[0..4] != b"RSY\0" {
             return Err(StxError::BadMagic);
@@ -136,15 +136,15 @@ impl StxImage {
                 return Err(StxError::Truncated);
             }
             let block_size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            // Taille (en octets) du bloc de bits "fuzzy" (secteurs à
-            // protection par bits instables) inséré juste après la table de
-            // SDR — jamais lu auparavant, alors que `data_offset` (ci-
-            // dessous) est relatif à la fin de CE bloc, pas au début du TDR.
-            // Confirmé empiriquement sur une vraie image protégée
-            // (Rick_Dangerous.stx, piste 0) : sans ce décalage, le secteur
-            // extrait tombait en plein milieu du bloc fuzzy/de l'image de
-            // piste brute, donnant des données fausses (zéros) plutôt que
-            // le vrai contenu du secteur.
+            // Size (in bytes) of the "fuzzy" bits block (sectors protected
+            // with unstable bits) inserted right after the SDR table —
+            // never read before, even though `data_offset` (below) is
+            // relative to the end of THIS block, not to the start of the
+            // TDR. Confirmed empirically on a real protected image
+            // (Rick_Dangerous.stx, track 0): without this offset, the
+            // extracted sector landed right in the middle of the fuzzy
+            // block/raw track image, producing bogus data (zeros) instead
+            // of the real sector content.
             let fuzzy_size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
             let sector_count =
                 u16::from_le_bytes(data[pos + 8..pos + 10].try_into().unwrap()) as usize;
@@ -152,19 +152,19 @@ impl StxImage {
             let track = track_number & 0x7F;
             let side = (track_number >> 7) & 1;
 
-            // Référence pour `data_offset` de chaque SDR : fin de la table
-            // de SDR (TDR + 16 octets par secteur) + bloc fuzzy — PAS le
-            // début du TDR. `data_offset` inclut lui-même le franchissement
-            // de l'éventuelle image de piste brute (track image) qui peut
-            // suivre le bloc fuzzy : pas besoin de la localiser séparément.
+            // Reference for each SDR's `data_offset`: end of the SDR table
+            // (TDR + 16 bytes per sector) + fuzzy block — NOT the start of
+            // the TDR. `data_offset` itself already accounts for crossing
+            // over the optional raw track image that may follow the fuzzy
+            // block: no need to locate it separately.
             let sector_data_ref = pos + 16 + sector_count * 16 + fuzzy_size;
-            // Début du bloc fuzzy lui-même (avant qu'il ne soit sauté par
-            // `sector_data_ref` ci-dessus) : chaque secteur marqué "fuzzy"
-            // (bit 7 de `fdc_status`) y consomme ses `SECTOR_SIZE` octets de
-            // masque SÉQUENTIELLEMENT, dans l'ordre de la table de SDR —
-            // vérifié contre Hatari (`src/floppies/stx.c`,
-            // `pStxTrack->pFuzzyData` avancé de `SectorSize` uniquement pour
-            // les secteurs `STX_SECTOR_FLAG_FUZZY`).
+            // Start of the fuzzy block itself (before it gets skipped by
+            // `sector_data_ref` above): each sector marked "fuzzy" (bit 7 of
+            // `fdc_status`) consumes its `SECTOR_SIZE` mask bytes from it
+            // SEQUENTIALLY, in the order of the SDR table — verified
+            // against Hatari (`src/floppies/stx.c`,
+            // `pStxTrack->pFuzzyData` advanced by `SectorSize` only for
+            // `STX_SECTOR_FLAG_FUZZY` sectors).
             let fuzzy_block_start = pos + 16 + sector_count * 16;
             let mut fuzzy_cursor = fuzzy_block_start;
 
@@ -180,8 +180,8 @@ impl StxImage {
                 let sector = data[sdr_pos + 10];
                 let size_code = data[sdr_pos + 11];
                 let fdc_status = data[sdr_pos + 14];
-                // Bit 7 = STX_SECTOR_FLAG_FUZZY (protection par bits
-                // physiquement instables — voir la doc de `fuzzy_mask`).
+                // Bit 7 = STX_SECTOR_FLAG_FUZZY (protection using
+                // physically unstable bits — see the doc of `fuzzy_mask`).
                 let is_fuzzy = fdc_status & 0x80 != 0;
                 let has_crc_error = fdc_status & 0x08 != 0;
                 let fuzzy_mask = if is_fuzzy && fuzzy_cursor + SECTOR_SIZE <= data.len() {
@@ -225,9 +225,9 @@ impl StxImage {
             num_tracks: max_track + 1,
             num_sides: max_side + 1,
             sectors_per_track: max_sectors,
-            // Graine fixe : le déterminisme n'a aucune importance ici (le
-            // jeu ne peut pas prédire ces octets de toute façon), et une
-            // graine fixe garde les runs reproductibles pour le débogage.
+            // Fixed seed: determinism doesn't matter here at all (the game
+            // can't predict these bytes anyway), and a fixed seed keeps
+            // runs reproducible for debugging.
             fuzzy_rng: std::cell::Cell::new(0x9E3779B97F4A7C15),
         })
     }
@@ -239,9 +239,9 @@ impl StxImage {
             .and_then(|t| t.sectors.iter().find(|s| s.sector == sector))
     }
 
-    /// Un octet "aléatoire" de plus (xorshift64*, une seule instance par
-    /// image partagée entre tous les secteurs fuzzy — pas besoin d'un état
-    /// par secteur, seule la variation d'une lecture à l'autre compte).
+    /// One more "random" byte (xorshift64*, a single instance per image
+    /// shared across all fuzzy sectors — no need for per-sector state,
+    /// only variation from one read to the next matters).
     fn next_random_byte(&self) -> u8 {
         let mut x = self.fuzzy_rng.get();
         x ^= x << 13;
@@ -266,19 +266,19 @@ impl FloppyDisk for StxImage {
         true
     }
 
-    /// Pour un secteur "fuzzy" (protection par bits physiquement instables,
-    /// voir la doc de [`StxSector::fuzzy_mask`]), combine l'octet réel avec
-    /// du bruit sur les positions instables — comme le vrai média (chaque
-    /// lecture y donne un résultat différent) et comme Hatari
-    /// (`src/floppies/stx.c` : `Byte = (Byte & FuzzyData[i]) |
-    /// (Hatari_rand() & ~FuzzyData[i])`). Sans ceci, une vérification de
-    /// protection qui compare deux lectures du même secteur et s'attend à
-    /// ce qu'elles DIFFÈRENT (preuve qu'il s'agit d'un média physique et
-    /// non d'une copie numérique parfaite) verrait toujours deux lectures
-    /// identiques ici — trouvé en creusant pourquoi `Rick_Dangerous.stx`
-    /// finissait par exécuter de la mémoire non initialisée comme du code,
-    /// bien après le chargement (piste 0, qui a un bloc fuzzy, vérifié
-    /// absente de toute variation avant ce correctif).
+    /// For a "fuzzy" sector (protection using physically unstable bits,
+    /// see the doc of [`StxSector::fuzzy_mask`]), combines the real byte
+    /// with noise on the unstable positions — like the real medium (each
+    /// read gives a different result there) and like Hatari
+    /// (`src/floppies/stx.c`: `Byte = (Byte & FuzzyData[i]) |
+    /// (Hatari_rand() & ~FuzzyData[i])`). Without this, a protection check
+    /// that compares two reads of the same sector and expects them to
+    /// DIFFER (proof that it's a physical medium and not a perfect digital
+    /// copy) would always see two identical reads here — found while
+    /// digging into why `Rick_Dangerous.stx` eventually executed
+    /// uninitialized memory as code, well after loading (track 0, which
+    /// has a fuzzy block, verified to show no variation at all before this
+    /// fix).
     fn read_sector(&self, track: u8, side: u8, sector: u8) -> Option<[u8; SECTOR_SIZE]> {
         let sec = self.find_sector(track, side, sector)?;
         let mut buf = sec.data;
@@ -293,12 +293,12 @@ impl FloppyDisk for StxImage {
 
     fn write_sector(&mut self, _track: u8, _side: u8, _sector: u8, _data: &[u8; SECTOR_SIZE]) {}
 
-    /// Compte RÉEL de secteurs de la piste/face visée (celui de son propre
-    /// TDR), pas le maximum global renvoyé par `sectors_per_track()` — une
-    /// image `.stx` protégée n'a typiquement PAS le même nombre de secteurs
-    /// sur toutes les pistes (voir la doc du module), donc utiliser le
-    /// maximum global désaligne progressivement le calcul de latence de
-    /// rotation d'une piste à l'autre.
+    /// REAL sector count of the targeted track/side (from its own TDR),
+    /// not the global maximum returned by `sectors_per_track()` — a
+    /// protected `.stx` image typically does NOT have the same number of
+    /// sectors on every track (see the module doc), so using the global
+    /// maximum would progressively misalign the rotational latency
+    /// calculation from one track to the next.
     fn sectors_on_track(&self, track: u8, side: u8) -> u8 {
         self.tracks
             .iter()
@@ -328,19 +328,19 @@ mod tests {
         v.to_le_bytes()
     }
 
-    /// Construit une image `.stx` synthétique à une piste, un secteur, pour
-    /// tester le parsing sans dépendre d'un fichier réel.
+    /// Builds a synthetic single-track, single-sector `.stx` image, to test
+    /// parsing without depending on a real file.
     fn build_minimal_stx(sector_payload: &[u8; SECTOR_SIZE]) -> Vec<u8> {
         build_stx_with_fuzzy(sector_payload, 0)
     }
 
-    /// Comme [`build_minimal_stx`], avec un bloc `fuzzy_size` (potentiellement
-    /// non nul) inséré entre la table de SDR et la charge utile du secteur —
-    /// voir [`StxImage::parse`] (`sector_data_ref`) : `data_offset` doit être
-    /// relatif à la fin de CE bloc, pas au début du TDR.
+    /// Like [`build_minimal_stx`], with a `fuzzy_size` block (potentially
+    /// non-zero) inserted between the SDR table and the sector payload —
+    /// see [`StxImage::parse`] (`sector_data_ref`): `data_offset` must be
+    /// relative to the end of THIS block, not to the start of the TDR.
     fn build_stx_with_fuzzy(sector_payload: &[u8; SECTOR_SIZE], fuzzy_size: u32) -> Vec<u8> {
         let mut file = Vec::new();
-        // En-tête.
+        // Header.
         file.extend_from_slice(b"RSY\0");
         file.extend_from_slice(&le16(3)); // version
         file.extend_from_slice(&le16(1)); // tool
@@ -349,9 +349,9 @@ mod tests {
         file.push(2); // revision
         file.extend_from_slice(&[0u8; 4]); // reserved
 
-        // `data_offset` relatif à la fin de la table de SDR + bloc fuzzy
-        // (voir la doc du module) : ici, le secteur suit immédiatement ce
-        // bloc, donc `data_offset = 0`.
+        // `data_offset` relative to the end of the SDR table + fuzzy block
+        // (see the module doc): here, the sector immediately follows that
+        // block, so `data_offset = 0`.
         let sdr_data_offset: u32 = 0;
         let track_pos = file.len();
         let block_size = 16 + 16 + fuzzy_size + SECTOR_SIZE as u32;
@@ -362,7 +362,7 @@ mod tests {
         file.extend_from_slice(&le16(1)); // sector_count
         file.extend_from_slice(&le16(0x61)); // flags
         file.extend_from_slice(&le16(6261)); // track_length
-        file.push(0); // track_number (piste 0, face 0)
+        file.push(0); // track_number (track 0, side 0)
         file.push(0); // track_type
 
         // SDR.
@@ -371,8 +371,8 @@ mod tests {
         file.extend_from_slice(&le16(0)); // read_time
         file.push(0); // track
         file.push(0); // head
-        file.push(1); // sector (1-indexé)
-        file.push(2); // size_code = 512 octets
+        file.push(1); // sector (1-indexed)
+        file.push(2); // size_code = 512 bytes
         file.extend_from_slice(&[0u8; 4]); // crc1, crc2, fdc_status, reserved
 
         assert_eq!(file.len(), track_pos + 16 + 16);
@@ -381,9 +381,9 @@ mod tests {
         file
     }
 
-    /// Comme [`build_minimal_stx`], mais avec un `bit_position` choisi pour
-    /// le secteur — teste que ce champ (jusqu'ici toujours à 0 dans les
-    /// autres constructeurs de ce module) est bien extrait et exposé via
+    /// Like [`build_minimal_stx`], but with a chosen `bit_position` for the
+    /// sector — tests that this field (always 0 so far in the other
+    /// builders of this module) is properly extracted and exposed via
     /// [`FloppyDisk::sector_bit_position`].
     fn build_minimal_stx_with_bit_position(sector_payload: &[u8; SECTOR_SIZE], bit_position: u16) -> Vec<u8> {
         let mut file = Vec::new();
@@ -422,64 +422,64 @@ mod tests {
     }
 
     #[test]
-    fn expose_la_position_reelle_du_secteur_via_bit_position() {
+    fn exposes_real_sector_position_via_bit_position() {
         let payload = [0u8; SECTOR_SIZE];
         let file = build_minimal_stx_with_bit_position(&payload, 12345);
-        let image = StxImage::parse(&file).expect("parsing valide");
+        let image = StxImage::parse(&file).expect("valid parsing");
 
         assert_eq!(image.sector_bit_position(0, 0, 1), Some(12345));
-        // Secteur/piste inexistants : pas de position connue.
+        // Nonexistent sector/track: no known position.
         assert_eq!(image.sector_bit_position(0, 0, 2), None);
         assert_eq!(image.sector_bit_position(1, 0, 1), None);
     }
 
     #[test]
-    fn rejette_signature_invalide() {
+    fn rejects_invalid_signature() {
         let data = vec![0u8; 32];
         let is_bad_magic = matches!(StxImage::parse(&data), Err(StxError::BadMagic));
         assert!(is_bad_magic);
     }
 
     #[test]
-    fn extrait_le_secteur_unique() {
+    fn extracts_the_single_sector() {
         let mut payload = [0u8; SECTOR_SIZE];
         for (i, b) in payload.iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
         let file = build_minimal_stx(&payload);
-        let image = StxImage::parse(&file).expect("parsing valide");
+        let image = StxImage::parse(&file).expect("valid parsing");
 
         assert_eq!(image.num_tracks(), 1);
         assert_eq!(image.num_sides(), 1);
         assert_eq!(image.sectors_per_track(), 1);
         assert!(image.write_protected());
 
-        let sector = image.read_sector(0, 0, 1).expect("secteur present");
+        let sector = image.read_sector(0, 0, 1).expect("sector present");
         assert_eq!(sector, payload);
     }
 
     #[test]
-    fn extrait_le_secteur_avec_bloc_fuzzy_non_nul() {
-        // Bug réel corrigé : sur une piste avec `fuzzy_size != 0` (secteurs
-        // à protection par bits instables — le cas de `Rick_Dangerous.stx`,
-        // un jeu commercial réel dont le secteur de boot piste 0 ressortait
-        // entièrement à zéro avant ce correctif), `data_offset` doit être
-        // compté depuis la fin du bloc fuzzy, pas depuis le début du TDR.
+    fn extracts_sector_with_nonzero_fuzzy_block() {
+        // Real bug fixed: on a track with `fuzzy_size != 0` (sectors
+        // protected with unstable bits — the case of `Rick_Dangerous.stx`,
+        // a real commercial game whose track 0 boot sector came out
+        // entirely zeroed before this fix), `data_offset` must be counted
+        // from the end of the fuzzy block, not from the start of the TDR.
         let mut payload = [0u8; SECTOR_SIZE];
         for (i, b) in payload.iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
         let file = build_stx_with_fuzzy(&payload, 1024);
-        let image = StxImage::parse(&file).expect("parsing valide");
+        let image = StxImage::parse(&file).expect("valid parsing");
 
-        let sector = image.read_sector(0, 0, 1).expect("secteur present");
-        assert_eq!(sector, payload, "le bloc fuzzy de 1024 octets doit être sauté, pas confondu avec le secteur");
+        let sector = image.read_sector(0, 0, 1).expect("sector present");
+        assert_eq!(sector, payload, "the 1024-byte fuzzy block must be skipped, not confused with the sector");
     }
 
-    /// Comme [`build_stx_with_fuzzy`], mais marque le secteur unique comme
-    /// "fuzzy" (bit 7 de `fdc_status`) et écrit `mask` (exactement
-    /// `SECTOR_SIZE` octets, comme Hatari) comme bloc fuzzy au lieu d'un
-    /// simple remplissage `0xFF`.
+    /// Like [`build_stx_with_fuzzy`], but marks the single sector as
+    /// "fuzzy" (bit 7 of `fdc_status`) and writes `mask` (exactly
+    /// `SECTOR_SIZE` bytes, like Hatari) as the fuzzy block instead of a
+    /// plain `0xFF` fill.
     fn build_stx_with_fuzzy_flag(sector_payload: &[u8; SECTOR_SIZE], mask: &[u8; SECTOR_SIZE]) -> Vec<u8> {
         build_stx_with_status(sector_payload, mask, 0x80)
     }
@@ -526,72 +526,72 @@ mod tests {
     }
 
     #[test]
-    fn secteur_fuzzy_varie_sur_les_positions_instables_et_stabilise_les_autres() {
-        // Comme Hatari (`src/floppies/stx.c` : `Byte = (Byte & FuzzyData[i])
-        // | (Hatari_rand() & ~FuzzyData[i])`) — trouvé en retraçant un
-        // DoubleFault tardif de Rick_Dangerous.stx jusqu'à une vérification
-        // de protection qui doit voir deux lectures DIFFÉRENTES du même
-        // secteur "fuzzy" pour ne pas se croire face à une copie parfaite.
+    fn fuzzy_sector_varies_on_unstable_positions_and_stays_stable_on_others() {
+        // Like Hatari (`src/floppies/stx.c`: `Byte = (Byte & FuzzyData[i])
+        // | (Hatari_rand() & ~FuzzyData[i])`) — found by tracing a late
+        // DoubleFault in Rick_Dangerous.stx back to a protection check that
+        // must see two DIFFERENT reads of the same "fuzzy" sector so as not
+        // to believe it's facing a perfect copy.
         let payload = [0x42u8; SECTOR_SIZE];
-        let mut mask = [0xFFu8; SECTOR_SIZE]; // tout stable...
-        mask[0] = 0x00; // ...sauf l'octet 0, entièrement instable.
+        let mut mask = [0xFFu8; SECTOR_SIZE]; // everything stable...
+        mask[0] = 0x00; // ...except byte 0, entirely unstable.
         let file = build_stx_with_fuzzy_flag(&payload, &mask);
-        let image = StxImage::parse(&file).expect("parsing valide");
+        let image = StxImage::parse(&file).expect("valid parsing");
 
         let mut byte0_values = std::collections::HashSet::new();
         for _ in 0..50 {
-            let sector = image.read_sector(0, 0, 1).expect("secteur present");
-            // Positions stables : toujours la vraie valeur, sur les 50 lectures.
-            assert_eq!(&sector[1..], &payload[1..], "les octets stables ne doivent jamais varier");
+            let sector = image.read_sector(0, 0, 1).expect("sector present");
+            // Stable positions: always the real value, across all 50 reads.
+            assert_eq!(&sector[1..], &payload[1..], "stable bytes must never vary");
             byte0_values.insert(sector[0]);
         }
         assert!(
             byte0_values.len() > 1,
-            "l'octet fuzzy doit varier d'une lecture à l'autre (obtenu : {byte0_values:?})"
+            "the fuzzy byte must vary from one read to the next (got: {byte0_values:?})"
         );
     }
 
     #[test]
-    fn secteur_marque_crc_error_le_signale_sans_affecter_les_octets() {
-        // Bit 3 (STX_SECTOR_FLAG_CRC) sans bit 7 (fuzzy) : technique de
-        // protection distincte (CRC d'ID délibérément faux) — souvent posée
-        // EN MÊME TEMPS que fuzzy sur le même secteur en pratique
-        // (Rick_Dangerous.stx pistes 0-4 secteurs 11-12, fdc_status=0x88),
-        // mais testée seule ici pour isoler l'effet de chaque bit.
+    fn sector_marked_crc_error_reports_it_without_affecting_bytes() {
+        // Bit 3 (STX_SECTOR_FLAG_CRC) without bit 7 (fuzzy): a distinct
+        // protection technique (deliberately wrong ID CRC) — often set AT
+        // THE SAME TIME as fuzzy on the same sector in practice
+        // (Rick_Dangerous.stx tracks 0-4 sectors 11-12, fdc_status=0x88),
+        // but tested alone here to isolate the effect of each bit.
         let mut payload = [0u8; SECTOR_SIZE];
         for (i, b) in payload.iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
         let mask = [0xFFu8; SECTOR_SIZE];
         let file = build_stx_with_status(&payload, &mask, 0x08);
-        let image = StxImage::parse(&file).expect("parsing valide");
+        let image = StxImage::parse(&file).expect("valid parsing");
 
         assert!(image.sector_has_crc_error(0, 0, 1));
-        assert!(!image.sector_has_crc_error(0, 0, 2), "secteur inexistant : jamais d'erreur CRC");
-        let sector = image.read_sector(0, 0, 1).expect("secteur present");
-        assert_eq!(sector, payload, "l'erreur CRC ne doit pas altérer les octets transférés");
+        assert!(!image.sector_has_crc_error(0, 0, 2), "nonexistent sector: never a CRC error");
+        let sector = image.read_sector(0, 0, 1).expect("sector present");
+        assert_eq!(sector, payload, "the CRC error must not alter the transferred bytes");
     }
 
     #[test]
-    fn secteur_non_fuzzy_reste_identique_a_chaque_lecture() {
+    fn non_fuzzy_sector_stays_identical_on_every_read() {
         let mut payload = [0u8; SECTOR_SIZE];
         for (i, b) in payload.iter_mut().enumerate() {
             *b = (i % 256) as u8;
         }
         let file = build_minimal_stx(&payload);
-        let image = StxImage::parse(&file).expect("parsing valide");
+        let image = StxImage::parse(&file).expect("valid parsing");
 
         for _ in 0..10 {
-            let sector = image.read_sector(0, 0, 1).expect("secteur present");
-            assert_eq!(sector, payload, "un secteur ordinaire ne doit jamais varier");
+            let sector = image.read_sector(0, 0, 1).expect("sector present");
+            assert_eq!(sector, payload, "an ordinary sector must never vary");
         }
     }
 
     #[test]
-    fn secteur_absent_renvoie_none() {
+    fn missing_sector_returns_none() {
         let payload = [0u8; SECTOR_SIZE];
         let file = build_minimal_stx(&payload);
-        let image = StxImage::parse(&file).expect("parsing valide");
+        let image = StxImage::parse(&file).expect("valid parsing");
 
         assert!(image.read_sector(0, 0, 2).is_none());
         assert!(image.read_sector(1, 0, 1).is_none());
@@ -599,11 +599,11 @@ mod tests {
     }
 
     #[test]
-    fn fichier_tronque_est_rejete() {
+    fn truncated_file_is_rejected() {
         let payload = [0u8; SECTOR_SIZE];
         let file = build_minimal_stx(&payload);
-        // Coupe en plein milieu du TDR de la seule piste : ni le TDR ni le
-        // SDR qui suit ne tiennent dans le fichier tronqué.
+        // Cuts right in the middle of the sole track's TDR: neither the TDR
+        // nor the following SDR fit in the truncated file.
         let truncated = &file[..20];
         let is_truncated = matches!(StxImage::parse(truncated), Err(StxError::Truncated));
         assert!(is_truncated);

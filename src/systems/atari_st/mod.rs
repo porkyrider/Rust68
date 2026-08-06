@@ -1,64 +1,60 @@
-//! Board Atari ST : mapping mémoire réel + câblage MFP/GLUE → IPL.
+//! Atari ST board: real memory map + MFP/GLUE → IPL wiring.
 //!
-//! Implémente [`crate::Bus`] pour un ST/STE minimal : RAM installée à
-//! `0x000000`, ROM TOS à `0xFC0000`, MFP 68901 aux adresses impaires
-//! `0xFFFA01`-`0xFFFA2F`. Sur silicium réel, le MMU répond toujours
-//! /DTACK dans tout l'espace d'adressage "RAM ST" (4 Mo, voir
-//! [`ST_RAM_ADDRESS_SPACE`]) — même au-delà de la RAM physiquement
-//! installée, l'accès ne déclenche **jamais** de bus error dans cette
-//! plage (contrairement au vrai "trou" entre 4 Mo et le début de la zone
-//! d'E/S, `0xFF8000`, qui lui déclenche un bus error via
-//! [`crate::Bus::take_bus_fault`] — mécanisme que de nombreux
-//! programmes/démos utilisent pour détecter la RAM installée une fois le
-//! TOS démarré). Au-delà de la RAM réellement installée mais dans les
-//! 4 Mo, un accès "flotte" : modélisé ici par une valeur fixe non
-//! stockée (jamais ce qui vient d'être écrit), plutôt que la valeur
-//! réelle (capacité résiduelle du bus selon le dernier cycle, non
-//! reproductible dans un émulateur déterministe) — c'est justement cette
-//! absence de persistance, pas une histoire d'adressage replié, que le
-//! TOS observe pour sa propre détection de RAM au tout début du boot
-//! froid (écrire un motif, le relire, conclure "pas de RAM ici" si ça ne
-//! correspond pas).
+//! Implements [`crate::Bus`] for a minimal ST/STE: installed RAM at
+//! `0x000000`, TOS ROM at `0xFC0000`, MFP 68901 at odd addresses
+//! `0xFFFA01`-`0xFFFA2F`. On real silicon, the MMU always responds with
+//! /DTACK across the whole "ST RAM" address space (4 MB, see
+//! [`ST_RAM_ADDRESS_SPACE`]) — even beyond the physically installed RAM,
+//! an access in this range **never** triggers a bus error (unlike the
+//! real "hole" between 4 MB and the start of the I/O area, `0xFF8000`,
+//! which does trigger a bus error via [`crate::Bus::take_bus_fault`] —
+//! a mechanism many programs/demos use to detect installed RAM once TOS
+//! has started). Beyond the actually installed RAM but within the 4 MB,
+//! an access "floats": modeled here as a fixed, non-stored value (never
+//! what was just written), rather than the real value (residual bus
+//! capacitance from the last cycle, not reproducible in a deterministic
+//! emulator) — it is precisely this lack of persistence, not some
+//! address-folding story, that TOS observes for its own RAM detection at
+//! the very start of a cold boot (write a pattern, read it back, conclude
+//! "no RAM here" if it doesn't match).
 //!
-//! Câblage d'interruption réel ST/STE, par priorité décroissante :
-//! MFP → IPL6, VBL (GLUE) → IPL4, HBL (GLUE) → IPL2. Les deux ACIA
-//! (clavier + MIDI) ne génèrent pas d'IPL directement : leurs sorties IRQ
-//! sont OR câblées sur `GPIP4` du MFP (câblage réel ST/STE). Le WD1772
-//! (`/INTRQ`) est câblé sur `GPIP5` (câblage réel ST/STE).
+//! Real ST/STE interrupt wiring, in decreasing priority order:
+//! MFP → IPL6, VBL (GLUE) → IPL4, HBL (GLUE) → IPL2. The two ACIAs
+//! (keyboard + MIDI) do not generate an IPL directly: their IRQ outputs
+//! are OR-wired onto the MFP's `GPIP4` (real ST/STE wiring). The WD1772
+//! (`/INTRQ`) is wired onto `GPIP5` (real ST/STE wiring).
 //!
-//! Le Shifter (vidéo) est piloté par le rythme HBL/VBL du GLUE : `tick`
-//! détecte les changements de `Glue::current_line`/`frame_count` et
-//! déclenche `Shifter::render_scanline`/`start_frame` en conséquence,
-//! accumulant l'image dans [`AtariSt::framebuffer`].
+//! The Shifter (video) is driven by the GLUE's HBL/VBL rhythm: `tick`
+//! detects changes in `Glue::current_line`/`frame_count` and triggers
+//! `Shifter::render_scanline`/`start_frame` accordingly, accumulating
+//! the image in [`AtariSt::framebuffer`].
 //!
-//! ## Limitations connues (v1)
-//! - RAM/ROM/MFP/ACIA×2/YM2149/Shifter sont réellement mappés. Le reste de
-//!   la zone d'E/S (`0xFF8000`-`0xFFFFFF` : FDC/DMA…) et le port cartouche
-//!   (`0xFA0000`-`0xFBFFFF`) répondent `0xFF` en lecture et ignorent les
-//!   écritures — chip select réel mais périphérique pas encore émulé (ou,
-//!   pour la cartouche, absente), plutôt qu'un bus error qui casserait
-//!   tout polling de statut par le logiciel ou la sonde de cartouche que
-//!   fait la ROM TOS au boot (`cmpi.l #$fa52235f,$fa0000`).
-//! - `rom_base` vaut `DEFAULT_ROM_BASE` (`0xFC0000`, TOS <= 1.04) par
-//!   défaut ; [`AtariSt::set_rom_base`] permet de le changer à `0xE00000`
-//!   pour les TOS >= 1.06 (256 Ko, ne tiendrait de toute façon pas entre
-//!   `0xFC0000` et `IO_BASE`). Pas de mirroring simultané aux deux adresses.
-//! - Pas de modèle de contention DRAM/vidéo (`is_contended` reste à
-//!   `false`) : le Shifter est maintenant implémenté mais son accès
-//!   mémoire n'est pas (encore) modélisé comme volant des cycles bus au
-//!   CPU.
-//! - Les adresses paires adjacentes à un registre MFP (ex: `0xFFFA00`,
-//!   normalement flottantes sur un vrai bus 8 bits) retombent dans le
-//!   stub d'E/S générique plutôt que de modéliser précisément le
-//!   comportement de décodage UDS/LDS.
-//! - `AtariSt::tick` doit être appelé explicitement par l'appelant après
-//!   chaque `Cpu::step` (ce crate ne fait pas progresser les
-//!   périphériques tout seul) — voir l'exemple sur `tick`.
-//! - Registres DMA/WD1772 simplifiés : sélecteur de registre FDC
-//!   (`DMA_MODE`, bits 0-1) modélisé, mais pas le registre de nombre de
-//!   secteurs ni la sélection FDC/HDC réels du contrôleur DMA ST — notre
-//!   modèle de transfert "instantané par secteur" n'en a pas besoin
-//!   fonctionnellement (voir `peripherals::atari_st::wd1772` pour le détail).
+//! ## Known limitations (v1)
+//! - RAM/ROM/MFP/ACIA×2/YM2149/Shifter are actually mapped. The rest of
+//!   the I/O area (`0xFF8000`-`0xFFFFFF`: FDC/DMA…) and the cartridge port
+//!   (`0xFA0000`-`0xFBFFFF`) respond `0xFF` on reads and ignore writes —
+//!   a real chip select but a peripheral not yet emulated (or, for the
+//!   cartridge, absent), rather than a bus error that would break any
+//!   status polling done by software or the cartridge probe the TOS ROM
+//!   performs at boot (`cmpi.l #$fa52235f,$fa0000`).
+//! - `rom_base` defaults to `DEFAULT_ROM_BASE` (`0xFC0000`, TOS <= 1.04);
+//!   [`AtariSt::set_rom_base`] allows changing it to `0xE00000` for
+//!   TOS >= 1.06 (256 KB, which wouldn't fit between `0xFC0000` and
+//!   `IO_BASE` anyway). No simultaneous mirroring at both addresses.
+//! - No DRAM/video contention model (`is_contended` stays `false`): the
+//!   Shifter is now implemented but its memory access is not (yet)
+//!   modeled as stealing bus cycles from the CPU.
+//! - Even addresses adjacent to an MFP register (e.g. `0xFFFA00`,
+//!   normally floating on a real 8-bit bus) fall through to the generic
+//!   I/O stub instead of precisely modeling UDS/LDS decoding behavior.
+//! - `AtariSt::tick` must be called explicitly by the caller after each
+//!   `Cpu::step` (this crate does not advance the peripherals on its
+//!   own) — see the example on `tick`.
+//! - Simplified DMA/WD1772 registers: the FDC register selector
+//!   (`DMA_MODE`, bits 0-1) is modeled, but not the real sector-count
+//!   register or the real FDC/HDC selection of the ST DMA controller —
+//!   our "instantaneous per-sector" transfer model doesn't functionally
+//!   need it (see `peripherals::atari_st::wd1772` for details).
 
 pub mod model;
 
@@ -74,373 +70,370 @@ use crate::peripherals::atari_st::wd1772::{self, DmaChannel, FloppyDisk, SECTOR_
 use crate::peripherals::atari_st::ym2149::{self, Ym2149};
 use crate::{ADDR_MASK, Bus};
 
-/// Adresse du premier registre MFP (`GPIP`), sur ST/STE réel.
+/// Address of the first MFP register (`GPIP`), on real ST/STE.
 pub const MFP_BASE: u32 = 0xFFFA01;
-/// Nombre de registres logiques du MFP (voir `peripherals::atari_st::mfp::reg`).
+/// Number of logical MFP registers (see `peripherals::atari_st::mfp::reg`).
 const MFP_REG_COUNT: u32 = 24;
-/// Adresse du dernier registre MFP (`UDR`).
+/// Address of the last MFP register (`UDR`).
 pub const MFP_END: u32 = MFP_BASE + (MFP_REG_COUNT - 1) * 2;
 
-/// ACIA clavier : registre de contrôle/statut, sur ST/STE réel.
+/// Keyboard ACIA: control/status register, on real ST/STE.
 pub const ACIA_KEYBOARD_CONTROL: u32 = 0xFFFC00;
-/// ACIA clavier : registre de données.
+/// Keyboard ACIA: data register.
 pub const ACIA_KEYBOARD_DATA: u32 = 0xFFFC02;
-/// ACIA MIDI : registre de contrôle/statut.
+/// MIDI ACIA: control/status register.
 pub const ACIA_MIDI_CONTROL: u32 = 0xFFFC04;
-/// ACIA MIDI : registre de données.
+/// MIDI ACIA: data register.
 pub const ACIA_MIDI_DATA: u32 = 0xFFFC06;
 
-/// YM2149 : registre sélecteur (écriture = choix du registre, lecture =
-/// registre actuellement sélectionné), sur ST/STE réel.
+/// YM2149: selector register (write = register choice, read = currently
+/// selected register), on real ST/STE.
 pub const YM2149_SELECT: u32 = 0xFF8800;
-/// YM2149 : registre de données du registre actuellement sélectionné.
+/// YM2149: data register of the currently selected register.
 pub const YM2149_DATA: u32 = 0xFF8802;
 
-/// WD1772 : registre multiplexé (Commande/Statut/Piste/Secteur/Donnée
-/// selon le sélecteur `DMA_MODE`), sur ST/STE réel.
+/// WD1772: multiplexed register (Command/Status/Track/Sector/Data
+/// depending on the `DMA_MODE` selector), on real ST/STE.
 pub const FDC_DATA: u32 = 0xFF8604;
-/// Contrôleur DMA : sélecteur de registre FDC — registre 16 bits sur
-/// silicium réel (bits 0, 9-15 inutilisés ; bits 1-2 = sélecteur de
-/// registre FDC A1-A0, voir [`AtariSt::write16`]), confirmé par Hatari
-/// (`fdc.c` : `FDC_reg = (FDC_DMA.Mode & 0x6) >> 1`). PAS bits 0-1 comme un
-/// registre 8 bits classique — un accès mot (l'usage réel de TOS) place le
-/// sélecteur dans l'octet BAS du mot, ce que seule une prise en charge
-/// explicite de l'accès 16 bits complet peut voir (un `write8` naïf décomposé
-/// octet par octet, comme le reste du bus, ne verrait que l'octet haut,
-/// toujours nul pour ces petites valeurs — le sélecteur resterait alors
-/// bloqué à 0 en permanence quoi que TOS écrive).
+/// DMA controller: FDC register selector — a 16-bit register on real
+/// silicon (bit 0, bits 9-15 unused; bits 1-2 = FDC register selector
+/// A1-A0, see [`AtariSt::write16`]), confirmed by Hatari
+/// (`fdc.c`: `FDC_reg = (FDC_DMA.Mode & 0x6) >> 1`). NOT bits 0-1 as a
+/// classic 8-bit register would suggest — a word access (TOS's real
+/// usage) places the selector in the LOW byte of the word, which only
+/// explicit support for a full 16-bit access can see (a naive `write8`
+/// decomposed byte by byte, like the rest of the bus, would only see the
+/// high byte, always zero for these small values — the selector would
+/// then stay permanently stuck at 0 no matter what TOS writes).
 pub const DMA_MODE: u32 = 0xFF8606;
-/// Compteur d'adresse DMA, octet haut.
+/// DMA address counter, high byte.
 pub const DMA_ADDR_HIGH: u32 = 0xFF8609;
-/// Compteur d'adresse DMA, octet médian.
+/// DMA address counter, middle byte.
 pub const DMA_ADDR_MID: u32 = 0xFF860B;
-/// Compteur d'adresse DMA, octet bas.
+/// DMA address counter, low byte.
 pub const DMA_ADDR_LOW: u32 = 0xFF860D;
 
-/// Registre de synchronisation du GLUE (bit 1 = sélection 50/60Hz externe)
-/// — voir [`crate::peripherals::atari_st::glue::Glue::write_sync`] pour la
-/// suppression de bordure verticale STE que sa cycle-position déclenche.
+/// GLUE synchronization register (bit 1 = external 50/60Hz selection)
+/// — see [`crate::peripherals::atari_st::glue::Glue::write_sync`] for the
+/// STE vertical border removal that its cycle-position triggers.
 pub const GLUE_SYNC: u32 = 0xFF820A;
 
-/// Base des registres du Blitter, sur STE réel.
+/// Base of the Blitter registers, on real STE.
 pub const BLITTER_BASE: u32 = 0xFF8A00;
 
-/// Début de la zone d'E/S général (ACIA, PSG, FDC, Shifter…) sur ST/STE.
+/// Start of the general I/O area (ACIA, PSG, FDC, Shifter…) on ST/STE.
 pub const IO_BASE: u32 = 0xFF8000;
-/// Fin de l'espace d'adressage (24 bits).
+/// End of the address space (24 bits).
 pub const IO_END: u32 = 0x00FF_FFFF;
 
-/// Port cartouche (ROM externe, ex: cartouches jeu). Contrairement au
-/// "trou" physique au-dessus de la RAM installée (qui déclenche un bus
-/// error, voir [`crate::Bus::take_bus_fault`]), une cartouche absente
-/// répond en lecture flottante (`0xFF`) SANS bus error — le boot ROM TOS
-/// sonde justement cette zone (`cmpi.l #$fa52235f,$fa0000` : signature de
-/// cartouche) pour détecter une cartouche sans jamais planter s'il n'y en
-/// a pas.
+/// Cartridge port (external ROM, e.g. game cartridges). Unlike the
+/// physical "hole" above installed RAM (which triggers a bus error, see
+/// [`crate::Bus::take_bus_fault`]), an absent cartridge responds with a
+/// floating read (`0xFF`) WITHOUT a bus error — the TOS boot ROM probes
+/// precisely this area (`cmpi.l #$fa52235f,$fa0000`: cartridge signature)
+/// to detect a cartridge without ever crashing if there isn't one.
 pub const CARTRIDGE_BASE: u32 = 0xFA0000;
 pub const CARTRIDGE_END: u32 = 0xFBFFFF;
 
-/// DMA sound (STE) — voir [`crate::peripherals::atari_st::dma_sound::DmaSound`]
-/// (registre-fidèle, lecture PCM 8 bits mono/stéréo aux 4 fréquences
-/// matérielles, simplifié : pas de FIFO 8 octets ni de filtre passe-bas,
-/// voir sa doc de module). Le Microwire/LMC1992 (`$FF8920`/`22`/`24`) est
-/// géré séparément, voir [`crate::peripherals::atari_st::microwire::Microwire`].
-/// En dessous de `$FF8922` (registre Microwire DATA), une réponse `0x00`
-/// (pas `0xFF` comme le reste de la zone d'E/S non émulée) reste nécessaire
-/// pour les adresses non mappées à un registre réel de ces deux
-/// périphériques : le TOS >= 1.62 (STE) écrit puis relit le registre
-/// Microwire DATA en boucle en attendant qu'il retombe à zéro (fin de
-/// décalage série) au tout début du boot — avec la réponse générique
-/// `0xFF` (bits toujours à 1), cette attente ne se terminerait jamais (voir
-/// le commentaire sur ce cas particulier dans [`AtariSt::read8`]).
+/// DMA sound (STE) — see [`crate::peripherals::atari_st::dma_sound::DmaSound`]
+/// (register-accurate, 8-bit PCM mono/stereo playback at the 4 hardware
+/// frequencies, simplified: no 8-byte FIFO nor low-pass filter, see its
+/// module doc). The Microwire/LMC1992 (`$FF8920`/`22`/`24`) is handled
+/// separately, see [`crate::peripherals::atari_st::microwire::Microwire`].
+/// Below `$FF8922` (Microwire DATA register), a `0x00` response (not
+/// `0xFF` like the rest of the non-emulated I/O area) remains necessary
+/// for addresses not mapped to a real register of these two peripherals:
+/// TOS >= 1.62 (STE) writes then reads back the Microwire DATA register
+/// in a loop, waiting for it to fall back to zero (end of serial shift)
+/// at the very start of boot — with the generic `0xFF` response (bits
+/// always 1), this wait would never end (see the comment on this special
+/// case in [`AtariSt::read8`]).
 pub const STE_DMA_SOUND_BASE: u32 = 0xFF8900;
 pub const STE_DMA_SOUND_END: u32 = 0xFF893F;
-/// Registre Microwire DATA (interface série vers le mixeur LMC1992) — voir
-/// le commentaire sur son cas particulier en lecture dans [`AtariSt::read8`].
+/// Microwire DATA register (serial interface to the LMC1992 mixer) — see
+/// the comment on its special read case in [`AtariSt::read8`].
 const STE_MICROWIRE_DATA: u32 = 0xFF8922;
 const STE_MICROWIRE_DATA1: u32 = 0xFF8923;
-/// Registre Microwire MASK (masque de décalage série) — voir
+/// Microwire MASK register (serial shift mask) — see
 /// [`crate::peripherals::atari_st::microwire::Microwire`].
 const STE_MICROWIRE_MASK: u32 = 0xFF8924;
 const STE_MICROWIRE_MASK1: u32 = 0xFF8925;
 
-/// Adresse de base usuelle de la ROM TOS (192 Ko, TOS 1.x/2.x).
+/// Usual base address of the TOS ROM (192 KB, TOS 1.x/2.x).
 pub const DEFAULT_ROM_BASE: u32 = 0xFC0000;
 
-/// Registre de configuration mémoire (MMU), sur ST/STE réel. Écrire ici
-/// désactive l'overlay ROM à l'adresse 0 (voir [`AtariSt::overlay`]) — le
-/// TOS le fait très tôt au boot, juste après avoir sondé le cookie de
-/// warmstart, pour reprendre normalement le contrôle des adresses basses
-/// une fois son propre code d'amorçage terminé.
+/// Memory configuration register (MMU), on real ST/STE. Writing here
+/// disables the ROM overlay at address 0 (see [`AtariSt::overlay`]) — TOS
+/// does this very early at boot, right after probing the warmstart
+/// cookie, to normally regain control of the low addresses once its own
+/// bootstrap code has finished.
 ///
-/// Bits 3-2 = taille logique annoncée de la banque 0, bits 1-0 = banque 1
-/// (`00`=128 Ko, `01`=512 Ko, `10`=2 Mo, `11`=réservé) — confirmé par le
-/// code source de Hatari (`stMemory.c`, `STMemory_MMU_ConfToBank`). Le TOS
-/// l'écrit lui-même pendant la détection de RAM au boot froid ; pilote
-/// réellement le mirroring d'adresse intra-banque (voir
-/// [`AtariSt::translate_ram_addr`]) sur STE, pas seulement le timing de
-/// rafraîchissement DRAM.
+/// Bits 3-2 = announced logical size of bank 0, bits 1-0 = bank 1
+/// (`00`=128 KB, `01`=512 KB, `10`=2 MB, `11`=reserved) — confirmed by
+/// Hatari's source code (`stMemory.c`, `STMemory_MMU_ConfToBank`). TOS
+/// writes it itself during RAM detection at cold boot; it actually
+/// drives intra-bank address mirroring (see
+/// [`AtariSt::translate_ram_addr`]) on STE, not just DRAM refresh timing.
 pub const MEMORY_CONF: u32 = 0xFF8001;
 
-/// Taille de l'espace d'adressage "RAM ST" sur ST/STE réel (4 Mo, deux
-/// banques MMU de 2 Mo chacune), par opposition au vrai "trou" au-delà,
-/// avant `IO_BASE` — voir la doc de [`AtariSt::in_floating_st_ram`] pour le
-/// détail de ce qui déclenche (ou pas) un bus error dans cette plage selon
-/// le type d'accès (CPU direct vs DMA).
+/// Size of the "ST RAM" address space on real ST/STE (4 MB, two MMU
+/// banks of 2 MB each), as opposed to the real "hole" beyond it, before
+/// `IO_BASE` — see the doc of [`AtariSt::in_floating_st_ram`] for the
+/// details of what triggers (or doesn't) a bus error in this range
+/// depending on the access type (direct CPU vs DMA).
 const ST_RAM_ADDRESS_SPACE: u32 = 4 * 1024 * 1024;
 
-/// Cycles CPU accordés au CPU entre deux tranches de blit non-HOG (64
-/// accès bus, voir `Blitter::execute`/`BUS_ACCESSES_PER_SLICE`),
-/// c'est-à-dire le temps que le CPU a pour s'exécuter en parallèle avant
-/// que le Blitter ne reprenne la main — PAS le temps que le Blitter
-/// lui-même met à traiter sa tranche. Utilisé pour cadencer la reprise
-/// autonome du Blitter dans [`AtariSt::tick`] au même rythme que le vrai
-/// matériel, plutôt qu'une tranche entière par instruction CPU (bien trop
-/// rapide).
+/// CPU cycles granted to the CPU between two non-HOG blit slices (64 bus
+/// accesses, see `Blitter::execute`/`BUS_ACCESSES_PER_SLICE`), i.e. the
+/// time the CPU has to run in parallel before the Blitter takes back
+/// control — NOT the time the Blitter itself takes to process its slice.
+/// Used to pace the Blitter's autonomous resumption in [`AtariSt::tick`]
+/// at the same rate as real hardware, rather than a whole slice per CPU
+/// instruction (far too fast).
 ///
-/// Valeur reprise de Hatari (`src/blitter.c`, `Blitter_Start`, mode non
-/// "cycle exact" — celui qui correspond à notre propre modèle, sans
-/// comptage d'accès bus individuel) : le commentaire y est explicite —
+/// Value taken from Hatari (`src/blitter.c`, `Blitter_Start`, non "cycle
+/// exact" mode — the one matching our own model, without individual bus
+/// access counting): the comment there is explicit —
 /// "In non cycle exact mode, the blitter will have 64 bus accesses and the
-/// cpu will run during 64*4 = 256 cpu cycles" — implémenté via
-/// `CycInt_AddRelativeInterrupt(BLITTER_NONHOG_BUS_CPU*4, ...)` avec
-/// `BLITTER_NONHOG_BUS_CPU = 64`, donc bien 256, pas 64 (bug de calibration
-/// corrigé ici : une valeur de 64 laissait le Blitter reprendre la main
-/// 4× plus souvent que sur le matériel de référence).
+/// cpu will run during 64*4 = 256 cpu cycles" — implemented via
+/// `CycInt_AddRelativeInterrupt(BLITTER_NONHOG_BUS_CPU*4, ...)` with
+/// `BLITTER_NONHOG_BUS_CPU = 64`, so indeed 256, not 64 (calibration bug
+/// fixed here: a value of 64 let the Blitter take back control 4x more
+/// often than on the reference hardware).
 const BLITTER_SLICE_CYCLES: u32 = 256;
 
-/// Broche GPIP du MFP câblée sur le signal "MONO DETECT" du connecteur
-/// moniteur, sur ST/STE réel : un moniteur monochrome met ce signal à la
-/// masse (broche lue à 0), tandis qu'un moniteur couleur (ou l'absence de
-/// moniteur) laisse une résistance de tirage le maintenir à l'état haut
-/// (broche lue à 1). Le TOS lit cette broche très tôt au boot pour choisir
-/// entre le mode haute résolution monochrome (640×400 N&B) et les modes
-/// couleur (320×200/640×200) — sans ce câblage, la broche resterait à son
-/// état par défaut (0), et le TOS conclurait à tort à un moniteur
-/// monochrome. Ce board modélise un moniteur couleur : la broche est donc
-/// maintenue à 1 en permanence, y compris après un `/RESET` logiciel
-/// (`Bus::reset_bus`) puisque le signal reflète un branchement physique
-/// externe, pas un état interne du MFP que `/RESET` réinitialiserait.
+/// MFP GPIP pin wired to the "MONO DETECT" signal of the monitor
+/// connector, on real ST/STE: a monochrome monitor pulls this signal to
+/// ground (pin read as 0), while a color monitor (or the absence of a
+/// monitor) leaves a pull-up resistor holding it high (pin read as 1).
+/// TOS reads this pin very early at boot to choose between monochrome
+/// high resolution mode (640×400 B&W) and the color modes (320×200/
+/// 640×200) — without this wiring, the pin would stay at its default
+/// state (0), and TOS would wrongly conclude a monochrome monitor is
+/// connected. This board models a color monitor: the pin is therefore
+/// held at 1 permanently, including after a software `/RESET`
+/// (`Bus::reset_bus`) since the signal reflects an external physical
+/// connection, not internal MFP state that `/RESET` would reset.
 const GPIP_MONO_DETECT: u8 = 7;
 
-/// Board Atari ST minimal : RAM + ROM + MFP 68901 + GLUE (HBL/VBL).
+/// Minimal Atari ST board: RAM + ROM + MFP 68901 + GLUE (HBL/VBL).
 pub struct AtariSt {
     ram: Vec<u8>,
     rom: Vec<u8>,
     rom_base: u32,
-    /// Image ROM de cartouche (port `$FA0000`), le cas échéant — vide par
-    /// défaut (emplacement libre, lectures renvoyant `0xFF` sans bus error,
-    /// voir [`Self::read8`]). Voir [`Self::load_cartridge`].
+    /// Cartridge ROM image (port `$FA0000`), if any — empty by default
+    /// (free slot, reads return `0xFF` with no bus error, see
+    /// [`Self::read8`]). See [`Self::load_cartridge`].
     cartridge: Vec<u8>,
-    /// `RUST68_TRACE_IRQ=1` lu une seule fois à la construction (pas à
-    /// chaque appel — voir l'historique du fichier pour la régression de
-    /// performance que ça a provoquée en étant vérifié à chaque IACK).
+    /// `RUST68_TRACE_IRQ=1` read only once at construction (not on every
+    /// call — see the file history for the performance regression this
+    /// caused when checked on every IACK).
     trace_irq: bool,
-    /// Cycles CPU accumulés depuis la dernière tranche de blit non-HOG
-    /// traitée (voir [`Self::tick`]) — au-delà de [`BLITTER_SLICE_CYCLES`],
-    /// une nouvelle tranche est autorisée. Sans ce throttling, un blit
-    /// repris à CHAQUE tick() (donc à chaque instruction CPU) se termine en
-    /// une poignée d'instructions au lieu du temps réel que prend le
-    /// silicium (256 cycles CPU laissés au CPU entre deux tranches en mode
-    /// partagé — voir la doc de [`BLITTER_SLICE_CYCLES`] pour la source).
+    /// CPU cycles accumulated since the last non-HOG blit slice processed
+    /// (see [`Self::tick`]) — past [`BLITTER_SLICE_CYCLES`], a new slice
+    /// is allowed. Without this throttling, a blit resumed on EVERY
+    /// tick() (i.e. every CPU instruction) finishes in a handful of
+    /// instructions instead of the real time silicon takes (256 CPU
+    /// cycles left to the CPU between two slices in shared mode — see the
+    /// doc of [`BLITTER_SLICE_CYCLES`] for the source).
     blitter_slice_cycle_acc: u32,
-    /// Registres DMA son STE (`$FF8900`-`$FF893F`) — pas de véritable
-    /// émulation audio DMA (le son STE reste silencieux), mais un simple
-    /// stockage octet par octet fidèle en lecture/écriture. Sans cela (un
-    /// stub renvoyant toujours `0x00` en lecture, écritures ignorées), tout
-    /// logiciel testant la présence du DMA son par écriture-puis-relecture
-    /// (technique standard de détection matérielle, utilisée notamment par
-    /// les cartouches de diagnostic) boucle indéfiniment en attendant une
-    /// valeur qui ne revient jamais.
+    /// STE DMA sound registers (`$FF8900`-`$FF893F`) — no real DMA audio
+    /// emulation (STE sound stays silent), but a simple, faithful
+    /// byte-by-byte read/write storage. Without this (a stub always
+    /// returning `0x00` on read, writes ignored), any software testing
+    /// for DMA sound presence via write-then-read-back (a standard
+    /// hardware detection technique, used notably by diagnostic
+    /// cartridges) loops indefinitely waiting for a value that never
+    /// comes back.
     ste_dma_sound: [u8; (STE_DMA_SOUND_END - STE_DMA_SOUND_BASE + 1) as usize],
-    /// Contrôleur DMA Sound (STE) : lecture d'échantillons PCM 8 bits en
-    /// RAM. Champ public pour la génération audio par l'appelant (voir
-    /// [`DmaSound::next_sample`]) — câblé aux registres `$FF8901`-`$FF8921`
-    /// (offsets [`dma_sound::reg`]) dans `read8`/`write8`, le reste de la
-    /// plage `STE_DMA_SOUND_BASE..=STE_DMA_SOUND_END` (dont le Microwire)
-    /// restant un stockage générique séparé (voir `ste_dma_sound` juste
-    /// au-dessus).
+    /// DMA Sound controller (STE): reads 8-bit PCM samples from RAM.
+    /// Public field for audio generation by the caller (see
+    /// [`DmaSound::next_sample`]) — wired to registers `$FF8901`-`$FF8921`
+    /// (offsets [`dma_sound::reg`]) in `read8`/`write8`, the rest of the
+    /// `STE_DMA_SOUND_BASE..=STE_DMA_SOUND_END` range (including the
+    /// Microwire) remaining a separate generic storage (see
+    /// `ste_dma_sound` just above).
     pub dma_sound: DmaSound,
-    /// Circuit Microwire/LMC1992 (STE) : volume maître et gauche/droite en
-    /// aval du mélange PSG+DMA — voir [`Microwire::gain`], à appliquer par
-    /// l'appelant sur l'échantillon de sortie final (pas un registre de
-    /// `dma_sound`, câblé séparément dans `read8`/`write8` sur les mêmes
-    /// adresses `$FF8922`/`$FF8924`).
+    /// Microwire/LMC1992 circuit (STE): master and left/right volume
+    /// downstream of the PSG+DMA mix — see [`Microwire::gain`], to be
+    /// applied by the caller to the final output sample (not a
+    /// `dma_sound` register, wired separately in `read8`/`write8` at the
+    /// same addresses `$FF8922`/`$FF8924`).
     pub microwire: Microwire,
-    /// Puce MFP 68901, câblée sur IPL6 (voir `Bus::irq_level`). Champ
-    /// public : l'appelant a besoin d'y injecter des événements externes
-    /// (`set_gpip_input`, `push_rx_byte`…). Faire progresser ses timers
-    /// passe par [`Self::tick`], pas directement par `Mfp::tick`.
+    /// MFP 68901 chip, wired onto IPL6 (see `Bus::irq_level`). Public
+    /// field: the caller needs to inject external events into it
+    /// (`set_gpip_input`, `push_rx_byte`…). Advancing its timers goes
+    /// through [`Self::tick`], not directly through `Mfp::tick`.
     pub mfp: Mfp,
-    /// Puce GLUE (timing HBL/VBL), câblée sur IPL2/IPL4. Champ public :
-    /// utile en lecture pour synchroniser un rendu vidéo externe sur
-    /// `current_line()`/`frame_count()`.
+    /// GLUE chip (HBL/VBL timing), wired onto IPL2/IPL4. Public field:
+    /// useful to read in order to synchronize external video rendering
+    /// on `current_line()`/`frame_count()`.
     pub glue: Glue,
-    /// ACIA clavier. Champ public : injecter les octets reçus du
-    /// contrôleur clavier via `push_rx_byte`, lire les commandes envoyées
-    /// par le programme via `take_tx_byte`.
+    /// Keyboard ACIA. Public field: inject bytes received from the
+    /// keyboard controller via `push_rx_byte`, read commands sent by the
+    /// program via `take_tx_byte`.
     pub acia_keyboard: Acia,
-    /// Contrôleur IKBD (HD6301) : traduit les événements clavier/souris
-    /// venant de l'hôte en octets protocole IKBD et gère les commandes
-    /// envoyées par le programme (reset, mode souris…). Câblé sur
-    /// `acia_keyboard` par [`Self::tick`] — voir [`ikbd::Ikbd`]. Champ
-    /// public : injecter les événements hôte via `key_make`/`key_break`/
-    /// `mouse_move`.
+    /// IKBD controller (HD6301): translates keyboard/mouse events coming
+    /// from the host into IKBD protocol bytes and handles commands sent
+    /// by the program (reset, mouse mode…). Wired to `acia_keyboard` by
+    /// [`Self::tick`] — see [`ikbd::Ikbd`]. Public field: inject host
+    /// events via `key_make`/`key_break`/`mouse_move`.
     pub ikbd: Ikbd,
-    /// ACIA MIDI (in/out).
+    /// MIDI ACIA (in/out).
     pub acia_midi: Acia,
-    /// PSG YM2149 (son + ports d'E/S). Champ public : lire les niveaux de
-    /// sortie audio via `channel_level`, injecter les entrées des ports
-    /// A/B (joystick/souris/lecteur, câblage non interprété par ce board).
+    /// YM2149 PSG (sound + I/O ports). Public field: read audio output
+    /// levels via `channel_level`, inject port A/B inputs
+    /// (joystick/mouse/drive, wiring not interpreted by this board).
     pub ym2149: Ym2149,
-    /// Shifter (vidéo). Champ public surtout pour la lecture directe des
-    /// registres si besoin ; en pratique l'image se lit via
-    /// [`Self::framebuffer`], déjà rendue.
+    /// Shifter (video). Public field mainly for direct register reads if
+    /// needed; in practice the image is read via [`Self::framebuffer`],
+    /// already rendered.
     pub shifter: Shifter,
-    /// Image de la trame en cours de construction : une ligne par entrée
-    /// (indexée comme `Glue::current_line`), mise à jour au rythme HBL par
-    /// [`Self::tick`]. Contient l'image de la trame précédente jusqu'à ce
-    /// que la ligne correspondante de la trame courante soit rendue.
+    /// Image of the frame currently being built: one line per entry
+    /// (indexed like `Glue::current_line`), updated at the HBL rate by
+    /// [`Self::tick`]. Contains the previous frame's image until the
+    /// corresponding line of the current frame has been rendered.
     pub framebuffer: Vec<Vec<(u8, u8, u8)>>,
-    /// Compteur monotone (jamais remis à zéro, contrairement à
-    /// `Glue::current_line` qui boucle) : nécessaire pour détecter le
-    /// passage d'une trame complète (313 lignes en PAL) sans le confondre
-    /// avec "aucune ligne écoulée" quand `current_line` revient à 0.
+    /// Monotonic counter (never reset, unlike `Glue::current_line` which
+    /// wraps around): needed to detect that a complete frame has just
+    /// elapsed (313 lines in PAL) without confusing it with "no line
+    /// elapsed" when `current_line` wraps back to 0.
     last_absolute_line: u64,
-    /// Dernier `Glue::vbl_edge_count()` observé — détecte le front VBL
-    /// (transition ligne visible -> blanking, PAS le bouclage de trame) pour
-    /// déclencher `Shifter::start_frame`. Voir la doc de
-    /// `Glue::vbl_edge_count` pour pourquoi VBL, spécifiquement, et pas
+    /// Last observed `Glue::vbl_edge_count()` — detects the VBL edge
+    /// (visible-line -> blanking transition, NOT the frame wraparound) to
+    /// trigger `Shifter::start_frame`. See the doc of
+    /// `Glue::vbl_edge_count` for why VBL specifically, and not
     /// `frame_count`.
     last_vbl_edge: u64,
-    /// PC de l'instruction CPU en cours d'exécution, mis à jour par
-    /// l'appelant juste avant `Cpu::step` — uniquement pour le diagnostic
-    /// (`RUST68_TRACE_BLITTER`, identifier la routine ROM qui arme un blit).
+    /// PC of the CPU instruction currently executing, updated by the
+    /// caller just before `Cpu::step` — only for diagnostics
+    /// (`RUST68_TRACE_BLITTER`, identify the ROM routine arming a blit).
     pub last_pc: u32,
-    /// WD1772 (contrôleur de disquette). Champ public : câbler `/INTRQ`
-    /// n'est pas nécessaire à la main, `Self::tick` s'en charge (relayé
-    /// sur `GPIP5` du MFP).
+    /// WD1772 (floppy disk controller). Public field: wiring `/INTRQ` by
+    /// hand isn't necessary, `Self::tick` handles it (relayed onto the
+    /// MFP's `GPIP5`).
     pub wd1772: Wd1772,
-    /// Disque inséré dans le lecteur A, s'il y en a un. Champ public :
-    /// insérer/éjecter directement (`st.floppy_a = Some(Box::new(RawDiskImage::new(...)))`).
-    /// Type objet (`dyn FloppyDisk`) plutôt qu'un format concret : accepte
-    /// aussi bien `RawDiskImage` (`.st`) que `peripherals::atari_st::stx::StxImage`
-    /// (`.stx`) sans que ce board ait à connaître le format du fichier.
+    /// Disk inserted in drive A, if any. Public field: insert/eject
+    /// directly (`st.floppy_a = Some(Box::new(RawDiskImage::new(...)))`).
+    /// A trait object (`dyn FloppyDisk`) rather than a concrete format:
+    /// accepts `RawDiskImage` (`.st`) as well as
+    /// `peripherals::atari_st::stx::StxImage` (`.stx`) without this board
+    /// needing to know the file format.
     pub floppy_a: Option<Box<dyn FloppyDisk>>,
     dma_register_select: u8,
     dma_address: u32,
-    /// Bit 4 de `DMA_MODE` : bascule `FDC_DATA` entre accès aux registres du
-    /// WD1772 (0) et écriture/lecture du compteur de secteurs DMA (1) — un
-    /// mécanisme séparé, PAS un registre du contrôleur de disquette lui-même
-    /// (confirmé par Hatari, `fdc.c` : "Set DMA sector count if ff8606 bit
-    /// 4 == 1"). Voir `dma_sector_count`.
+    /// Bit 4 of `DMA_MODE`: toggles `FDC_DATA` between access to the
+    /// WD1772's registers (0) and writing/reading the DMA sector count
+    /// (1) — a separate mechanism, NOT a register of the floppy disk
+    /// controller itself (confirmed by Hatari, `fdc.c`: "Set DMA sector
+    /// count if ff8606 bit 4 == 1"). See `dma_sector_count`.
     dma_sector_count_mode: bool,
-    /// Nombre de secteurs restant à transférer, programmé via `FDC_DATA` en
-    /// mode compteur de secteurs (voir `dma_sector_count_mode`) — `None`
-    /// tant qu'aucun compteur n'a jamais été programmé (simplification :
-    /// sur silicium réel il vaut 0 après reset, ce qui bloquerait tout
-    /// transfert tant que le logiciel ne l'a pas armé ; en pratique TOS le
-    /// fait toujours avant la moindre commande Type II, donc traiter
-    /// "jamais programmé" comme "illimité" est sans conséquence pratique et
-    /// évite de faire échouer un transfert délibérément déclenché "à la
-    /// main", sans ce préambule, par un test/outil). Limite RÉELLEMENT le
-    /// nombre de secteurs transférés côté DMA, indépendamment de ce que le
-    /// WD1772 lui-même ferait naturellement (qui continuerait de trouver
-    /// les secteurs suivants sur la piste) — sans cette limite, une lecture
-    /// multi-secteurs (bit M) déborde sur la RAM bien au-delà de ce que le
-    /// logiciel attend dès que la piste physique a plus de secteurs que ce
-    /// qui a été demandé (le cas des pistes protégées non standard).
+    /// Number of sectors remaining to transfer, programmed via
+    /// `FDC_DATA` in sector-count mode (see `dma_sector_count_mode`) —
+    /// `None` as long as no count has ever been programmed
+    /// (simplification: on real silicon it is 0 after reset, which would
+    /// block any transfer until software arms it; in practice TOS always
+    /// does so before the slightest Type II command, so treating "never
+    /// programmed" as "unlimited" has no practical consequence and avoids
+    /// making a transfer deliberately triggered "by hand", without this
+    /// preamble, by a test/tool fail). REALLY limits the number of
+    /// sectors transferred on the DMA side, independently of what the
+    /// WD1772 itself would naturally do (which would keep finding the
+    /// following sectors on the track) — without this limit, a
+    /// multi-sector read (bit M) overflows into RAM far beyond what
+    /// software expects as soon as the physical track has more sectors
+    /// than what was requested (the case of non-standard protected
+    /// tracks).
     dma_sector_count: Option<u16>,
-    /// Blitter (STE). Champ public surtout pour la lecture directe des
-    /// registres ; le déclenchement se fait en écrivant le bit BUSY/START
-    /// du registre de contrôle (voir `Bus::write8` sur `BLITTER_BASE +
+    /// Blitter (STE). Public field mainly for direct register reads;
+    /// triggering happens by writing the BUSY/START bit of the control
+    /// register (see `Bus::write8` on `BLITTER_BASE +
     /// blitter::reg::CONTROL`).
     pub blitter: Blitter,
-    /// Overlay ROM à l'adresse 0 (câblage matériel réel ST/STE) : tant que
-    /// vrai, les LECTURES dans `0x000000..OVERLAY_SIZE` renvoient le
-    /// contenu de la ROM (pas de la RAM sous-jacente), tandis que les
-    /// ÉCRITURES continuent d'aller en RAM normalement — exactement le
-    /// comportement réel (la ROM est en lecture seule de toute façon).
-    /// Actif par défaut à la création (et après un `/RESET`), désactivé
-    /// par la première écriture dans [`MEMORY_CONF`] (le TOS le fait très
-    /// tôt au boot). Sans cet overlay : (1) le vecteur de reset (SSP/PC lus
-    /// à `0x000000`/`0x000004`) ne serait pas satisfait par de la RAM
-    /// neuve (zéros), et (2) la technique standard de détection de RAM du
-    /// TOS — zéroter le vecteur de bus error à `0x000008` puis sonder
-    /// au-delà de la RAM installée, ce qui fait rebondir l'exécution sur
-    /// l'adresse 0 à chaque échec — ne retomberait pas sur du code ROM
-    /// valide (le `bra.s` d'en-tête TOS) mais sur de la RAM à zéro,
-    /// dégénérant en exécution de code arbitraire. L'overlay ne couvre
-    /// volontairement qu'une petite fenêtre ([`OVERLAY_SIZE`], pas toute la
-    /// ROM) : au-delà, des adresses basses comme les variables système
-    /// `memvalid`/`phystop` (`$420`, `$42E`…) doivent rester de la vraie
-    /// RAM, sans quoi leur vérification par le TOS n'aurait aucun sens
-    /// (une variable système censée persister à travers un redémarrage à
-    /// chaud ne peut pas être en lecture seule dans la ROM).
+    /// ROM overlay at address 0 (real ST/STE hardware wiring): as long as
+    /// true, READS in `0x000000..OVERLAY_SIZE` return the ROM's content
+    /// (not the underlying RAM), while WRITES still go to RAM normally —
+    /// exactly the real behavior (the ROM is read-only anyway). Active by
+    /// default at creation (and after a `/RESET`), disabled by the first
+    /// write to [`MEMORY_CONF`] (TOS does this very early at boot).
+    /// Without this overlay: (1) the reset vector (SSP/PC read at
+    /// `0x000000`/`0x000004`) would not be satisfied by fresh RAM
+    /// (zeros), and (2) TOS's standard RAM detection technique — zeroing
+    /// the bus error vector at `0x000008` then probing beyond installed
+    /// RAM, which bounces execution back to address 0 on each failure —
+    /// would not land on valid ROM code (the TOS header's `bra.s`) but on
+    /// zeroed RAM, degenerating into arbitrary code execution. The
+    /// overlay deliberately covers only a small window ([`OVERLAY_SIZE`],
+    /// not the whole ROM): beyond it, low addresses such as the system
+    /// variables `memvalid`/`phystop` (`$420`, `$42E`…) must remain real
+    /// RAM, without which TOS's check of them would make no sense (a
+    /// system variable meant to persist across a warm restart cannot be
+    /// read-only in ROM).
     overlay: bool,
-    /// Copie de la dernière valeur écrite dans [`MEMORY_CONF`] (registre
-    /// MMU). Pilote désormais réellement le mirroring d'adresse intra-banque
-    /// sur STE (voir [`Self::translate_ram_addr`]) — pas seulement une
-    /// relecture logicielle passive.
+    /// Copy of the last value written to [`MEMORY_CONF`] (MMU register).
+    /// Now actually drives intra-bank address mirroring on STE (see
+    /// [`Self::translate_ram_addr`]) — not just a passive software
+    /// readback.
     memory_conf: u8,
-    /// Taille réelle peuplée de chaque banque RAM (voir
-    /// [`Self::ram_bank_sizes`]) — `None` si `self.ram.len()` ne correspond
-    /// à aucune configuration de banque STE standard (voir sa doc), auquel
-    /// cas [`Self::translate_ram_addr`] ne traduit rien (mappage direct
-    /// inchangé, comme avant l'introduction du mirroring MMU).
+    /// Actually populated size of each RAM bank (see
+    /// [`Self::ram_bank_sizes`]) — `None` if `self.ram.len()` doesn't
+    /// match any standard STE bank configuration (see its doc), in which
+    /// case [`Self::translate_ram_addr`] doesn't translate anything
+    /// (direct mapping unchanged, as before the introduction of MMU
+    /// mirroring).
     ram_bank_sizes: Option<(u32, u32)>,
-    /// Force la valeur logicielle de [`MEMORY_CONF`] à rester fixée à cette
-    /// valeur, quoi que le logiciel y écrive — voir
+    /// Forces the software value of [`MEMORY_CONF`] to stay pinned to
+    /// this value, no matter what software writes to it — see
     /// [`Self::pin_memory_conf`].
     memory_conf_pin: Option<u8>,
-    /// Vrai si le Blitter est physiquement présent sur cette machine. De
-    /// série sur STE/Mega STE ; absent sur 520ST/1040ST (le Mega ST avait
-    /// juste un support de puce, pas toujours peuplé — voir
-    /// [`crate::systems::atari_st::model`]). Quand faux, la zone
-    /// `BLITTER_BASE` retombe dans le stub d'E/S générique (`0xFF` en
-    /// lecture, écritures ignorées) au lieu de répondre — un vrai
-    /// programme qui sonde la présence du Blitter avant de s'en servir
-    /// doit voir la même chose que sur un ST sans Blitter.
+    /// True if the Blitter is physically present on this machine.
+    /// Standard on STE/Mega STE; absent on 520ST/1040ST (the Mega ST just
+    /// had a chip socket, not always populated — see
+    /// [`crate::systems::atari_st::model`]). When false, the
+    /// `BLITTER_BASE` area falls through to the generic I/O stub (`0xFF`
+    /// on read, writes ignored) instead of responding — a real program
+    /// probing for Blitter presence before using it must see the same
+    /// thing as on an ST without a Blitter.
     blitter_present: bool,
     bus_fault: Option<(u32, bool)>,
 }
 
-/// Taille de la fenêtre d'overlay ROM à l'adresse 0 (voir [`AtariSt::overlay`]).
-/// Couvre largement l'en-tête TOS et le tout début du code d'amorçage
-/// (`os_entry`/`os_version`/`os_reseth`/`os_beg`/… puis les premières
-/// instructions réelles), sans empiéter sur les variables système basses
-/// (`memvalid` etc. commencent à `$420`).
+/// Size of the ROM overlay window at address 0 (see [`AtariSt::overlay`]).
+/// Broadly covers the TOS header and the very start of the bootstrap code
+/// (`os_entry`/`os_version`/`os_reseth`/`os_beg`/… then the first real
+/// instructions), without encroaching on the low system variables
+/// (`memvalid` etc. start at `$420`).
 const OVERLAY_SIZE: u32 = 0x200;
 
-/// Taille de la zone en permanence mappée sur la ROM à l'adresse 0 (les
-/// vecteurs reset SSP/PC), indépendamment de l'état de [`AtariSt::overlay`].
+/// Size of the area permanently mapped onto ROM at address 0 (the SSP/PC
+/// reset vectors), independently of the state of [`AtariSt::overlay`].
 ///
-/// Documentée noir sur blanc dans le manuel technique Atari (Mega Service
-/// Manual, carte mémoire RAM) : "Note: the first 8 bytes of ROM are mapped
-/// into addresses 0-7. These are reset vectors which the 68000 uses on
-/// start-up." — une caractéristique permanente du plan mémoire, distincte du
-/// plus large overlay désactivable par `MEMORY_CONF` (qui, lui, couvre
-/// `0x200` octets et sert uniquement à amorcer le tout début du boot). Écrire
-/// dans cette zone doit déclencher un vrai bus error (Glue : "asserts Bus
-/// Error if... writing to ROM"), pas être silencieusement ignoré comme les
-/// autres écritures en ROM — confirmé par la cartouche de diagnostic usine
-/// STe (test "I7 Bus error not detected", qui écrit délibérément à l'adresse
-/// 0 après avoir installé son propre gestionnaire de bus error, pour
-/// vérifier que le matériel réagit). N'entre pas en conflit avec la technique
-/// standard de détection RAM du TOS (qui cible l'adresse 8, hors de cette
-/// zone), ni avec aucune variable système basse (`memvalid` etc. commencent
-/// à `$420`).
+/// Documented in black and white in the Atari technical manual (Mega
+/// Service Manual, RAM memory map): "Note: the first 8 bytes of ROM are
+/// mapped into addresses 0-7. These are reset vectors which the 68000
+/// uses on start-up." — a permanent characteristic of the memory map,
+/// distinct from the larger overlay that can be disabled via
+/// `MEMORY_CONF` (which covers `0x200` bytes and only serves to bootstrap
+/// the very start of boot). Writing into this area must trigger a real
+/// bus error (Glue: "asserts Bus Error if... writing to ROM"), not be
+/// silently ignored like other ROM writes — confirmed by the STe factory
+/// diagnostic cartridge (test "I7 Bus error not detected", which
+/// deliberately writes to address 0 after installing its own bus error
+/// handler, to verify the hardware reacts). Doesn't conflict with TOS's
+/// standard RAM detection technique (which targets address 8, outside
+/// this area), nor with any low system variable (`memvalid` etc. start
+/// at `$420`).
 const RESET_VECTOR_ROM_SIZE: u32 = 8;
 
-/// Canal DMA reliant le WD1772 à la RAM du board à l'adresse DMA courante
-/// (voir `peripherals::atari_st::wd1772::DmaChannel`) : le WD1772 ne connaît pas la
-/// RAM, seulement ce canal.
+/// DMA channel connecting the WD1772 to the board's RAM at the current
+/// DMA address (see `peripherals::atari_st::wd1772::DmaChannel`): the
+/// WD1772 doesn't know about RAM, only this channel.
 ///
-/// Fait aussi respecter `dma_sector_count` (voir sa doc) : au-delà du
-/// nombre de secteurs programmé, les octets sont silencieusement perdus
-/// (lecture : RAM inchangée : écriture : `0` renvoyé au WD1772) plutôt que
-/// transférés — comportement du vrai contrôleur DMA, indépendant de ce que
-/// le WD1772 continuerait de faire tout seul.
+/// Also enforces `dma_sector_count` (see its doc): beyond the programmed
+/// sector count, bytes are silently dropped (read: RAM unchanged; write:
+/// `0` returned to the WD1772) rather than transferred — behavior of the
+/// real DMA controller, independent of what the WD1772 would keep doing
+/// on its own.
 struct RamDmaChannel<'a> {
     ram: &'a mut [u8],
     address: &'a mut u32,
@@ -464,19 +457,19 @@ impl<'a> RamDmaChannel<'a> {
     }
 }
 
-/// Vue `Bus` d'une tranche de RAM, pour donner au Blitter (qui prend un
-/// `Bus` générique) accès à la RAM du board sans emprunt réflexif de
-/// `AtariSt` tout entier.
+/// `Bus` view over a slice of RAM, to give the Blitter (which takes a
+/// generic `Bus`) access to the board's RAM without a reflexive borrow of
+/// the whole `AtariSt`.
 ///
-/// Doit aussi voir la ROM : le Blitter lit fréquemment ses données source
-/// (masques d'icône, motifs) directement en ROM (`src_addr` dans la plage
-/// `rom_base..`). Un `RamBus` ne connaissant que `ram` renvoyait `0xFF` pour
-/// toute lecture ROM (adresse hors de `ram`, bien au-delà de sa taille
-/// installée) au lieu du contenu réel — corruption silencieuse et
-/// systématique de tout blit lisant sa source en ROM (masques d'icône lors
-/// d'une sélection, motifs de menu), invisible aux tests qui rejouent le
-/// Blitter via un bus HashMap avec ROM embarquée à la main plutôt que via ce
-/// `RamBus` précis.
+/// Must also see the ROM: the Blitter frequently reads its source data
+/// (icon masks, patterns) directly from ROM (`src_addr` in the
+/// `rom_base..` range). A `RamBus` that only knew about `ram` used to
+/// return `0xFF` for any ROM read (address outside `ram`, well beyond its
+/// installed size) instead of the real content — silent and systematic
+/// corruption of any blit reading its source from ROM (icon masks during
+/// a selection, menu patterns), invisible to tests that replay the
+/// Blitter via a HashMap bus with a hand-embedded ROM rather than through
+/// this precise `RamBus`.
 struct RamBus<'a> {
     ram: &'a mut [u8],
     rom: &'a [u8],
@@ -495,7 +488,7 @@ impl<'a> Bus for RamBus<'a> {
             return 0x00;
         }
         if std::env::var("RUST68_TRACE_RAMBUS_FALLBACK").is_ok() {
-            eprintln!("[rambus] lecture hors RAM/ROM/flottante : addr={addr:#08x} -> 0xFF");
+            eprintln!("[rambus] read outside RAM/ROM/floating: addr={addr:#08x} -> 0xFF");
         }
         0xFF
     }
@@ -504,8 +497,8 @@ impl<'a> Bus for RamBus<'a> {
         if let Some(slot) = self.ram.get_mut(addr as usize) {
             *slot = value;
         }
-        // ROM et au-delà : écriture ignorée (lecture seule / flottante),
-        // même logique que `AtariSt::write8`.
+        // ROM and beyond: write ignored (read-only / floating), same
+        // logic as `AtariSt::write8`.
     }
 }
 
@@ -533,26 +526,25 @@ impl<'a> DmaChannel for RamDmaChannel<'a> {
 }
 
 impl AtariSt {
-    /// Accès en lecture à la RAM installée — uniquement pour le diagnostic
-    /// (instantané complet déclenché par `RUST68_RAM_DUMP_KEY`, voir le
-    /// binaire SDL2).
+    /// Read access to installed RAM — only for diagnostics (full snapshot
+    /// triggered by `RUST68_RAM_DUMP_KEY`, see the SDL2 binary).
     pub fn ram(&self) -> &[u8] {
         &self.ram
     }
 
-    /// Génère l'échantillon DMA Sound (STE) suivant, à `host_rate_hz` (voir
-    /// [`DmaSound::next_sample`]) — emprunte `self.ram` et `self.dma_sound`
-    /// séparément pour l'appelant (un binaire externe ne peut pas le faire
-    /// lui-même : `ram()` emprunte tout `&self`, incompatible avec un
-    /// emprunt simultané `&mut self.dma_sound`).
+    /// Generates the next DMA Sound (STE) sample, at `host_rate_hz` (see
+    /// [`DmaSound::next_sample`]) — borrows `self.ram` and
+    /// `self.dma_sound` separately for the caller (an external binary
+    /// cannot do this itself: `ram()` borrows all of `&self`, incompatible
+    /// with a simultaneous `&mut self.dma_sound` borrow).
     ///
-    /// Relaie aussi chaque front XSINT (fin de trame DMA, voir
-    /// `DmaSound::take_xsint_pulses`) vers `Mfp::pulse_ta` : câblage
-    /// matériel réel (XSINT sur l'entrée de comptage d'événements du Timer
-    /// A), sans quoi un logiciel qui compte les bouclages de trame via ce
-    /// timer (dont la cartouche de diagnostic usine STe, test Audio) ne
-    /// verrait jamais l'interruption et retomberait sur un mécanisme de
-    /// secours bien plus court que la vraie durée de lecture.
+    /// Also relays each XSINT edge (end of DMA frame, see
+    /// `DmaSound::take_xsint_pulses`) to `Mfp::pulse_ta`: real hardware
+    /// wiring (XSINT on Timer A's event-counting input), without which
+    /// software that counts frame wraparounds via this timer (including
+    /// the STe factory diagnostic cartridge, Audio test) would never see
+    /// the interrupt and would fall back to a much shorter fallback
+    /// mechanism than the real playback duration.
     pub fn next_dma_sample(&mut self, host_rate_hz: u32) -> (i8, i8) {
         let sample = self.dma_sound.next_sample(&self.ram, host_rate_hz);
         for _ in 0..self.dma_sound.take_xsint_pulses() {
@@ -561,30 +553,30 @@ impl AtariSt {
         sample
     }
 
-    /// Taille de la ROM chargée — pour construire un puits de traçage (voir
-    /// [`Self::describe_addr_static`]) sans emprunter `AtariSt` lui-même.
+    /// Size of the loaded ROM — to build a trace sink (see
+    /// [`Self::describe_addr_static`]) without borrowing `AtariSt` itself.
     pub fn rom_len(&self) -> usize {
         self.rom.len()
     }
 
-    /// Vrai si le modèle simulé possède un Blitter — même usage que
+    /// True if the simulated model has a Blitter — same usage as
     /// [`Self::rom_len`].
     pub fn blitter_present(&self) -> bool {
         self.blitter_present
     }
 
-    /// Crée un board avec `ram_size` octets de RAM installée à `0x000000`,
-    /// `rom` (typiquement un dump TOS) mappée à `DEFAULT_ROM_BASE`, et le
-    /// GLUE cadencé en PAL 50 Hz (le cas le plus courant — voir
-    /// [`VideoMode`] pour du NTSC).
+    /// Creates a board with `ram_size` bytes of RAM installed at
+    /// `0x000000`, `rom` (typically a TOS dump) mapped at
+    /// `DEFAULT_ROM_BASE`, and the GLUE clocked at PAL 50 Hz (the most
+    /// common case — see [`VideoMode`] for NTSC).
     pub fn new(ram_size: usize, rom: Vec<u8>) -> Self {
         let mut mfp = Mfp::new();
-        mfp.set_gpip_input(GPIP_MONO_DETECT, true); // moniteur couleur (voir la constante)
-        // État de repos réel de GPIP4/GPIP5 (`/IRQ` ACIA, `/INTRQ` WD1772,
-        // actifs bas, tirés au niveau haut par défaut — voir `Self::tick`) :
-        // sans cette initialisation, l'état interne par défaut du MFP (0)
-        // masquerait la toute première transition vers "interruption active"
-        // (elle calculerait aussi 0, donc aucun front détecté).
+        mfp.set_gpip_input(GPIP_MONO_DETECT, true); // color monitor (see the constant)
+        // Real idle state of GPIP4/GPIP5 (ACIA `/IRQ`, WD1772 `/INTRQ`,
+        // active low, pulled high by default — see `Self::tick`): without
+        // this initialization, the MFP's default internal state (0) would
+        // mask the very first transition to "interrupt active" (it would
+        // also compute 0, so no edge detected).
         mfp.set_gpip_input(4, true);
         mfp.set_gpip_input(5, true);
         AtariSt {
@@ -624,14 +616,14 @@ impl AtariSt {
         }
     }
 
-    /// Construit un board à partir d'un modèle connu de la gamme ST/STE
-    /// (voir [`model`]) : RAM et présence du Blitter réglées d'après le
-    /// modèle, `rom` fourni séparément (la version de TOS installée n'est
-    /// pas une propriété du modèle — n'importe quel TOS compatible peut
-    /// être flashé dans une machine réelle). La base ROM (`0xFC0000` vs
-    /// `0xE00000`) reste à régler séparément via [`Self::set_rom_base`]
-    /// une fois la version de TOS connue (voir `os_version` dans l'en-tête
-    /// TOS, indépendant du modèle de machine).
+    /// Builds a board from a known model in the ST/STE lineup (see
+    /// [`model`]): RAM and Blitter presence set according to the model,
+    /// `rom` provided separately (the installed TOS version is not a
+    /// property of the model — any compatible TOS can be flashed into a
+    /// real machine). The ROM base (`0xFC0000` vs `0xE00000`) still needs
+    /// to be set separately via [`Self::set_rom_base`] once the TOS
+    /// version is known (see `os_version` in the TOS header, independent
+    /// of the machine model).
     pub fn from_model(profile: model::MachineProfile, rom: Vec<u8>) -> Self {
         let mut st = Self::new(profile.ram_size, rom);
         st.blitter_present = profile.has_blitter;
@@ -639,50 +631,51 @@ impl AtariSt {
         st
     }
 
-    /// Change l'adresse de base de la ROM après construction. Utile pour
-    /// les TOS >= 1.06, mappés à `0xE00000` sur ST/STE réel plutôt qu'à
-    /// [`DEFAULT_ROM_BASE`] (`0xFC0000`, valable pour TOS <= 1.04) — la
-    /// taille de 256 Ko de ces TOS plus récents ne tiendrait de toute façon
-    /// pas entre `0xFC0000` et le début de la zone d'E/S (`0xFF8000`).
+    /// Changes the ROM base address after construction. Useful for
+    /// TOS >= 1.06, mapped at `0xE00000` on real ST/STE rather than at
+    /// [`DEFAULT_ROM_BASE`] (`0xFC0000`, valid for TOS <= 1.04) — the
+    /// 256 KB size of these more recent TOS versions wouldn't fit between
+    /// `0xFC0000` and the start of the I/O area (`0xFF8000`) anyway.
     pub fn set_rom_base(&mut self, base: u32) {
         self.rom_base = base;
     }
 
-    /// Change le mode vidéo (PAL 50 Hz par défaut à la construction, voir
-    /// [`Self::new`]) — remplace le GLUE, donc à appeler juste après la
-    /// construction/avant le premier `reset`, pas en cours d'émulation (sans
-    /// quoi le compteur de ligne/trame en cours serait perdu).
+    /// Changes the video mode (PAL 50 Hz by default at construction, see
+    /// [`Self::new`]) — replaces the GLUE, so it must be called right
+    /// after construction/before the first `reset`, not during ongoing
+    /// emulation (otherwise the current line/frame counter would be
+    /// lost).
     pub fn set_video_mode(&mut self, mode: VideoMode) {
         self.glue = Glue::new(mode);
     }
 
-    /// Insère une image ROM de cartouche, mappée en lecture seule à partir
-    /// de `CARTRIDGE_BASE` (`$FA0000`) — port cartouche ST/STE réel, utilisé
-    /// notamment par les cartouches de diagnostic matériel. `data` doit déjà
-    /// être au format natif 68000 (mots big-endian) ; voir `atari_st_sdl2`
-    /// pour l'entrelacement de deux images HGH/LOW séparées (ROMs 8 bits
-    /// jumelées, format EPROM courant pour ces cartouches).
+    /// Inserts a cartridge ROM image, mapped read-only starting at
+    /// `CARTRIDGE_BASE` (`$FA0000`) — real ST/STE cartridge port, notably
+    /// used by hardware diagnostic cartridges. `data` must already be in
+    /// native 68000 format (big-endian words); see `atari_st_sdl2` for
+    /// interleaving two separate HIGH/LOW images (paired 8-bit ROMs, a
+    /// common EPROM format for these cartridges).
     pub fn load_cartridge(&mut self, data: Vec<u8>) {
         self.cartridge = data;
     }
 
-    /// Vrai si une cartouche a été chargée (voir [`Self::load_cartridge`]).
-    /// Utile pour savoir si le raccourci "redémarrage à chaud" du TOS (voir
-    /// [`Self::pin_memory_conf`]) a lieu d'être : une cartouche de
-    /// diagnostic fait sa propre initialisation matérielle complète et ne
-    /// passe pas par le boot TOS normal, donc pas par ce raccourci — y
-    /// figer `MEMORY_CONF` casserait sa propre détection RAM (qui a
-    /// justement besoin d'écrire ce registre librement pour observer le
-    /// mirroring d'adresse et se corriger elle-même).
+    /// True if a cartridge has been loaded (see [`Self::load_cartridge`]).
+    /// Useful to know whether TOS's "warm restart" shortcut (see
+    /// [`Self::pin_memory_conf`]) is relevant: a diagnostic cartridge does
+    /// its own complete hardware initialization and doesn't go through
+    /// the normal TOS boot, so not through this shortcut either — pinning
+    /// `MEMORY_CONF` there would break its own RAM detection (which
+    /// precisely needs to write this register freely to observe address
+    /// mirroring and self-correct).
     pub fn has_cartridge(&self) -> bool {
         !self.cartridge.is_empty()
     }
 
-    /// Fait progresser les périphériques (MFP + GLUE + YM2149) de
-    /// `cpu_cycles` cycles CPU, relaie l'IRQ combinée des deux ACIA sur
-    /// `GPIP4` du MFP (OR câblé, câblage réel ST/STE), et déclenche le
-    /// rendu vidéo (`Shifter`) au rythme HBL/VBL du GLUE. À appeler par
-    /// l'appelant après chaque `Cpu::step` :
+    /// Advances the peripherals (MFP + GLUE + YM2149) by
+    /// `cpu_cycles` CPU cycles, relays the combined IRQ of the two ACIAs onto
+    /// the MFP's `GPIP4` (wired OR, real ST/STE wiring), and triggers
+    /// video rendering (`Shifter`) at the GLUE's HBL/VBL rate. To be called by
+    /// the caller after every `Cpu::step`:
     ///
     /// ```
     /// use rust68::{Cpu, systems::atari_st::AtariSt};
@@ -694,25 +687,25 @@ impl AtariSt {
     /// st.tick(cycles);
     /// ```
     pub fn tick(&mut self, cpu_cycles: u32) {
-        // Fait avancer un blit non-HOG en pause (voir `Blitter::execute`,
-        // tranches de 16 mots) indépendamment de toute écriture CPU du
-        // registre CONTROL. Sur silicium réel, le Blitter progresse de
-        // façon autonome (cycles de bus partagés avec le CPU au rythme du
-        // matériel), pas seulement quand le logiciel réécrit CONTROL —
-        // notre modèle antérieur ne reprenait le blit QUE sur une écriture
-        // de CONTROL avec le bit BUSY posé, ce qui fonctionnait par
-        // coïncidence avec la boucle `TAS.B` de TOS (qui EST une écriture)
-        // mais bloquait indéfiniment tout logiciel scrutant BUSY par simple
-        // lecture (`BTST.B`, sans réécriture) — confirmé en pratique avec
-        // la cartouche de diagnostic usine STe (test G2 "endmask", blit
-        // large de 40 mots dépassant une tranche, jamais relancé).
+        // Advances a paused non-HOG blit (see `Blitter::execute`, 16-word
+        // slices) independently of any CPU write to the CONTROL register.
+        // On real silicon, the Blitter progresses autonomously (bus
+        // cycles shared with the CPU at the hardware's rhythm), not only
+        // when software rewrites CONTROL — our earlier model only resumed
+        // the blit on a write to CONTROL with the BUSY bit set, which
+        // worked by coincidence with TOS's `TAS.B` loop (which IS a
+        // write) but blocked indefinitely any software polling BUSY via
+        // a plain read (`BTST.B`, without a rewrite) — confirmed in
+        // practice with the STe factory diagnostic cartridge (test G2
+        // "endmask", a wide 40-word blit exceeding a single slice, never
+        // resumed).
         if self.blitter_present && self.blitter.busy() {
             self.blitter_slice_cycle_acc += cpu_cycles;
             if self.blitter_slice_cycle_acc >= BLITTER_SLICE_CYCLES {
                 self.blitter_slice_cycle_acc -= BLITTER_SLICE_CYCLES;
                 if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
                     eprintln!(
-                        "[blit-reg] pc={:#010x} tick declenche execute() acc_avant_maj={}",
+                        "[blit-reg] pc={:#010x} tick triggers execute() acc_before_update={}",
                         blitter::DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed),
                         self.blitter_slice_cycle_acc + BLITTER_SLICE_CYCLES,
                     );
@@ -731,54 +724,55 @@ impl AtariSt {
         self.glue.tick(cpu_cycles);
         self.ym2149.tick(cpu_cycles);
         self.ikbd.tick(cpu_cycles);
-        // Commandes envoyées par le programme (reset, mode souris…) : les
-        // relayer de l'émission de l'ACIA vers l'IKBD, qui les interprète.
+        // Commands sent by the program (reset, mouse mode…): relay them
+        // from the ACIA's transmit side to the IKBD, which interprets
+        // them.
         while let Some(byte) = self.acia_keyboard.take_tx_byte() {
             self.ikbd.receive_cmd(byte);
         }
-        // Ne pousse l'octet suivant dans l'ACIA que si le précédent a bien
-        // été consommé par le programme (RDRF retombé) — lecture du
-        // registre de statut, sans effet de bord (contrairement à une
-        // lecture du registre de données, qui acquitte RDRF).
+        // Only push the next byte into the ACIA if the previous one has
+        // actually been consumed by the program (RDRF cleared) — read of
+        // the status register, without side effects (unlike a read of the
+        // data register, which acknowledges RDRF).
         //
-        // Sur silicium réel, `/IRQ` de l'ACIA remonte réellement à 1 (le
-        // temps de l'intervalle série entre deux octets) avant de retomber
-        // pour l'octet suivant — un vrai front à chaque fois. Ici, pousser
-        // l'octet suivant dans le même tick() que celui où RDRF vient de
-        // retomber masque cette remontée : GPIP4 resterait à 0 en continu
-        // entre deux octets d'une même rafale (ex. les 3 octets d'une trame
-        // souris), et `Mfp::set_gpip_input` — à juste titre edge-triggered —
-        // ne verrait alors jamais de front pour les octets suivants, les
-        // laissant bloqués jusqu'à ce qu'un évènement sans rapport (une
-        // autre écriture de registre MFP) déclenche un front incident. Bug
-        // exact déjà isolé et corrigé dans le projet compagnon Stay (voir
-        // `Bus::read_acia_ikbd_data`) : forcer explicitement le relâchement
-        // (niveau haut) avant de réarmer RDRF pour l'octet suivant, dans le
-        // même tick, pour garantir un vrai front montant-puis-descendant.
+        // On real silicon, the ACIA's `/IRQ` genuinely rises back to 1
+        // (for the duration of the serial gap between two bytes) before
+        // falling again for the next byte — a real edge every time. Here,
+        // pushing the next byte within the same tick() in which RDRF has
+        // just cleared masks this rise: GPIP4 would stay at 0
+        // continuously between two bytes of the same burst (e.g. the 3
+        // bytes of a mouse packet), and `Mfp::set_gpip_input` — rightly
+        // edge-triggered — would then never see an edge for the following
+        // bytes, leaving them stuck until an unrelated event (another MFP
+        // register write) triggers an incidental edge. Exact bug already
+        // isolated and fixed in the companion project Stay (see
+        // `Bus::read_acia_ikbd_data`): explicitly force the release (high
+        // level) before rearming RDRF for the next byte, within the same
+        // tick, to guarantee a genuine rising-then-falling edge.
         if self.acia_keyboard.read(acia::reg::CONTROL_STATUS) & 0x01 == 0 {
             if let Some(byte) = self.ikbd.pop_tx() {
                 self.mfp.set_gpip_input(4, true);
                 self.acia_keyboard.push_rx_byte(byte);
             }
         }
-        // `/IRQ` (ACIA) et `/INTRQ` (WD1772) sont des signaux matériels réels
-        // actifs bas (asserted = niveau logique 0, comme leur nom l'indique)
-        // câblés directement sur GPIP4/GPIP5 — sans inverseur, GPIP doit
-        // donc lire 0 quand l'interruption est active, 1 au repos. Un TOS
-        // réel sonde parfois ce niveau brut directement (pas seulement via
-        // le canal d'interruption edge-triggered du MFP) : au boot, par
-        // exemple, la détection du nombre de lecteurs de disquette attend
-        // que GPIP5 passe à 0 après une commande WD1772, avec un timeout —
-        // sans cette inversion, le bit ne descend jamais à 0 et le TOS
-        // conclut à tort qu'aucun lecteur n'est présent (`_nflops` reste à
-        // 0, aucune icône A: sur le bureau).
-        // Fait progresser une commande WD1772 en cours (voir la doc de
-        // `wd1772::Wd1772::tick` — vitesse de pas, latence de rotation,
-        // débit de transfert réels, plutôt que l'exécution instantanée
-        // d'une version précédente qui rendait toute la disquette bien
-        // trop rapide). Câblage face/lecteur : voir `floppy_drive_select`,
-        // relu ici aussi (pas seulement à l'écriture de commande) car une
-        // commande multi-secteurs peut s'étaler sur plusieurs `tick()`.
+        // `/IRQ` (ACIA) and `/INTRQ` (WD1772) are real hardware signals,
+        // active low (asserted = logic level 0, as their name indicates),
+        // wired directly onto GPIP4/GPIP5 — with no inverter, GPIP must
+        // therefore read 0 when the interrupt is active, 1 at rest. A
+        // real TOS sometimes probes this raw level directly (not only via
+        // the MFP's edge-triggered interrupt channel): at boot, for
+        // example, floppy drive count detection waits for GPIP5 to go to
+        // 0 after a WD1772 command, with a timeout — without this
+        // inversion, the bit never goes down to 0 and TOS wrongly
+        // concludes no drive is present (`_nflops` stays at 0, no A:
+        // icon on the desktop).
+        // Advances an in-progress WD1772 command (see the doc of
+        // `wd1772::Wd1772::tick` — real seek speed, rotational latency,
+        // transfer rate, rather than the instantaneous execution of an
+        // earlier version that made the whole floppy drive far too fast).
+        // Drive/side wiring: see `floppy_drive_select`, re-read here too
+        // (not only on command write) because a multi-sector command can
+        // span several `tick()` calls.
         {
             let (drive_a_selected, side) = self.floppy_drive_select();
             self.wd1772.side = side;
@@ -796,50 +790,51 @@ impl AtariSt {
         self.mfp.set_gpip_input(4, !acia_irq);
         self.mfp.set_gpip_input(5, !self.wd1772.interrupt_requested());
 
-        // Recharge le compteur vidéo du Shifter au front VBL (transition
-        // ligne visible -> blanking, voir `Glue::vbl_edge_count`), PAS au
-        // bouclage complet de la trame (`Glue::frame_count`) : sur silicium
-        // réel, la base est rechargée dès le début du blanking vertical,
-        // qui précède la ligne 0 de la trame suivante de tout le reste du
-        // blanking (~113 lignes en PAL) — pas dans le même souffle. Utiliser
-        // `frame_count` ici rendait la ligne visible 0 de la trame suivante
-        // déjà rendue (et son pulse Timer B déjà émis, voir plus bas) dans
-        // le MÊME appel `tick()` que celui où VBL vient tout juste de
-        // s'armer, ne laissant absolument aucune fenêtre au logiciel pour
-        // prendre l'interruption VBL avant que cette ligne ne soit déjà
-        // consommée — confirmé nécessaire par la cartouche de diagnostic
-        // usine STe (test "T4 Video Counter in Memory Controller").
+        // Reloads the Shifter's video counter on the VBL edge (visible
+        // line -> blanking transition, see `Glue::vbl_edge_count`), NOT
+        // on the complete frame wraparound (`Glue::frame_count`): on real
+        // silicon, the base is reloaded right at the start of vertical
+        // blanking, which precedes line 0 of the next frame by the whole
+        // rest of blanking (~113 lines in PAL) — not in the same breath.
+        // Using `frame_count` here would have visible line 0 of the next
+        // frame already rendered (and its Timer B pulse already emitted,
+        // see below) within the SAME `tick()` call as the one where VBL
+        // has just armed, leaving absolutely no window for software to
+        // take the VBL interrupt before this line has already been
+        // consumed — confirmed necessary by the STe factory diagnostic
+        // cartridge (test "T4 Video Counter in Memory Controller").
         let vbl_edge_now = self.glue.vbl_edge_count();
         if vbl_edge_now != self.last_vbl_edge {
             self.last_vbl_edge = vbl_edge_now;
             self.shifter.start_frame();
         }
         let lines_per_frame = self.glue.lines_per_frame() as u64;
-        // Compteur absolu (jamais remis à zéro) pour ne pas confondre "une
-        // trame entière vient de s'écouler" avec "aucune ligne écoulée"
-        // quand current_line() revient à 0 en bouclant.
+        // Absolute counter (never reset) so as not to confuse "a whole
+        // frame has just elapsed" with "no line elapsed" when
+        // current_line() wraps back to 0.
         let absolute_line_now =
             self.glue.frame_count() * lines_per_frame + self.glue.current_line() as u64;
-        // Borne défensive : ne rattrape jamais plus d'une trame complète en
-        // un seul tick (cas normal : 0 ou 1 ligne, tick() étant appelé après
-        // chaque instruction, bien plus fréquemment qu'une ligne = 512 cycles).
+        // Defensive bound: never catch up more than one whole frame in a
+        // single tick (normal case: 0 or 1 line, tick() being called
+        // after each instruction, far more often than one line = 512
+        // cycles).
         let mut guard = 0u64;
         while self.last_absolute_line < absolute_line_now && guard < lines_per_frame {
             self.last_absolute_line += 1;
             let absolute_line = (self.last_absolute_line % lines_per_frame) as u32;
-            // Câblage matériel réel ST/STE : le Shifter ne fetch (et donc
-            // n'avance son compteur vidéo) QUE pendant les lignes affichées
-            // (`Glue::display_index`, fenêtre nominale de 200 lignes,
-            // potentiellement étendue par une suppression de bordure
-            // haute/basse STE — voir `peripherals::atari_st::shifter`) —
-            // pas pendant le blanking vertical. Idem pour l'entrée externe
-            // TBI du Timer B du MFP, reliée au signal de balayage actif
-            // (DE), pas au HBL brut : elle ne pulse que sur ces mêmes
-            // lignes affichées. C'est exactement ce que le boot TOS
-            // exploite pour détecter qu'il vient d'entrer en VBL : il
-            // programme le Timer B en mode event-count puis attend que la
-            // valeur cesse de changer (~615 lectures stables), ce qui
-            // n'arrive jamais tant qu'on reste dans la zone affichée.
+            // Real ST/STE hardware wiring: the Shifter only fetches (and
+            // thus only advances its video counter) DURING displayed
+            // lines (`Glue::display_index`, nominal 200-line window,
+            // potentially extended by an STE top/bottom border removal —
+            // see `peripherals::atari_st::shifter`) — not during vertical
+            // blanking. Likewise for the MFP Timer B's external TBI
+            // input, wired to the active display-enable signal (DE), not
+            // to the raw HBL: it only pulses on these same displayed
+            // lines. This is exactly what the TOS boot exploits to detect
+            // it has just entered VBL: it programs Timer B in event-count
+            // mode then waits for the value to stop changing (~615 stable
+            // reads), which never happens as long as we stay within the
+            // displayed area.
             if let Some(idx) = self.glue.display_index(absolute_line).map(|i| i as usize) {
                 let row = self.shifter.render_scanline(&self.ram);
                 if idx >= self.framebuffer.len() {
@@ -852,7 +847,7 @@ impl AtariSt {
         }
         if guard >= lines_per_frame && self.last_absolute_line < absolute_line_now && std::env::var("RUST68_TRACE_VECTORS").is_ok() {
             eprintln!(
-                "[trace] tick() : rattrapage vidéo tronqué par la garde (retard restant : {} lignes)",
+                "[trace] tick(): video catch-up truncated by the guard (remaining lag: {} lines)",
                 absolute_line_now - self.last_absolute_line
             );
         }
@@ -870,49 +865,50 @@ impl AtariSt {
         addr >= self.rom_base && addr - self.rom_base < self.rom.len() as u32
     }
 
-    /// Vrai si `addr` (déjà connue hors de la RAM installée, c'est-à-dire
-    /// `addr >= self.ram.len()`) tombe dans l'espace d'adressage "RAM ST"
-    /// fixe de 4 Mo (voir [`ST_RAM_ADDRESS_SPACE`]) — où un accès ne
-    /// déclenche **jamais** de bus error sur silicium réel, même sans RAM
-    /// physique à cette adresse précise, contrairement au vrai "trou"
-    /// au-delà, avant `IO_BASE`.
+    /// True if `addr` (already known to be outside installed RAM, i.e.
+    /// `addr >= self.ram.len()`) falls within the fixed 4 MB "ST RAM"
+    /// address space (see [`ST_RAM_ADDRESS_SPACE`]) — where an access
+    /// **never** triggers a bus error on real silicon, even without
+    /// physical RAM at that precise address, unlike the real "hole"
+    /// beyond it, before `IO_BASE`.
     ///
-    /// Confirmé par le code source de Hatari (`stMemory.c`) : cette zone
-    /// est mappée sur `VoidMem_bank`, dont les lectures renvoient une valeur
-    /// fixe (`nonexistingdata()` = 0) et les écritures sont silencieusement
-    /// ignorées (`dummy_get`/`dummy_put`), sans jamais lever de bus error —
-    /// le vrai "trou" (`BusErrMem_bank` chez Hatari) ne commence, lui,
-    /// qu'à 4 Mo.
+    /// Confirmed by Hatari's source code (`stMemory.c`): this area is
+    /// mapped onto `VoidMem_bank`, whose reads return a fixed value
+    /// (`nonexistingdata()` = 0) and whose writes are silently ignored
+    /// (`dummy_get`/`dummy_put`), never raising a bus error — the real
+    /// "hole" (`BusErrMem_bank` in Hatari) only starts at 4 MB.
     ///
-    /// Historique : deux tentatives antérieures de mirroring d'adresse par
-    /// banque MMU (pour, en plus, satisfaire une cartouche de diagnostic
-    /// usine dont l'heuristique rapide de taille RAM conclut "2 Mo" au lieu
-    /// de 1 Mo pour un 1040STE) avaient été essayées et abandonnées — l'une
-    /// faisait conclure au TOS 4 Mo au lieu d'1 Mo, l'autre (un vrai bus
-    /// error ici, retenté puis annulé dans cette même session) provoquait un
-    /// double bus fault (SP encore dérivé de l'en-tête ROM — "os_entry", pas
-    /// un vrai SSP — au moment du tout premier accès hors RAM, avant que le
-    /// TOS n'ait eu la moindre chance d'installer le sien).
+    /// History: two earlier attempts at MMU per-bank address mirroring
+    /// (in order to also satisfy a factory diagnostic cartridge whose
+    /// quick RAM-size heuristic concludes "2 MB" instead of 1 MB for a
+    /// 1040STE) were tried and abandoned — one made TOS conclude 4 MB
+    /// instead of 1 MB, the other (a real bus error here, retried then
+    /// reverted within this same session) caused a double bus fault (SP
+    /// still derived from the ROM header — "os_entry", not a real SSP —
+    /// at the moment of the very first out-of-RAM access, before TOS had
+    /// had the slightest chance to install its own).
     ///
-    /// Vérifié directement contre Hatari (capture d'écran à l'appui) que le
-    /// mirroring EST bien nécessaire — Hatari affiche correctement "1M RAM"
-    /// pour ce même TOS/cartouche/1040STE, pas "2M". Le vrai mécanisme (voir
-    /// [`Self::translate_ram_addr`]) est plus étroit que les tentatives
-    /// précédentes : un mirroring purement INTRA-banque, piloté par
-    /// [`MEMORY_CONF`], qui devient l'identité dès que ce registre reflète
-    /// la RAM réellement installée (le cas normal, une fois le TOS booté) —
-    /// donc sans le risque des tentatives précédentes (ni bus error, ni
-    /// mirroring global hors de propos).
+    /// Directly verified against Hatari (with a screenshot as evidence)
+    /// that mirroring IS indeed necessary — Hatari correctly displays
+    /// "1M RAM" for this same TOS/cartridge/1040STE, not "2M". The real
+    /// mechanism (see [`Self::translate_ram_addr`]) is narrower than the
+    /// earlier attempts: a purely INTRA-bank mirroring, driven by
+    /// [`MEMORY_CONF`], which becomes the identity as soon as this
+    /// register reflects the actually installed RAM (the normal case,
+    /// once TOS has booted) — so without the risk of the earlier
+    /// attempts (neither a bus error, nor an irrelevant global
+    /// mirroring).
     fn in_floating_st_ram(addr: u32) -> bool {
         addr < ST_RAM_ADDRESS_SPACE
     }
 
-    /// Taille réellement peuplée de chaque banque RAM STE pour une RAM
-    /// totale de `ram_len` octets — reproduction exacte de la table de
-    /// `STMemory_RAM_SetBankSize` (Hatari, `stMemory.c`), seules
-    /// configurations standard sur silicium réel (banques par paires de
-    /// 128/512/2048 Ko). `None` si `ram_len` ne correspond à aucune d'elles
-    /// (auquel cas [`Self::translate_ram_addr`] ne traduit rien).
+    /// Actually populated size of each STE RAM bank for a total RAM of
+    /// `ram_len` bytes — exact reproduction of the
+    /// `STMemory_RAM_SetBankSize` table (Hatari, `stMemory.c`), the only
+    /// standard configurations on real silicon (bank pairs of
+    /// 128/512/2048 KB). `None` if `ram_len` doesn't match any of them
+    /// (in which case [`Self::translate_ram_addr`] doesn't translate
+    /// anything).
     fn ram_bank_sizes(ram_len: usize) -> Option<(u32, u32)> {
         const KB: usize = 1024;
         Some(match ram_len / KB {
@@ -929,19 +925,19 @@ impl AtariSt {
         })
     }
 
-    /// Valeur de [`MEMORY_CONF`] correspondant à une RAM totale de
-    /// `ram_len` octets CORRECTEMENT configurée (bits 3-2 = banque 0,
-    /// bits 1-0 = banque 1) — même table que [`Self::ram_bank_sizes`],
-    /// exprimée en code MEMCONF plutôt qu'en taille de banque. `None` si
-    /// `ram_len` ne correspond à aucune configuration standard.
+    /// Value of [`MEMORY_CONF`] corresponding to a total RAM of
+    /// `ram_len` bytes CORRECTLY configured (bits 3-2 = bank 0, bits
+    /// 1-0 = bank 1) — same table as [`Self::ram_bank_sizes`], expressed
+    /// as a MEMCONF code rather than as a bank size. `None` if `ram_len`
+    /// doesn't match any standard configuration.
     ///
-    /// À utiliser pour pré-remplir `MEMORY_CONF` avant un démarrage à chaud
-    /// (voir `atari_st_sdl2`) : le raccourci "redémarrage à chaud" saute
-    /// précisément le code TOS qui configurerait normalement ce registre
-    /// (même raisonnement que pour `memvalid`/`phystop`) — sans ce
-    /// pré-remplissage, [`Self::translate_ram_addr`] verrait `MEMORY_CONF`
-    /// resté à sa valeur de reset (`0`, soit 128 Ko + 128 Ko) et rendrait
-    /// inaccessible (flottante) toute la RAM au-delà de 256 Ko.
+    /// To be used to pre-fill `MEMORY_CONF` before a warm start (see
+    /// `atari_st_sdl2`): the "warm restart" shortcut precisely skips the
+    /// TOS code that would normally configure this register (same
+    /// reasoning as for `memvalid`/`phystop`) — without this pre-fill,
+    /// [`Self::translate_ram_addr`] would see `MEMORY_CONF` stuck at its
+    /// reset value (`0`, i.e. 128 KB + 128 KB) and would make all RAM
+    /// beyond 256 KB inaccessible (floating).
     pub fn expected_memory_conf(ram_len: usize) -> Option<u8> {
         const KB: usize = 1024;
         Some(match ram_len / KB {
@@ -958,30 +954,29 @@ impl AtariSt {
         })
     }
 
-    /// Fige la valeur logicielle de [`MEMORY_CONF`] à `value` — toute
-    /// écriture ultérieure du CPU dans ce registre (`write8`) est acceptée
-    /// (l'overlay se désactive normalement) mais n'affecte plus la valeur
-    /// mémorisée, qui reste `value`. `None` (défaut) : comportement normal,
-    /// le CPU contrôle entièrement ce registre.
+    /// Pins the software value of [`MEMORY_CONF`] to `value` — any
+    /// subsequent CPU write to this register (`write8`) is accepted (the
+    /// overlay disables normally) but no longer affects the stored value,
+    /// which stays `value`. `None` (default): normal behavior, the CPU
+    /// fully controls this register.
     ///
-    /// À utiliser avec le raccourci "redémarrage à chaud" (voir
-    /// `atari_st_sdl2`, à côté de son pré-remplissage équivalent de
-    /// `memvalid`/`phystop`) : contrairement à ces derniers (simplement LUS
-    /// par le TOS pour décider chaud/froid), le TOS écrit
-    /// INCONDITIONNELLEMENT `MEMORY_CONF=0` très tôt au boot (avant même de
-    /// consulter `memvalid`), qui n'est normalement corrigé qu'à la toute
-    /// fin de l'algorithme de détection RAM — algorithme que le raccourci
-    /// saute justement. Un simple pré-remplissage ponctuel se fait donc
-    /// aussitôt écraser ; le figer ici le fait survivre à cette écriture
-    /// intermédiaire, exactement comme si la détection avait réellement eu
-    /// lieu et avait conclu la bonne valeur.
+    /// To be used with the "warm restart" shortcut (see `atari_st_sdl2`,
+    /// alongside its equivalent pre-fill of `memvalid`/`phystop`): unlike
+    /// those (simply READ by TOS to decide warm/cold), TOS
+    /// UNCONDITIONALLY writes `MEMORY_CONF=0` very early at boot (even
+    /// before consulting `memvalid`), which is normally only corrected at
+    /// the very end of the RAM detection algorithm — the exact algorithm
+    /// the shortcut skips. A one-off pre-fill therefore gets immediately
+    /// overwritten; pinning it here makes it survive this intermediate
+    /// write, exactly as if detection had actually taken place and had
+    /// concluded the correct value.
     pub fn pin_memory_conf(&mut self, value: u8) {
         self.memory_conf_pin = Some(value);
     }
 
-    /// Décode un champ 2 bits de [`MEMORY_CONF`] en taille de banque
-    /// logique (`00`=128 Ko, `01`=512 Ko, `10`=2 Mo, `11`=réservé/invalide,
-    /// traité comme absent) — reproduction de `STMemory_MMU_Size` (Hatari).
+    /// Decodes a 2-bit field of [`MEMORY_CONF`] into a logical bank size
+    /// (`00`=128 KB, `01`=512 KB, `10`=2 MB, `11`=reserved/invalid,
+    /// treated as absent) — reproduction of `STMemory_MMU_Size` (Hatari).
     fn mmu_bank_size_from_code(code: u8) -> u32 {
         match code & 0x3 {
             0 => 128 * 1024,
@@ -991,34 +986,33 @@ impl AtariSt {
         }
     }
 
-    /// Traduit une adresse logique CPU en offset physique dans `self.ram` —
-    /// `None` si l'adresse tombe hors de la RAM installée (doit alors
-    /// retomber dans [`Self::in_floating_st_ram`]).
+    /// Translates a logical CPU address into a physical offset within
+    /// `self.ram` — `None` if the address falls outside installed RAM (it
+    /// must then fall through to [`Self::in_floating_st_ram`]).
     ///
-    /// Sur STE/Mega STE avec une configuration de banques standard (voir
-    /// [`Self::ram_bank_sizes`]), reproduit le mirroring d'adresse
-    /// intra-banque du MMU/MCU (`STMemory_MMU_Translate_Addr_STE`, Hatari) :
-    /// [`MEMORY_CONF`] (bits 3-2 = taille logique banque 0, bits 1-0 =
-    /// banque 1) attribue à chaque banque une taille que le logiciel croit
-    /// vraie ; si elle dépasse la taille RÉELLEMENT peuplée, les adresses
-    /// au-delà de la taille réelle mais dans la taille logique "bouclent"
-    /// (adressage DRAM incomplet : certaines lignes de colonne/rangée ne
-    /// sont simplement pas câblées pour une puce plus petite que
-    /// l'emplacement prévu). Démontré chez Hatari : la formule se réduit
-    /// systématiquement à `addr_logique & (taille_réelle - 1)`,
-    /// indépendamment de la taille logique précise (seul son ordre de
-    /// grandeur, via le dispatch de banque ci-dessous, importe) — d'où
-    /// l'implémentation simplifiée. Devient l'identité dès que
-    /// `MEMORY_CONF` reflète la RAM réellement installée (le cas normal, une
-    /// fois le TOS booté) : aucun changement de comportement hors de la
-    /// fenêtre de démarrage où la configuration est encore incorrecte/par
-    /// défaut.
+    /// On STE/Mega STE with a standard bank configuration (see
+    /// [`Self::ram_bank_sizes`]), reproduces the MMU/MCU's intra-bank
+    /// address mirroring (`STMemory_MMU_Translate_Addr_STE`, Hatari):
+    /// [`MEMORY_CONF`] (bits 3-2 = bank 0's logical size, bits 1-0 =
+    /// bank 1) assigns each bank a size that software believes is real;
+    /// if it exceeds the ACTUALLY populated size, addresses beyond the
+    /// real size but within the logical size "wrap around" (incomplete
+    /// DRAM addressing: certain column/row lines simply aren't wired for
+    /// a chip smaller than the slot it's meant for). Demonstrated in
+    /// Hatari: the formula systematically reduces to
+    /// `logical_addr & (real_size - 1)`, independently of the precise
+    /// logical size (only its order of magnitude, via the bank dispatch
+    /// below, matters) — hence the simplified implementation. Becomes the
+    /// identity as soon as `MEMORY_CONF` reflects the actually installed
+    /// RAM (the normal case, once TOS has booted): no change in behavior
+    /// outside the startup window where the configuration is still
+    /// incorrect/default.
     ///
-    /// Sur ST/Mega ST (`!self.blitter_present`) ou pour une taille de RAM
-    /// non standard (`ram_bank_sizes` = `None`) : mappage direct, comme
-    /// avant l'introduction de ce mirroring — la formule STF (non-STE)
-    /// diffère (réordonnancement différent des bits colonne/rangée) et
-    /// n'est pas reproduite ici faute de besoin démontré.
+    /// On ST/Mega ST (`!self.blitter_present`) or for a non-standard RAM
+    /// size (`ram_bank_sizes` = `None`): direct mapping, as before the
+    /// introduction of this mirroring — the STF (non-STE) formula differs
+    /// (different reordering of column/row bits) and isn't reproduced
+    /// here for lack of a demonstrated need.
     fn translate_ram_addr(&self, addr: u32) -> Option<usize> {
         let Some((ram_b0, ram_b1)) = self.ram_bank_sizes.filter(|_| self.blitter_present) else {
             return if (addr as usize) < self.ram.len() { Some(addr as usize) } else { None };
@@ -1061,13 +1055,14 @@ impl AtariSt {
         self.blitter_present && (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&addr)
     }
 
-    /// Décode les lignes de sélection lecteur/face du connecteur disquette,
-    /// portées par le port A du YM2149 (voir la doc de
-    /// [`ym2149::Ym2149::port_a_output`]) — renvoie `(lecteur A sélectionné,
-    /// face)`. Sans ce câblage, `self.wd1772.side` resterait toujours à sa
-    /// valeur par défaut (0) quoi que TOS programme, rendant illisible tout
-    /// contenu situé sur la face 1 d'une disquette double face (le cas de
-    /// pratiquement tout logiciel ST réel au format `.st` 720 Ko).
+    /// Decodes the drive/side selection lines of the floppy connector,
+    /// carried by the YM2149's port A (see the doc of
+    /// [`ym2149::Ym2149::port_a_output`]) — returns `(drive A selected,
+    /// side)`. Without this wiring, `self.wd1772.side` would always stay
+    /// at its default value (0) no matter what TOS programs, making
+    /// unreadable any content located on side 1 of a double-sided floppy
+    /// (the case of practically all real ST software in the 720 KB `.st`
+    /// format).
     fn floppy_drive_select(&self) -> (bool, u8) {
         let port_a = self.ym2149.port_a_output();
         let drive_a_selected = port_a & 0x02 == 0;
@@ -1075,12 +1070,12 @@ impl AtariSt {
         (drive_a_selected, side)
     }
 
-    /// Vrai si `off` (offset relatif à [`STE_DMA_SOUND_BASE`]) correspond à
-    /// un registre géré par [`dma_sound::DmaSound`] (voir son module
-    /// [`dma_sound::reg`]) plutôt qu'au stockage générique
-    /// (`self.ste_dma_sound`) — le Microwire (`$FF8922`/`$FF8923`, offsets
-    /// `0x22`/`0x23`) reste volontairement hors de cette liste, géré à part
-    /// (voir la doc sur `STE_MICROWIRE_DATA`).
+    /// True if `off` (offset relative to [`STE_DMA_SOUND_BASE`])
+    /// corresponds to a register handled by [`dma_sound::DmaSound`] (see
+    /// its [`dma_sound::reg`] module) rather than the generic storage
+    /// (`self.ste_dma_sound`) — the Microwire (`$FF8922`/`$FF8923`,
+    /// offsets `0x22`/`0x23`) is deliberately kept out of this list,
+    /// handled separately (see the doc on `STE_MICROWIRE_DATA`).
     fn is_dma_sound_reg(off: u32) -> bool {
         use dma_sound::reg;
         matches!(
@@ -1099,27 +1094,27 @@ impl AtariSt {
         )
     }
 
-    /// Étiquette de composant pour `addr`, pour [`crate::trace::FileTraceSink`]
-    /// (voir `RUST68_TRACE_ALL`) — reproduit fidèlement l'ordre de décision
-    /// de [`Bus::read8`] ci-dessous (même priorité entre RAM/ROM et
-    /// périphériques), afin que l'étiquette corresponde toujours à ce que
-    /// l'accès a *réellement* touché, pas à une classification approximative
-    /// indépendante. N'observe pas `self.overlay` (état vrai seulement
-    /// pendant les toutes premières instructions du boot froid) : voir
-    /// [`Self::describe_addr_static`], dont ceci n'est qu'un raccourci —
-    /// l'étiquette "ram" est renvoyée à la place pendant cette courte
-    /// fenêtre, sans conséquence puisque c'est purement descriptif (le vrai
-    /// dispatch dans `read8`/`write8` reste, lui, inchangé).
+    /// Component label for `addr`, for [`crate::trace::FileTraceSink`]
+    /// (see `RUST68_TRACE_ALL`) — faithfully reproduces the decision
+    /// order of [`Bus::read8`] below (same priority between RAM/ROM and
+    /// peripherals), so that the label always matches what the access
+    /// *actually* touched, not an independent, approximate
+    /// classification. Doesn't observe `self.overlay` (true state only
+    /// during the very first instructions of cold boot): see
+    /// [`Self::describe_addr_static`], of which this is only a shortcut —
+    /// the "ram" label is returned instead during this short window,
+    /// without consequence since it is purely descriptive (the real
+    /// dispatch in `read8`/`write8` remains unchanged).
     pub fn describe_addr(&self, addr: u32) -> &'static str {
         Self::describe_addr_static(self.ram.len(), self.rom_base, self.rom.len(), self.blitter_present, addr)
     }
 
-    /// Version sans `&self` de [`Self::describe_addr`] — pour les appelants
-    /// (comme le puits de traçage `RUST68_TRACE_ALL`, voir
-    /// `bin/atari_st_sdl2.rs`) qui ne peuvent pas emprunter `AtariSt` tout en
-    /// l'enveloppant simultanément dans un [`crate::TracingBus`] mutable.
-    /// Les paramètres capturent tout ce dont la classification a besoin,
-    /// figé à la construction (jamais modifié ensuite).
+    /// `&self`-less version of [`Self::describe_addr`] — for callers
+    /// (such as the `RUST68_TRACE_ALL` trace sink, see
+    /// `bin/atari_st_sdl2.rs`) that cannot borrow `AtariSt` while
+    /// simultaneously wrapping it in a mutable [`crate::TracingBus`]. The
+    /// parameters capture everything the classification needs, fixed at
+    /// construction (never modified afterwards).
     pub fn describe_addr_static(
         ram_len: usize,
         rom_base: u32,
@@ -1173,18 +1168,17 @@ impl Bus for AtariSt {
             return self.ram[phys];
         }
         if Self::in_floating_st_ram(addr) {
-            // Au-delà de la RAM installée mais dans l'espace "RAM ST" (4 Mo) :
-            // jamais de bus error sur silicium réel (voir la doc du module),
-            // valeur fixe non stockée (jamais ce qui vient d'être écrit) —
-            // confirmé par le code source de Hatari (`stMemory.c`,
-            // `VoidMem_bank`/`dummy_get`) : cette zone renvoie une valeur
-            // fixe sans jamais fauter, contrairement au vrai "trou" au-delà
-            // de 4 Mo (`BusErrMem_bank` chez Hatari, avant `IO_BASE` chez
-            // nous). Ne PAS confondre avec un défaut d'aliasing de banque
-            // MMU (qui, lui, existe réellement chez Hatari mais ne
-            // s'applique qu'à l'intérieur d'une banque physiquement
-            // peuplée — non modélisé ici, voir la doc de
-            // `in_floating_st_ram`).
+            // Beyond installed RAM but within the "ST RAM" space (4 MB):
+            // never a bus error on real silicon (see the module doc), a
+            // fixed, non-stored value (never what was just written) —
+            // confirmed by Hatari's source code (`stMemory.c`,
+            // `VoidMem_bank`/`dummy_get`): this area returns a fixed
+            // value without ever faulting, unlike the real "hole" beyond
+            // 4 MB (`BusErrMem_bank` in Hatari, before `IO_BASE` for us).
+            // Do NOT confuse with an MMU bank aliasing quirk (which does
+            // genuinely exist in Hatari but only applies inside a
+            // physically populated bank — not modeled here, see the doc
+            // of `in_floating_st_ram`).
             return 0x00;
         }
         if let Some(off) = Self::mfp_offset(addr) {
@@ -1195,7 +1189,7 @@ impl Bus for AtariSt {
             ACIA_KEYBOARD_DATA => {
                 let v = self.acia_keyboard.read(acia::reg::DATA);
                 if std::env::var("RUST68_TRACE_IKBD").is_ok() {
-                    eprintln!("[ikbd] lecture ACIA_KEYBOARD_DATA -> {v:#04x}");
+                    eprintln!("[ikbd] read ACIA_KEYBOARD_DATA -> {v:#04x}");
                 }
                 return v;
             }
@@ -1211,14 +1205,15 @@ impl Bus for AtariSt {
             DMA_ADDR_MID => return (self.dma_address >> 8) as u8,
             DMA_ADDR_LOW => return self.dma_address as u8,
             _ if self.is_blitter_addr(addr) => return self.blitter.read(addr - BLITTER_BASE),
-            // Microwire DATA (`$FF8922`/`$FF8923`) : toujours 0 en lecture,
-            // quoi qu'on y ait écrit — simule un décalage série toujours déjà
-            // terminé (silicium réel : ce registre se vide progressivement
-            // pendant le décalage ; sans émuler le vrai timing série, le
-            // logiciel qui écrit puis boucle en l'attendant à zéro doit
-            // trouver zéro immédiatement, pas boucler indéfiniment). Le
-            // registre MASK (`$FF8924`) et le reste de la plage restent un
-            // stockage lecture/écriture fidèle normal.
+            // Microwire DATA (`$FF8922`/`$FF8923`): always 0 on read, no
+            // matter what was written to it — simulates a serial shift
+            // that is always already finished (real silicon: this
+            // register progressively empties during the shift; without
+            // emulating the real serial timing, software that writes then
+            // loops waiting for it to reach zero must find zero
+            // immediately, not loop indefinitely). The MASK register
+            // (`$FF8924`) and the rest of the range remain normal,
+            // faithful read/write storage.
             STE_MICROWIRE_DATA | STE_MICROWIRE_DATA1 => return 0x00,
             _ if (STE_DMA_SOUND_BASE..=STE_DMA_SOUND_END).contains(&addr) => {
                 let off = addr - STE_DMA_SOUND_BASE;
@@ -1243,36 +1238,37 @@ impl Bus for AtariSt {
             return 0xFF;
         }
         if std::env::var("RUST68_TRACE_VECTORS").is_ok() {
-            eprintln!("[trace] bus fault en lecture : addr={addr:#x}");
+            eprintln!("[trace] read bus fault: addr={addr:#x}");
         }
         self.bus_fault = Some((addr, false));
         0xFF
     }
 
-    // Registres de palette Shifter (`$FF8240`-`$FF825E`) : sur le silicium
-    // réel (confirmé par Hatari, `Video_ColorReg_WriteWord`), un accès `.W`
-    // ou `.L` du CPU écrit le mot normalement, mais un accès `.B` ISOLÉ
-    // duplique l'octet écrit dans les deux moitiés du mot avant masquage
-    // (voir la doc de [`shifter::Shifter::write`]). Le `write8` par défaut
-    // ne voit jamais qu'un octet à la fois et ne peut donc pas distinguer
-    // ces deux cas — cette surcharge de `write16` intercepte les VRAIS
-    // accès mot pour cette plage précise et les route vers
-    // `write_palette_word`, qui n'applique pas la duplication.
+    // Shifter palette registers (`$FF8240`-`$FF825E`): on real silicon
+    // (confirmed by Hatari, `Video_ColorReg_WriteWord`), a `.W` or `.L`
+    // CPU access writes the word normally, but an ISOLATED `.B` access
+    // duplicates the written byte into both halves of the word before
+    // masking (see the doc of [`shifter::Shifter::write`]). The default
+    // `write8` only ever sees one byte at a time and therefore cannot
+    // distinguish these two cases — this `write16` override intercepts
+    // REAL word accesses for this precise range and routes them to
+    // `write_palette_word`, which doesn't apply the duplication.
     fn write16(&mut self, addr: u32, value: u16) {
         let masked = addr & ADDR_MASK;
         if (shifter::addr::PALETTE_BASE..shifter::addr::PALETTE_BASE + 32).contains(&masked) {
             self.shifter.write_palette_word(masked, value);
             return;
         }
-        // Registres Blitter 16 bits (SRC_X_INC/SRC_Y_INC/ENDMASK1-3/
-        // DST_X_INC/DST_Y_INC/X_COUNT/Y_COUNT) : sur le silicium réel, un
-        // accès `.B` ISOLÉ à l'un de ces registres est ignoré (confirmé par
-        // Hatari, `Blitter_CheckAccess_Byte`) — seul un accès `.W`/`.L`
-        // complet est honoré. Le `write8` par défaut ne voit jamais qu'un
-        // octet à la fois et ne peut donc pas faire cette distinction :
-        // cette surcharge intercepte les VRAIS accès mot pour ces
-        // registres précis et les route vers `Blitter::write_word` (voir sa
-        // doc) plutôt que vers la composition octet par octet.
+        // 16-bit Blitter registers (SRC_X_INC/SRC_Y_INC/ENDMASK1-3/
+        // DST_X_INC/DST_Y_INC/X_COUNT/Y_COUNT): on real silicon, an
+        // ISOLATED `.B` access to one of these registers is ignored
+        // (confirmed by Hatari, `Blitter_CheckAccess_Byte`) — only a
+        // complete `.W`/`.L` access is honored. The default `write8`
+        // only ever sees one byte at a time and therefore cannot make
+        // this distinction: this override intercepts REAL word accesses
+        // for these precise registers and routes them to
+        // `Blitter::write_word` (see its doc) rather than to the
+        // byte-by-byte composition.
         if self.blitter_present && (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&masked) {
             let reg_offset = masked - BLITTER_BASE;
             if reg_offset < 0x20
@@ -1292,56 +1288,56 @@ impl Bus for AtariSt {
                 self.blitter.write_word(reg_offset, value);
                 return;
             }
-            // CONTROL+SKEW ($FF8A3C/$FF8A3D) : TOS les écrit régulièrement
-            // en un seul accès `.W` (ex. TOS 1.62, `$E11746`, `MOVE.W
-            // D7,(A5)`, D7 empaquetant les deux octets pour armer un blit
-            // avec le bon SKEW dès le départ). La composition générique
-            // octet par octet ci-dessous écrirait CONTROL (octet HAUT)
-            // AVANT SKEW (octet BAS) — or `write8` déclenche `execute()`
-            // *synchrone et immédiat* dès que CONTROL est écrit avec le bit
-            // BUSY posé (voir plus bas) : le Blitter démarrerait alors le
-            // blit avec l'ANCIEN SKEW, un instant avant que le nouveau ne
-            // soit posé par ce même accès `.W` — confirmé par comparaison
-            // directe avec un vrai Hatari (trace `RUST68_HATARI_TRACE`) sur
-            // un blit de restauration de menu GEM : les 4 plans doivent
-            // partager le même SKEW (armé en une fois par TOS avant la
-            // boucle), mais seul le premier ressortait avec SKEW=0 côté
-            // Rust68 — exactement le plan dont le blit démarre pendant ce
-            // même accès `.W`. Écrire SKEW en premier (sans effet de bord)
-            // puis déléguer à `write8` pour CONTROL (chemin normal,
-            // inchangé) résout l'ordre sans dupliquer la logique de
-            // déclenchement.
+            // CONTROL+SKEW ($FF8A3C/$FF8A3D): TOS regularly writes them in
+            // a single `.W` access (e.g. TOS 1.62, `$E11746`, `MOVE.W
+            // D7,(A5)`, D7 packing both bytes to arm a blit with the
+            // correct SKEW right from the start). The generic
+            // byte-by-byte composition below would write CONTROL (HIGH
+            // byte) BEFORE SKEW (LOW byte) — but `write8` triggers
+            // `execute()` *synchronously and immediately* as soon as
+            // CONTROL is written with the BUSY bit set (see below): the
+            // Blitter would then start the blit with the OLD SKEW, an
+            // instant before the new one is set by this same `.W` access
+            // — confirmed by direct comparison with a real Hatari (trace
+            // `RUST68_HATARI_TRACE`) on a GEM menu restoration blit: all
+            // 4 planes must share the same SKEW (armed once by TOS before
+            // the loop), but only the first one came out with SKEW=0 on
+            // the Rust68 side — exactly the plane whose blit starts
+            // during this same `.W` access. Writing SKEW first (no side
+            // effects) then delegating to `write8` for CONTROL (normal,
+            // unchanged path) fixes the ordering without duplicating the
+            // trigger logic.
             if reg_offset == blitter::reg::CONTROL {
                 self.blitter.write(blitter::reg::SKEW, value as u8);
                 self.write8(addr, (value >> 8) as u8);
                 return;
             }
         }
-        // `DMA_MODE` ($FF8606) : registre 16 bits réel (voir sa doc) — le
-        // sélecteur de registre FDC vit dans l'octet BAS du mot. TOS y
-        // accède quasi systématiquement en mot complet ; une composition
-        // octet par octet naïve (comme la voie générique ci-dessous) ne
-        // verrait que l'octet HAUT (toujours nul pour ces petites valeurs),
-        // laissant le sélecteur bloqué à 0 en permanence — d'où la
-        // sélection FDC entièrement cassée que cette interception corrige.
+        // `DMA_MODE` ($FF8606): a real 16-bit register (see its doc) —
+        // the FDC register selector lives in the LOW byte of the word.
+        // TOS accesses it almost exclusively as a full word; a naive
+        // byte-by-byte composition (like the generic path below) would
+        // only see the HIGH byte (always zero for these small values),
+        // leaving the selector permanently stuck at 0 — hence the
+        // completely broken FDC selection that this interception fixes.
         if masked == DMA_MODE {
-            // Délègue à `write8` (pas de logique dupliquée ici) : évite que
-            // les deux chemins divergent, comme cela avait déjà causé un
-            // oubli du bit 4 (mode compteur de secteurs DMA) la première
-            // fois que ce cas a été traité séparément ici.
+            // Delegates to `write8` (no duplicated logic here): avoids
+            // the two paths diverging, as had already caused bit 4 (DMA
+            // sector-count mode) to be forgotten the first time this case
+            // was handled separately here.
             self.write8(DMA_MODE, value as u8);
             return;
         }
-        // `FDC_DATA` ($FF8604) : registre 16 bits réel lui aussi (même
-        // remarque que `DMA_MODE` ci-dessus) — l'octet du registre WD1772
-        // réellement sélectionné (commande/statut/piste/secteur/donnée)
-        // vit dans l'octet BAS du mot, confirmé par Hatari (`fdc.c`,
-        // `FDC_DiskController_WriteWord` : `IoMem_ReadByte(0xff8605)`).
-        // TOS y accède quasi systématiquement en mot complet ; sans cette
-        // interception, la composition octet par octet générique ne
-        // verrait que l'octet HAUT (toujours nul), et TOUTE commande/
-        // valeur de piste/secteur/donnée écrite ainsi serait perdue —
-        // rendant toute lecture de disquette impossible.
+        // `FDC_DATA` ($FF8604): also a real 16-bit register (same remark
+        // as `DMA_MODE` above) — the byte of the actually selected
+        // WD1772 register (command/status/track/sector/data) lives in
+        // the LOW byte of the word, confirmed by Hatari (`fdc.c`,
+        // `FDC_DiskController_WriteWord`: `IoMem_ReadByte(0xff8605)`).
+        // TOS accesses it almost exclusively as a full word; without this
+        // interception, the generic byte-by-byte composition would only
+        // see the HIGH byte (always zero), and EVERY command/track/
+        // sector/data value written this way would be lost — making any
+        // floppy read impossible.
         if masked == FDC_DATA {
             self.write8(FDC_DATA, value as u8);
             return;
@@ -1350,10 +1346,10 @@ impl Bus for AtariSt {
         self.write8(addr.wrapping_add(1), value as u8);
     }
 
-    /// Voir la doc de [`Self::write16`] sur `FDC_DATA` — même interception
-    /// symétrique en lecture (l'octet WD1772 réel vit dans l'octet BAS du
-    /// mot, la composition générique par défaut le mettrait dans l'octet
-    /// HAUT).
+    /// See the doc of [`Self::write16`] on `FDC_DATA` — same symmetric
+    /// interception on read (the real WD1772 byte lives in the LOW byte
+    /// of the word, the default generic composition would put it in the
+    /// HIGH byte).
     fn read16(&mut self, addr: u32) -> u16 {
         let masked = addr & ADDR_MASK;
         if masked == FDC_DATA {
@@ -1366,9 +1362,9 @@ impl Bus for AtariSt {
 
     fn write32(&mut self, addr: u32, value: u32) {
         let masked = addr & ADDR_MASK;
-        // SRC_ADDR/DST_ADDR du Blitter : registres 32 bits (24 bits
-        // significatifs), même principe que `write16` ci-dessus — seul un
-        // accès `.L` complet est honoré sur le silicium réel.
+        // Blitter's SRC_ADDR/DST_ADDR: 32-bit registers (24 significant
+        // bits), same principle as `write16` above — only a complete
+        // `.L` access is honored on real silicon.
         if self.blitter_present && (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&masked) {
             let reg_offset = masked - BLITTER_BASE;
             if reg_offset == blitter::reg::SRC_ADDR || reg_offset == blitter::reg::DST_ADDR {
@@ -1383,18 +1379,19 @@ impl Bus for AtariSt {
     fn write8(&mut self, addr: u32, value: u8) {
         let addr = addr & ADDR_MASK;
         if addr < 16 && std::env::var("RUST68_TRACE_VECTORS").is_ok() {
-            eprintln!("[trace] écriture vecteur bas : addr={addr:#x} value={value:#04x} overlay={}", self.overlay);
+            eprintln!("[trace] low vector write: addr={addr:#x} value={value:#04x} overlay={}", self.overlay);
         }
-        // Gardé par `!self.rom.is_empty()` : cette protection permanente
-        // suppose une vraie ROM contenant les vecteurs reset à l'origine du
-        // mirroring (voir la doc de la constante). Plusieurs tests
-        // d'intégration construisent un `AtariSt::new(_, vec![])` (ROM vide)
-        // comme banc d'essai CPU/bus nu, et écrivent directement en RAM basse
-        // — que ce soit pour poser leur propre vecteur de reset
-        // (`cpu_prend_une_interruption_mfp_bout_en_bout`) ou comme contenu
-        // vidéo ordinaire à l'adresse 0, base vidéo par défaut
-        // (`tick_rend_une_ligne_video_dans_le_framebuffer`) : sans vraie ROM,
-        // ce mirroring matériel n'a pas de sens et ne doit pas s'appliquer.
+        // Guarded by `!self.rom.is_empty()`: this permanent protection
+        // assumes a real ROM containing the reset vectors that this
+        // mirroring is based on (see the constant's doc). Several
+        // integration tests build an `AtariSt::new(_, vec![])` (empty
+        // ROM) as a bare CPU/bus test rig, and write directly to low RAM
+        // — whether to set their own reset vector
+        // (`cpu_prend_une_interruption_mfp_bout_en_bout`) or as plain
+        // video content at address 0, the default video base
+        // (`tick_rend_une_ligne_video_dans_le_framebuffer`): without a
+        // real ROM, this hardware mirroring makes no sense and must not
+        // apply.
         if !self.rom.is_empty() && addr < RESET_VECTOR_ROM_SIZE {
             self.bus_fault = Some((addr, true));
             return;
@@ -1404,9 +1401,9 @@ impl Bus for AtariSt {
             return;
         }
         if Self::in_floating_st_ram(addr) {
-            // Au-delà de la RAM installée mais dans l'espace "RAM ST" (4 Mo) :
-            // écriture "flottante", jamais persistée — voir la doc
-            // equivalente dans `read8`.
+            // Beyond installed RAM but within the "ST RAM" space (4 MB):
+            // "floating" write, never persisted — see the equivalent doc
+            // in `read8`.
             return;
         }
         if let Some(off) = Self::mfp_offset(addr) {
@@ -1418,7 +1415,7 @@ impl Bus for AtariSt {
                 self.memory_conf = self.memory_conf_pin.unwrap_or(value);
                 if std::env::var("RUST68_TRACE_VECTORS").is_ok() {
                     eprintln!(
-                        "[trace] MEMORY_CONF écrit : overlay désactivé (value={value:#04x}, mémorisée={:#04x})",
+                        "[trace] MEMORY_CONF written: overlay disabled (value={value:#04x}, stored={:#04x})",
                         self.memory_conf
                     );
                 }
@@ -1449,36 +1446,36 @@ impl Bus for AtariSt {
                 self.ym2149.write(ym2149::bus_offset::DATA, value);
                 return;
             }
-            // Registre de synchronisation du GLUE ($FF820A) : registre
-            // matériel UNIQUE, mais deux effets distincts modélisés dans
-            // deux composants séparés — un switch vers 60Hz bien placé en
-            // cycle près du haut/bas de la fenêtre affichée supprime la
-            // bordure VERTICALE correspondante pour la trame en cours
-            // (`Glue::write_sync`), tandis qu'un switch bien placé près de
-            // la fin de ligne (`RIGHT_OFF`) ou très tôt dans la ligne
-            // (nudges `LEFT_PLUS_2`/`RIGHT_MINUS_2`) supprime/ajuste la
-            // bordure HORIZONTALE de la ligne en cours (`Shifter::write_sync`,
-            // voir sa doc de module) — les deux ont besoin de la position en
-            // cycles dans la ligne, connue seulement du board.
+            // GLUE synchronization register ($FF820A): a SINGLE hardware
+            // register, but two distinct effects modeled in two separate
+            // components — a switch to 60Hz well-placed in cycle terms
+            // near the top/bottom of the displayed window removes the
+            // corresponding VERTICAL border for the current frame
+            // (`Glue::write_sync`), while a switch well-placed near the
+            // end of the line (`RIGHT_OFF`) or very early in the line
+            // (nudges `LEFT_PLUS_2`/`RIGHT_MINUS_2`) removes/adjusts the
+            // HORIZONTAL border of the current line (`Shifter::write_sync`,
+            // see its module doc) — both need the cycle position within
+            // the line, known only to the board.
             GLUE_SYNC => {
                 self.glue.write_sync(value);
                 self.shifter.write_sync(value, self.glue.cycles_in_line());
                 return;
             }
-            // Défilement fin STE ($FF8264/$FF8265) et largeur de ligne
-            // ($FF820F) : contrairement aux autres registres Shifter, leur
-            // effet dépend du CYCLE d'écriture dans la ligne courante — une
-            // écriture avant le début d'affichage actif (ou pendant une
-            // ligne hors zone visible, bordure haute/basse : rien à
-            // protéger) s'applique à la ligne EN COURS, une écriture plus
-            // tardive est différée à la ligne suivante (`pending_*` côté
-            // `Shifter`). Seuils cycle-exacts identiques à Hatari
-            // (`video.c`, `Video_HorScroll_Write`/`Video_LineWidth_WriteByte`) :
-            // `line_start_cycle()` (56 PAL/52 NTSC) pour le défilement,
-            // `line_end_cycle()` (376 PAL/372 NTSC, fin d'affichage actif)
-            // pour la largeur de ligne — seuil différent car LineWidth
-            // s'ajoute à l'adresse au moment où l'affichage actif se
-            // termine, pas à son début.
+            // STE fine scrolling ($FF8264/$FF8265) and line width
+            // ($FF820F): unlike other Shifter registers, their effect
+            // depends on the CYCLE of the write within the current line —
+            // a write before the start of active display (or during a
+            // line outside the visible area, top/bottom border: nothing
+            // to protect) applies to the CURRENT line, a later write is
+            // deferred to the next line (`pending_*` on the `Shifter`
+            // side). Cycle-exact thresholds identical to Hatari
+            // (`video.c`, `Video_HorScroll_Write`/`Video_LineWidth_WriteByte`):
+            // `line_start_cycle()` (56 PAL/52 NTSC) for scrolling,
+            // `line_end_cycle()` (376 PAL/372 NTSC, end of active
+            // display) for line width — different threshold because
+            // LineWidth is added to the address at the moment active
+            // display ends, not at its start.
             shifter::addr::HSCROLL_NO_PREFETCH | shifter::addr::HSCROLL_PREFETCH => {
                 let visible = self.glue.display_line().is_some();
                 let apply_now = !visible || self.glue.cycles_in_line() <= self.glue.line_start_cycle();
@@ -1492,11 +1489,11 @@ impl Bus for AtariSt {
                 self.shifter.write_line_width(value, apply_now);
                 return;
             }
-            // Résolution ($FF8260) : même principe que ci-dessus, la
-            // position en cycles dans la ligne détermine si un passage bref
-            // en haute résolution/retour déclenche le trick de suppression
-            // de bordure gauche STE (`LEFT_OFF_2_STE`, voir la doc de
-            // module de `Shifter`) — seul le board connaît cette position.
+            // Resolution ($FF8260): same principle as above, the
+            // cycle position within the line determines whether a brief
+            // switch to high resolution/back triggers the STE left-border
+            // removal trick (`LEFT_OFF_2_STE`, see `Shifter`'s
+            // module doc) — only the board knows this position.
             shifter::addr::RESOLUTION => {
                 self.shifter.write_resolution(value, self.glue.cycles_in_line());
                 return;
@@ -1507,8 +1504,8 @@ impl Bus for AtariSt {
             }
             FDC_DATA => {
                 if self.dma_sector_count_mode {
-                    // Bit 4 de DMA_MODE posé : ce n'est PAS un registre du
-                    // WD1772, voir la doc de `dma_sector_count`.
+                    // DMA_MODE bit 4 set: this is NOT a WD1772
+                    // register, see `dma_sector_count`'s doc.
                     self.dma_sector_count = Some(value as u16);
                     return;
                 }
@@ -1516,9 +1513,9 @@ impl Bus for AtariSt {
                     let (drive_a_selected, side) = self.floppy_drive_select();
                     self.wd1772.side = side;
                     let disk = if drive_a_selected { self.floppy_a.as_deref_mut() } else { None };
-                    // Ne fait plus que DÉMARRER la commande (positionne
-                    // BUSY) : c'est `AtariSt::tick` qui la fait progresser
-                    // et la termine réellement, voir la doc de
+                    // Only STARTS the command now (sets
+                    // BUSY): it's `AtariSt::tick` that advances it
+                    // and actually completes it, see the doc of
                     // `Wd1772::execute_command`/`Wd1772::tick`.
                     self.wd1772.execute_command(value, disk);
                 } else {
@@ -1527,7 +1524,7 @@ impl Bus for AtariSt {
                 return;
             }
             DMA_MODE => {
-                // Bits 1-2 (A1-A0), pas 0-1 — voir la doc de `DMA_MODE`.
+                // Bits 1-2 (A1-A0), not 0-1 — see `DMA_MODE`'s doc.
                 self.dma_register_select = (value & 0x6) >> 1;
                 self.dma_sector_count_mode = value & 0x10 != 0;
                 return;
@@ -1546,8 +1543,8 @@ impl Bus for AtariSt {
             }
             _ if self.blitter_present && addr == BLITTER_BASE + blitter::reg::CONTROL => {
                 self.blitter.write(blitter::reg::CONTROL, value);
-                // Bit BUSY/START (bit 7) posé : déclenche le blit dans son
-                // intégralité (modèle synchrone, voir peripherals::atari_st::blitter).
+                // BUSY/START bit (bit 7) set: triggers the blit in its
+                // entirety (synchronous model, see peripherals::atari_st::blitter).
                 if value & 0x80 != 0 {
                     if std::env::var("RUST68_TRACE_BLITTER").is_ok() {
                         let word = |a, b| ((self.blitter.read(a) as u32) << 8) | self.blitter.read(b) as u32;
@@ -1589,12 +1586,12 @@ impl Bus for AtariSt {
                             halftone_table.join(","),
                         );
                     }
-                    // `RUST68_TRACE_BLITTER_MEM=1` : dump le contenu réel de
-                    // la destination (tous les mots de la première ligne,
-                    // espacés de DST_X_INC) avant/après `execute()`, pour
-                    // vérifier directement le résultat écrit par le Blitter
-                    // plutôt que de le déduire à la main depuis les
-                    // paramètres seuls.
+                    // `RUST68_TRACE_BLITTER_MEM=1`: dumps the actual
+                    // destination content (every word of the first line,
+                    // spaced by DST_X_INC) before/after `execute()`, to
+                    // directly check the result written by the Blitter
+                    // rather than deducing it by hand from the
+                    // parameters alone.
                     let trace_mem = std::env::var("RUST68_TRACE_BLITTER_MEM").is_ok();
                     let mem_dst_addr = ((self.blitter.read(blitter::reg::DST_ADDR) as u32) << 24)
                         | ((self.blitter.read(blitter::reg::DST_ADDR1) as u32) << 16)
@@ -1665,22 +1662,22 @@ impl Bus for AtariSt {
             _ => {}
         }
         if self.in_rom(addr) {
-            return; // ROM : écriture ignorée (lecture seule sur silicium réel)
+            return; // ROM: write ignored (read-only on real silicon)
         }
         if (IO_BASE..=IO_END).contains(&addr) || (CARTRIDGE_BASE..=CARTRIDGE_END).contains(&addr) {
-            return; // périphérique/cartouche non émulé : écriture ignorée
+            return; // unemulated peripheral/cartridge: write ignored
         }
         if std::env::var("RUST68_TRACE_VECTORS").is_ok() {
-            eprintln!("[trace] bus fault en écriture : addr={addr:#x} value={value:#04x}");
+            eprintln!("[trace] bus fault on write: addr={addr:#x} value={value:#04x}");
         }
         self.bus_fault = Some((addr, true));
     }
 
     fn reset_bus(&mut self) {
-        // L'instruction RESET génère /RESET vers les périphériques externes.
-        // Le GLUE n'est PAS réinitialisé : sur silicium réel, le timing
-        // vidéo continue de tourner indépendamment d'un /RESET CPU (le
-        // moniteur reste synchronisé).
+        // The RESET instruction generates /RESET towards the external peripherals.
+        // The GLUE is NOT reset: on real silicon, the video
+        // timing keeps running independently of a CPU /RESET (the
+        // monitor stays synchronized).
         self.mfp = Mfp::new();
         self.mfp.set_gpip_input(GPIP_MONO_DETECT, true);
         self.mfp.set_gpip_input(4, true);
@@ -1690,13 +1687,13 @@ impl Bus for AtariSt {
         self.acia_midi = Acia::new();
         self.ym2149 = Ym2149::new();
         self.dma_sound = DmaSound::new();
-        // `self.microwire` volontairement PAS réinitialisé ici : le vrai
-        // circuit Microwire/LMC1992 n'a pas de signal de reset câblé,
-        // confirmé par Hatari (`dmaSnd.c` : « Microwire has no reset
-        // signal, it will keep its values on warm reset »).
-        // `Shifter::reset` (pas `Shifter::new()`) : préserve `ste_palette`,
-        // une caractéristique du silicium (voir sa doc) que RESET ne doit
-        // pas effacer.
+        // `self.microwire` deliberately NOT reset here: the real
+        // Microwire/LMC1992 circuit has no wired reset signal,
+        // confirmed by Hatari (`dmaSnd.c`: "Microwire has no reset
+        // signal, it will keep its values on warm reset").
+        // `Shifter::reset` (not `Shifter::new()`): preserves `ste_palette`,
+        // a silicon characteristic (see its doc) that RESET must
+        // not erase.
         self.shifter.reset();
         self.wd1772 = Wd1772::new();
         self.dma_register_select = 0;
@@ -1706,11 +1703,11 @@ impl Bus for AtariSt {
         self.blitter = Blitter::new();
         self.overlay = true;
         self.memory_conf = 0;
-        // Le disque inséré (floppy_a), lui, n'est pas éjecté par /RESET :
-        // c'est un support physique, pas un état de la puce.
-        // Le GLUE n'est pas réinitialisé (voir ci-dessus) : resynchroniser
-        // juste le suivi de ligne/trame sur sa position courante pour ne
-        // pas déclencher un rattrapage massif au prochain tick().
+        // The inserted disk (floppy_a) itself is not ejected by /RESET:
+        // it's a physical medium, not chip state.
+        // The GLUE is not reset (see above): just resynchronize
+        // line/frame tracking on its current position so as not to
+        // trigger a massive catch-up on the next tick().
         self.last_vbl_edge = self.glue.vbl_edge_count();
         self.last_absolute_line =
             self.glue.frame_count() * self.glue.lines_per_frame() as u64 + self.glue.current_line() as u64;
@@ -1725,7 +1722,7 @@ impl Bus for AtariSt {
     }
 
     fn irq_level(&self) -> u8 {
-        // Câblage matériel ST/STE, par priorité décroissante :
+        // Real ST/STE hardware wiring, by decreasing priority:
         // MFP (IPL6) > VBL (IPL4) > HBL (IPL2).
         if self.mfp.interrupt_requested() {
             6

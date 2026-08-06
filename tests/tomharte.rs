@@ -1,22 +1,22 @@
-//! Suite de conformité TomHarte / ProcessorTests (680x0).
+//! TomHarte / ProcessorTests (680x0) conformance suite.
 //!
-//! Réf. : <https://github.com/SingleStepTests/m68000>
+//! Ref.: <https://github.com/SingleStepTests/m68000>
 //!
-//! Chaque fichier `<opcode>.json[.gz]` contient des milliers de tests. Pour
-//! chacun : on installe l'état CPU + RAM `initial`, on exécute **une** instruction,
-//! puis on compare l'état CPU + RAM à l'état `final` attendu.
+//! Each `<opcode>.json[.gz]` file contains thousands of tests. For
+//! each one: install the `initial` CPU + RAM state, execute **one** instruction,
+//! then compare the CPU + RAM state against the expected `final` state.
 //!
-//! ## Utilisation
+//! ## Usage
 //!
-//! Les fichiers de test font plusieurs centaines de mégaoctets et ne sont pas
-//! versionnés. Téléchargez-les puis pointez la variable d'environnement
-//! `TOMHARTE_DIR` sur le répertoire contenant les `.json` :
+//! The test files are several hundred megabytes and are not
+//! version-controlled. Download them, then point the `TOMHARTE_DIR`
+//! environment variable at the directory containing the `.json` files:
 //!
 //! ```sh
-//! TOMHARTE_DIR=/chemin/vers/v1 cargo test --test tomharte -- --nocapture
+//! TOMHARTE_DIR=/path/to/v1 cargo test --test tomharte -- --nocapture
 //! ```
 //!
-//! Sans cette variable, le test est ignoré proprement (il ne bloque pas la CI).
+//! Without this variable, the test is skipped cleanly (it does not block CI).
 
 use std::path::PathBuf;
 
@@ -24,7 +24,7 @@ use rust68::{Bus, Cpu, FlatBus, Size};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// État CPU d'un cas de test (champs communs à `initial` et `final`).
+/// CPU state of a test case (fields common to `initial` and `final`).
 #[derive(Debug, Deserialize)]
 struct State {
     d0: u32,
@@ -46,13 +46,13 @@ struct State {
     ssp: u32,
     sr: u16,
     pc: u32,
-    /// File de préfetch (mots déjà lus par le 68000) — installée en RAM.
+    /// Prefetch queue (words already read by the 68000) — installed in RAM.
     prefetch: Vec<u16>,
-    /// Contenu mémoire : liste de paires `[adresse, octet]`.
+    /// Memory contents: list of `[address, byte]` pairs.
     ram: Vec<(u32, u8)>,
 }
 
-/// Un cas de test unitaire.
+/// A single test case.
 #[derive(Debug, Deserialize)]
 struct TestCase {
     name: String,
@@ -60,13 +60,13 @@ struct TestCase {
     initial: State,
     #[serde(rename = "final")]
     final_state: State,
-    /// Transactions bus. On s'en sert pour détecter les address errors ("re"/"we")
-    /// qui requièrent la gestion d'exceptions — ces cas sont ignorés.
+    /// Bus transactions. Used to detect address errors ("re"/"we")
+    /// that require exception handling — these cases are skipped.
     #[serde(default)]
     transactions: Vec<Value>,
-    /// Nombre de cycles CPU réels pour ce cas (format ProcessorTests standard).
-    /// `Option` : si le champ est absent (variante de format), on saute juste
-    /// la vérification du cycle-count pour ce cas sans faire échouer le parsing.
+    /// Actual number of CPU cycles for this case (standard ProcessorTests
+    /// format). `Option`: if the field is absent (format variant), we just
+    /// skip the cycle-count check for this case without failing the parse.
     #[serde(default)]
     length: Option<u64>,
 }
@@ -77,10 +77,10 @@ impl TestCase {
     }
 }
 
-/// Installe un [`State`] dans le CPU et le bus.
+/// Installs a [`State`] into the CPU and the bus.
 fn install(cpu: &mut Cpu, bus: &mut FlatBus, s: &State) {
     cpu.d = [s.d0, s.d1, s.d2, s.d3, s.d4, s.d5, s.d6, s.d7];
-    // a7 est dérivé du SR (mode superviseur) ; on installe a0..a6 puis le bon a7.
+    // a7 is derived from SR (supervisor mode); we install a0..a6 then the right a7.
     cpu.a[0] = s.a0;
     cpu.a[1] = s.a1;
     cpu.a[2] = s.a2;
@@ -91,32 +91,32 @@ fn install(cpu: &mut Cpu, bus: &mut FlatBus, s: &State) {
     cpu.usp = s.usp;
     cpu.ssp = s.ssp;
     cpu.sr = s.sr;
-    // a7 actif selon le mode : SSP en superviseur, USP en utilisateur.
+    // a7 active depending on mode: SSP in supervisor, USP in user mode.
     cpu.a[7] = if cpu.supervisor() { s.ssp } else { s.usp };
-    // Le PC TomHarte est m_au de MAME : "next prefetch address" = opcode_addr + 4.
-    // Notre modèle : PC pointe sur l'octet à fetch (= opcode_addr).
-    // On recule de 4 pour aligner les deux conventions.
+    // TomHarte's PC is MAME's m_au: "next prefetch address" = opcode_addr + 4.
+    // Our model: PC points at the byte to fetch (= opcode_addr).
+    // We subtract 4 to align the two conventions.
     cpu.pc = s.pc.wrapping_sub(4);
 
     for &(addr, val) in &s.ram {
         bus.write8(addr, val);
     }
-    // Le préfetch est injecté directement dans la file pipeline du CPU.
-    // On N'écrit PAS en RAM : les adresses au PC peuvent contenir des données
-    // initiales que l'instruction va lire (ex. ADD (A0)+,Dn quand A0 == PC).
+    // The prefetch is injected directly into the CPU's pipeline queue.
+    // We do NOT write it to RAM: the addresses at PC may contain initial
+    // data that the instruction will read (e.g. ADD (A0)+,Dn when A0 == PC).
     cpu.load_prefetch(&s.prefetch);
 }
 
-/// Compare le nombre de cycles réellement consommés à celui attendu par le
-/// test (champ `length`, absent → pas de vérification pour ce cas).
+/// Compares the number of cycles actually consumed to the one expected by the
+/// test (`length` field, absent → no check for this case).
 fn compare_cycles(got: u64, case: &TestCase) -> Result<(), String> {
     match case.length {
-        Some(want) if want != got => Err(format!("cycles = {got}, attendu {want}")),
+        Some(want) if want != got => Err(format!("cycles = {got}, expected {want}")),
         _ => Ok(()),
     }
 }
 
-/// Compare l'état final attendu à l'état réel ; renvoie un message si écart.
+/// Compares the expected final state to the actual state; returns a message on mismatch.
 fn compare(cpu: &Cpu, bus: &mut FlatBus, expected: &State) -> Result<(), String> {
     let regs = [
         ("d0", cpu.d[0], expected.d0),
@@ -134,19 +134,19 @@ fn compare(cpu: &Cpu, bus: &mut FlatBus, expected: &State) -> Result<(), String>
         ("a4", cpu.a[4], expected.a4),
         ("a5", cpu.a[5], expected.a5),
         ("a6", cpu.a[6], expected.a6),
-        // Convention TomHarte : PC = "next prefetch address" = instruction_addr + 4.
-        // Notre modèle : PC avance instruction par instruction (sans pipeline ahead).
-        // Relation : tomharte_final_pc = notre_pc_final + 4.
+        // TomHarte convention: PC = "next prefetch address" = instruction_addr + 4.
+        // Our model: PC advances instruction by instruction (no pipeline lookahead).
+        // Relation: tomharte_final_pc = our_final_pc + 4.
         ("pc", cpu.pc.wrapping_add(4), expected.pc),
     ];
-    for (nom, got, want) in regs {
+    for (name, got, want) in regs {
         if got != want {
-            return Err(format!("{nom} = {got:#010X}, attendu {want:#010X}"));
+            return Err(format!("{name} = {got:#010X}, expected {want:#010X}"));
         }
     }
     if cpu.sr != expected.sr {
         return Err(format!(
-            "sr = {:#06X}, attendu {:#06X}",
+            "sr = {:#06X}, expected {:#06X}",
             cpu.sr, expected.sr
         ));
     }
@@ -156,30 +156,30 @@ fn compare(cpu: &Cpu, bus: &mut FlatBus, expected: &State) -> Result<(), String>
         expected.usp
     };
     if cpu.a[7] != want_a7 {
-        return Err(format!("a7 = {:#010X}, attendu {want_a7:#010X}", cpu.a[7]));
+        return Err(format!("a7 = {:#010X}, expected {want_a7:#010X}", cpu.a[7]));
     }
     for &(addr, want) in &expected.ram {
         let got = bus.read8(addr);
         if got != want {
             return Err(format!(
-                "ram[{addr:#08X}] = {got:#04X}, attendu {want:#04X}"
+                "ram[{addr:#08X}] = {got:#04X}, expected {want:#04X}"
             ));
         }
     }
-    let _ = Size::Byte; // (taille importée pour usage futur du harness)
+    let _ = Size::Byte; // (size imported for future harness use)
     Ok(())
 }
 
-/// Exécute un fichier de cas de test ; renvoie (réussis, échecs état, échecs
-/// cycles, ignorés). Un cas peut échouer sur l'état ET sur les cycles ; il
-/// n'est compté qu'une fois dans `fail` mais les deux causes sont reportées.
+/// Runs a test case file; returns (passed, state failures, cycle
+/// failures, skipped). A case can fail on both state AND cycles; it
+/// is counted only once in `fail` but both causes are reported.
 fn run_file(path: &PathBuf) -> (usize, usize, usize, usize) {
-    let data = std::fs::read_to_string(path).expect("lecture du fichier de test");
-    let cases: Vec<TestCase> = serde_json::from_str(&data).expect("JSON TomHarte invalide");
+    let data = std::fs::read_to_string(path).expect("failed to read test file");
+    let cases: Vec<TestCase> = serde_json::from_str(&data).expect("invalid TomHarte JSON");
 
     let (mut ok, mut fail, mut cycle_fail, mut skipped) = (0, 0, 0, 0);
     for case in &cases {
-        // Les cas qui déclenchent des exceptions (address error, vecteur) : on ignore.
+        // Cases that trigger exceptions (address error, vector): skipped.
         if case.requires_exception_handling() {
             skipped += 1;
             continue;
@@ -206,7 +206,7 @@ fn run_file(path: &PathBuf) -> (usize, usize, usize, usize) {
                                 let field = why.split(['=', ' ', '[']).next().unwrap_or("?").trim();
                                 eprintln!("DIAG\t{}\tae={}\t{}", field, is_ae, case.name);
                             } else if fail < 5 {
-                                eprintln!("ÉCHEC [{}] : {why}", case.name);
+                                eprintln!("FAIL [{}]: {why}", case.name);
                             }
                         }
                         if let Err(why) = &cycles_result {
@@ -214,7 +214,7 @@ fn run_file(path: &PathBuf) -> (usize, usize, usize, usize) {
                             if std::env::var("DIAG").is_ok() {
                                 eprintln!("DIAG\tcycles\tae={}\t{}", is_ae, case.name);
                             } else if state_result.is_ok() && cycle_fail <= 5 {
-                                eprintln!("ÉCHEC CYCLES [{}] : {why}", case.name);
+                                eprintln!("CYCLE FAIL [{}]: {why}", case.name);
                             }
                         }
                         if state_result.is_err() {
@@ -223,7 +223,7 @@ fn run_file(path: &PathBuf) -> (usize, usize, usize, usize) {
                     }
                 }
             }
-            // Opcode pas encore implémenté : on l'ignore (couverture partielle).
+            // Opcode not yet implemented: skipped (partial coverage).
             Err(_) => skipped += 1,
         }
     }
@@ -260,24 +260,24 @@ fn bar(ok: usize, total: usize, width: usize) -> String {
 }
 
 #[test]
-fn conformite_tomharte() {
+fn tomharte_conformance() {
     let Ok(dir) = std::env::var("TOMHARTE_DIR") else {
         eprintln!(
-            "TOMHARTE_DIR non défini — test de conformité ignoré. \
-             Voir l'en-tête de tests/tomharte.rs pour l'installation."
+            "TOMHARTE_DIR not set — conformance test skipped. \
+             See the header of tests/tomharte.rs for setup instructions."
         );
         return;
     };
 
     let dir = PathBuf::from(dir);
 
-    // FOCUS=MOVE.l,MOVE.w  → ne tourne que ces fichiers
+    // FOCUS=MOVE.l,MOVE.w  → runs only these files
     let focus: Option<Vec<String>> = std::env::var("FOCUS")
         .ok()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("répertoire TOMHARTE_DIR illisible")
+        .expect("TOMHARTE_DIR directory unreadable")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
         .filter(|p| {
@@ -293,23 +293,23 @@ fn conformite_tomharte() {
 
     assert!(
         !files.is_empty(),
-        "aucun fichier .json dans {} (FOCUS={:?})",
+        "no .json file found in {} (FOCUS={:?})",
         dir.display(),
         focus,
     );
 
-    // En-tête tableau
+    // Table header
     eprintln!();
     if let Some(ref list) = focus {
-        eprintln!("{BOLD}{YELLOW}▶ mode ciblé : {}{RESET}", list.join(", "));
+        eprintln!("{BOLD}{YELLOW}▶ focused mode: {}{RESET}", list.join(", "));
     }
     eprintln!(
         "{BOLD}{CYAN}{:<22} {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:<20}{RESET}",
-        "Instruction", "total", "ok", "fail", "cyc", "skip", "progression"
+        "Instruction", "total", "ok", "fail", "cyc", "skip", "progress"
     );
     eprintln!("{DIM}{}{RESET}", "─".repeat(72));
 
-    // Charger la baseline si elle existe (format: "NOM ok fail")
+    // Load the baseline if it exists (format: "NAME ok fail")
     let baseline_path = std::path::Path::new("tomharte_baseline.txt");
     let baseline: std::collections::HashMap<String, (usize, usize)> =
         std::fs::read_to_string(baseline_path)
@@ -341,16 +341,16 @@ fn conformite_tomharte() {
         let pct = if total > 0 { ok * 100 / total } else { 100 };
         let progress = bar(ok, total, 20);
 
-        // Détection de régression vs baseline
+        // Regression detection vs baseline
         let regression_tag = if let Some(&(base_ok, base_fail)) = baseline.get(&name) {
             if fail > base_fail {
                 regressions += 1;
                 format!(
-                    "  {RED}▼ régression ({} → {} échecs){RESET}",
+                    "  {RED}▼ regression ({} → {} failures){RESET}",
                     base_fail, fail
                 )
             } else if fail == 0 && base_fail > 0 {
-                format!("  {GREEN}▲ résolu !{RESET}")
+                format!("  {GREEN}▲ resolved!{RESET}")
             } else if fail < base_fail {
                 format!(
                     "  {GREEN}▲ +{} ({} → {}){RESET}",
@@ -400,7 +400,7 @@ fn conformite_tomharte() {
         new_baseline.push(format!("{name} {ok} {fail}"));
     }
 
-    // Ligne totale
+    // Total line
     let grand_total = total_ok + total_fail + total_skip;
     let grand_pct = if total_ok + total_fail > 0 {
         total_ok * 100 / (total_ok + total_fail)
@@ -433,26 +433,26 @@ fn conformite_tomharte() {
     );
     if total_cycle_fail > 0 {
         eprintln!(
-            "{DIM}({total_cycle_fail} cas ok en registres/RAM mais avec un nombre de cycles \
-incorrect — colonne 'cyc', non bloquant pour l'instant, cf. plan de mise en \
-conformité des timings dans execute.rs){RESET}"
+            "{DIM}({total_cycle_fail} cases ok on registers/RAM but with an incorrect \
+cycle count — 'cyc' column, non-blocking for now, see the timing conformance \
+plan in execute.rs){RESET}"
         );
     }
     eprintln!();
 
     if save_baseline {
         std::fs::write(baseline_path, new_baseline.join("\n") + "\n")
-            .expect("écriture baseline impossible");
+            .expect("failed to write baseline");
         eprintln!(
-            "{DIM}baseline sauvegardée dans {}{RESET}",
+            "{DIM}baseline saved to {}{RESET}",
             baseline_path.display()
         );
     } else if focus.is_none() && !baseline.is_empty() {
-        eprintln!("{DIM}(relancer avec BASELINE=1 pour mettre à jour la baseline){RESET}");
+        eprintln!("{DIM}(rerun with BASELINE=1 to update the baseline){RESET}");
     }
 
     if regressions > 0 {
-        panic!("{regressions} régression(s) détectée(s) — voir tableau ci-dessus");
+        panic!("{regressions} regression(s) detected — see table above");
     }
-    assert_eq!(total_fail, 0, "{total_fail} cas de conformité en échec");
+    assert_eq!(total_fail, 0, "{total_fail} conformance case(s) failed");
 }

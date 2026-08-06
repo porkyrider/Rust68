@@ -1,68 +1,67 @@
-//! Blitter — coprocesseur de transfert de blocs (BitBlt) de l'Atari STE.
+//! Blitter — the Atari STE's block transfer coprocessor (BitBlt).
 //!
-//! Combine un mot source (optionnellement décalé bit à bit via `skew` pour
-//! aligner des images non alignées sur un mot), un motif de demi-teinte
-//! (halftone), et le contenu destination actuel, via une fonction booléenne
-//! programmable (`OP`, une des 16 fonctions à 2 entrées), avec masquage de
-//! bord de ligne (`ENDMASK1/2/3`) et parcours par incréments X/Y.
+//! Combines a source word (optionally shifted bit by bit via `skew` to
+//! align images not aligned on a word boundary), a halftone pattern, and
+//! the current destination content, via a programmable boolean function
+//! (`OP`, one of the 16 two-input functions), with line-edge masking
+//! (`ENDMASK1/2/3`) and X/Y increment-based traversal.
 //!
-//! Ce module modélise la puce **seule** : [`Blitter::execute`] prend un
-//! `Bus` (pour lire/écrire la RAM aux adresses source/destination) et fait
-//! progresser le blit — en mode HOG (bit 6 de CONTROL posé), il s'exécute
-//! intégralement en un seul appel ; en mode partagé (non-HOG, le cas le
-//! plus courant en pratique), un seul appel ne traite qu'une tranche de 16
-//! mots avant de rendre la main (voir [`Self::execute`] et sa doc pour le
-//! détail), `BUSY` restant posé entre deux tranches — donc bien observable
-//! par polling dans ce mode, contrairement à une version antérieure de ce
-//! module entièrement synchrone. C'est au board de mapper
-//! [`Blitter::read`]/[`Blitter::write`] dans son `Bus`, de déclencher un
-//! premier appel à `execute` quand le bit START du registre de contrôle
-//! est écrit, ET de rappeler `execute` périodiquement pour faire progresser
-//! un blit non-HOG en pause — voir `systems::atari_st::AtariSt::tick`, qui
-//! le fait de façon autonome au rythme du CPU (accès bus partagés avec le
-//! CPU, comme sur silicium réel), plutôt que de dépendre uniquement d'une
-//! réécriture logicielle de CONTROL (ce qui fonctionnait par coïncidence
-//! avec la boucle `TAS.B` de TOS mais pas avec un simple `BTST.B` de
-//! scrutation).
+//! This module models the chip **alone**: [`Blitter::execute`] takes a
+//! `Bus` (to read/write RAM at the source/destination addresses) and
+//! advances the blit — in HOG mode (bit 6 of CONTROL set), it executes
+//! entirely in a single call; in shared mode (non-HOG, the most common
+//! case in practice), a single call only processes a 16-word slice before
+//! yielding back (see [`Self::execute`] and its doc for details), with
+//! `BUSY` staying set between two slices — so well observable by polling
+//! in this mode, unlike a previous, fully synchronous version of this
+//! module. It's up to the board to map [`Blitter::read`]/[`Blitter::write`]
+//! into its `Bus`, to trigger a first call to `execute` when the START bit
+//! of the control register is written, AND to call `execute` back
+//! periodically to advance a paused non-HOG blit — see
+//! `systems::atari_st::AtariSt::tick`, which does this autonomously at the
+//! CPU's pace (bus accesses shared with the CPU, like on real silicon),
+//! rather than relying solely on a software rewrite of CONTROL (which
+//! happened to work with TOS's `TAS.B` loop but not with a simple polling
+//! `BTST.B`).
 //!
-//! Registres et sémantique des bits `FXSR`/`NFSR`/`SMUDGE`/HOP/numéro de
-//! ligne de demi-teinte croisés contre plusieurs sources indépendantes :
-//! le datasheet `BLITTER.TXT` (info-coach.fr), le `BLIT_FAQ.TXT`
-//! (dépôt `ggnkua/Atari_ST_Sources`) et le code source de Hatari
-//! (`src/blitter.c`), qui se recoupent — voir le détail par item
-//! ci-dessous. Contrairement à l'Amiga, le Blitter Atari STE **n'a pas**
-//! de mode "tracé de ligne" pour du dessin de polygone : le champ "numéro
-//! de ligne" du registre CONTROL ne sert qu'à sélectionner/pré-positionner
-//! le mot de demi-teinte courant (modélisé ci-dessous).
+//! Registers and the semantics of the `FXSR`/`NFSR`/`SMUDGE`/HOP/halftone
+//! line number bits cross-checked against several independent sources:
+//! the `BLITTER.TXT` datasheet (info-coach.fr), `BLIT_FAQ.TXT`
+//! (the `ggnkua/Atari_ST_Sources` repo), and Hatari's source code
+//! (`src/blitter.c`), which all agree — see the per-item detail below.
+//! Unlike the Amiga, the Atari STE Blitter **does not** have a
+//! "line-draw" mode for polygon drawing: the "line number" field of the
+//! CONTROL register is only used to select/pre-position the current
+//! halftone word (modeled below).
 //!
-//! ## Limitations connues (v1) — à prendre avec prudence
-//! - Le vol de cycles bus au CPU (mode "hog"/"steal") EST modélisé (voir
-//!   ci-dessus et `systems::atari_st::AtariSt::tick`/`BLITTER_SLICE_CYCLES`),
-//!   par une tranche de 64 accès bus RÉELS entre deux passages de bus
-//!   (`BUS_ACCESSES_PER_SLICE` dans [`Self::execute`] — lecture source,
-//!   lecture destination et écriture destination chacune comptée
-//!   séparément, pas un nombre de mots traités), reprise directement du
-//!   source de Hatari (`src/blitter.c`, `BLITTER_NONHOG_BUS_BLITTER`).
-//!   Reste néanmoins une approximation par rapport au mode "cycle exact"
-//!   de Hatari, qui entrelace ces accès AU MILIEU de l'exécution des
-//!   instructions CPU (plutôt qu'entre deux instructions complètes comme
-//!   ici) et reproduit un cas de bug documenté du silicium réel où le
-//!   Blitter s'arrête parfois à 63 accès au lieu de 64 — non modélisé ici.
-//! - Aucune suite de test équivalente à TomHarte n'existe pour le
-//!   Blitter : la logique est vérifiée par recoupement documentaire
-//!   (datasheet, BLIT_FAQ.TXT, code source de Hatari) plutôt que contre
-//!   des vecteurs de test matériel.
+//! ## Known limitations (v1) — take with caution
+//! - Bus cycle stealing from the CPU ("hog"/"steal" mode) IS modeled (see
+//!   above and `systems::atari_st::AtariSt::tick`/`BLITTER_SLICE_CYCLES`),
+//!   via a slice of 64 REAL bus accesses between two bus handoffs
+//!   (`BUS_ACCESSES_PER_SLICE` in [`Self::execute`] — source read,
+//!   destination read and destination write each counted separately, not
+//!   a number of words processed), taken directly from Hatari's source
+//!   (`src/blitter.c`, `BLITTER_NONHOG_BUS_BLITTER`). Still remains an
+//!   approximation compared to Hatari's "cycle exact" mode, which
+//!   interleaves these accesses IN THE MIDDLE of CPU instruction execution
+//!   (rather than between whole instructions as here) and reproduces a
+//!   documented real-silicon bug case where the Blitter sometimes stops
+//!   at 63 accesses instead of 64 — not modeled here.
+//! - No TomHarte-equivalent test suite exists for the Blitter: the logic
+//!   is verified by cross-referencing documentation (datasheet,
+//!   BLIT_FAQ.TXT, Hatari's source code) rather than against hardware
+//!   test vectors.
 
-/// Offsets des registres dans l'espace propre de la puce (à additionner à
-/// l'adresse de base du board, `0xFF8A00` sur STE réel).
+/// Register offsets in the chip's own address space (to be added to the
+/// board's base address, `0xFF8A00` on a real STE).
 pub mod reg {
-    /// 16 mots de motif de demi-teinte, offsets `0x00`, `0x02`, … `0x1E`.
+    /// 16 halftone pattern words, offsets `0x00`, `0x02`, … `0x1E`.
     pub const HALFTONE_BASE: u32 = 0x00;
     pub const SRC_X_INC: u32 = 0x20;
     pub const SRC_X_INC1: u32 = 0x21;
     pub const SRC_Y_INC: u32 = 0x22;
     pub const SRC_Y_INC1: u32 = 0x23;
-    /// Adresse source (32 bits, seuls les 24 bits bas sont significatifs).
+    /// Source address (32 bits, only the low 24 bits are significant).
     pub const SRC_ADDR: u32 = 0x24;
     pub const SRC_ADDR1: u32 = 0x25;
     pub const SRC_ADDR2: u32 = 0x26;
@@ -77,7 +76,7 @@ pub mod reg {
     pub const DST_X_INC1: u32 = 0x2F;
     pub const DST_Y_INC: u32 = 0x30;
     pub const DST_Y_INC1: u32 = 0x31;
-    /// Adresse destination (32 bits, seuls les 24 bits bas sont significatifs).
+    /// Destination address (32 bits, only the low 24 bits are significant).
     pub const DST_ADDR: u32 = 0x32;
     pub const DST_ADDR1: u32 = 0x33;
     pub const DST_ADDR2: u32 = 0x34;
@@ -88,27 +87,26 @@ pub mod reg {
     pub const Y_COUNT1: u32 = 0x39;
     pub const HOP: u32 = 0x3A;
     pub const OP: u32 = 0x3B;
-    /// Bit 7 = BUSY (écriture : start/stop du blit ; lecture : busy/idle),
-    /// bit 6 = HOG, bit 5 = SMUDGE, bits 3-0 = numéro de ligne de
-    /// demi-teinte courant — lisible/inscriptible directement (pas un
-    /// compteur interne caché : le logiciel peut le pré-positionner).
+    /// Bit 7 = BUSY (write: start/stop the blit; read: busy/idle),
+    /// bit 6 = HOG, bit 5 = SMUDGE, bits 3-0 = current halftone line
+    /// number — directly readable/writable (not a hidden internal
+    /// counter: software can pre-position it).
     pub const CONTROL: u32 = 0x3C;
     /// Bit 7 = FXSR (Force eXtra Source Read), bit 6 = NFSR (No Final
-    /// Source Read), bits 3-0 = décalage (skew, nombre de bits de
-    /// décalage à droite).
+    /// Source Read), bits 3-0 = skew (number of right-shift bits).
     pub const SKEW: u32 = 0x3D;
-    /// Fin de l'espace registre (exclusif).
+    /// End of the register space (exclusive).
     pub const END: u32 = 0x3E;
 }
 
 const CONTROL_BUSY: u8 = 1 << 7;
 const CONTROL_HOG: u8 = 1 << 6;
 
-/// PC courant du CPU, pour diagnostic uniquement (`RUST68_TRACE_BLIT_REGS`) —
-/// mis à jour par l'appelant (ex. `examples/rd_menu_ca6a.rs`) juste avant
-/// chaque `cpu.step()`, lu par les traces d'écriture de registre ci-dessous
-/// pour identifier l'instruction ROM responsable sans changer la signature
-/// publique de `write`/`write_word`.
+/// Current CPU PC, for diagnostics only (`RUST68_TRACE_BLIT_REGS`) —
+/// updated by the caller (e.g. `examples/rd_menu_ca6a.rs`) right before
+/// each `cpu.step()`, read by the register write traces below to identify
+/// the responsible ROM instruction without changing the public signature
+/// of `write`/`write_word`.
 pub static DEBUG_LAST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
@@ -121,44 +119,43 @@ pub struct Blitter {
     dst_x_inc: i16,
     dst_y_inc: i16,
     dst_addr: u32,
-    /// Mots par ligne. Stocké sur 32 bits (pas 16) pour pouvoir représenter
-    /// la valeur 65536 — voir [`Self::write_word_count`].
+    /// Words per line. Stored as 32 bits (not 16) so it can represent the
+    /// value 65536 — see [`Self::write_word_count`].
     x_count: u32,
-    /// Lignes par bloc. Même remarque que [`Self::x_count`].
+    /// Lines per block. Same remark as [`Self::x_count`].
     y_count: u32,
     hop: u8,
     op: u8,
     skew: u8,
-    /// Bit 7 = BUSY, bit 6 = HOG, bit 5 = SMUDGE, bits 3-0 = numéro de
-    /// ligne de demi-teinte courant (voir [`reg::CONTROL`]).
+    /// Bit 7 = BUSY, bit 6 = HOG, bit 5 = SMUDGE, bits 3-0 = current
+    /// halftone line number (see [`reg::CONTROL`]).
     control: u8,
-    /// "Armement" du Blitter — voir [`Self::execute`] pour le bug réel que
-    /// ce champ corrige.
+    /// Blitter "armed" state — see [`Self::execute`] for the real bug
+    /// this field fixes.
     armed: bool,
-    /// Vrai entre le début et la fin RÉELLE (Y_COUNT atteignant 0) d'un
-    /// blit — c'est-à-dire tant qu'il reste du travail, y compris entre
-    /// deux tranches en mode non-HOG (voir [`Self::execute`]). Distinct de
-    /// `armed` : `armed` autorise un DÉMARRAGE (ou redémarrage explicite,
-    /// Y_COUNT vient d'être réécrit), `mid_blit` autorise la POURSUITE d'un
-    /// blit déjà commencé sans qu'aucun registre n'ait besoin d'être
-    /// réécrit entre les tranches.
+    /// True between the start and the REAL end (Y_COUNT reaching 0) of a
+    /// blit — i.e. as long as work remains, including between two slices
+    /// in non-HOG mode (see [`Self::execute`]). Distinct from `armed`:
+    /// `armed` authorizes a START (or explicit restart, Y_COUNT was just
+    /// rewritten), `mid_blit` authorizes CONTINUING a blit already started
+    /// without any register needing to be rewritten between slices.
     mid_blit: bool,
-    /// Registre à décalage source 32 bits, persistant entre les tranches
-    /// (voir [`Self::execute`]).
+    /// 32-bit source shift register, persistent between slices (see
+    /// [`Self::execute`]).
     buffer: u32,
-    /// Dernier mot effectivement lu sur le bus source — réutilisé par NFSR
-    /// (voir [`Self::execute`]).
+    /// Last word actually read from the source bus — reused by NFSR (see
+    /// [`Self::execute`]).
     bus_word: u16,
-    /// Vrai si la lecture d'amorçage FXSR de la ligne EN COURS a déjà eu
-    /// lieu (remis à faux à chaque nouvelle ligne).
+    /// True if the FXSR priming read of the CURRENT line has already
+    /// happened (reset to false on every new line).
     have_fxsr: bool,
-    /// Vrai si la prochaine lecture source doit être omise (NFSR,
-    /// positionné dynamiquement quand X_COUNT atteint 2).
+    /// True if the next source read must be skipped (NFSR, set
+    /// dynamically when X_COUNT reaches 2).
     nfsr_dynamic: bool,
-    /// Largeur (en mots) de la ligne en cours de blit — capturée une seule
-    /// fois au véritable début du blit (contrairement à `x_count`, qui
-    /// décompte réellement et se réinitialise à cette valeur à chaque fin
-    /// de ligne).
+    /// Width (in words) of the line currently being blitted — captured
+    /// once at the true start of the blit (unlike `x_count`, which
+    /// actually counts down and resets to this value at the end of each
+    /// line).
     x_count_reset: u32,
 }
 
@@ -195,19 +192,19 @@ impl Blitter {
         }
     }
 
-    /// Vrai si le bit BUSY du registre de contrôle est actif. En mode HOG,
-    /// toujours faux juste après [`Self::execute`] (le blit s'y termine en
-    /// un seul appel). En mode non-HOG, peut rester vrai entre deux
-    /// tranches d'un blit encore en cours — voir la doc du module — donc
-    /// bien observable par polling dans ce mode, contrairement à un modèle
-    /// entièrement synchrone. Consulté par
-    /// `systems::atari_st::AtariSt::tick` pour savoir s'il faut continuer à
-    /// faire progresser le blit.
+    /// True if the CONTROL register's BUSY bit is active. In HOG mode,
+    /// always false right after [`Self::execute`] (the blit finishes
+    /// there in a single call). In non-HOG mode, can stay true between
+    /// two slices of a blit still in progress — see the module doc — so
+    /// well observable by polling in this mode, unlike a fully
+    /// synchronous model. Consulted by
+    /// `systems::atari_st::AtariSt::tick` to know whether to keep
+    /// advancing the blit.
     pub fn busy(&self) -> bool {
         self.control & CONTROL_BUSY != 0
     }
 
-    /// Lit le registre à l'offset `addr` (voir [`reg`]).
+    /// Reads the register at offset `addr` (see [`reg`]).
     pub fn read(&self, addr: u32) -> u8 {
         match addr {
             a if a < 0x20 && a % 2 == 0 => (self.halftone[(a / 2) as usize] >> 8) as u8,
@@ -234,10 +231,10 @@ impl Blitter {
             reg::DST_ADDR1 => (self.dst_addr >> 16) as u8,
             reg::DST_ADDR2 => (self.dst_addr >> 8) as u8,
             reg::DST_ADDR3 => self.dst_addr as u8,
-            // Le registre matériel reste 16 bits : relire après une écriture
-            // qui a converti 0 en 65536 en interne (voir
-            // `write_word_count`) redonne 0, pas 65536 — confirmé par
-            // Hatari (`Blitter_WordsPerLine_ReadWord`, masque `& 0xFFFF`).
+            // The hardware register stays 16 bits: reading back after a
+            // write that converted 0 to 65536 internally (see
+            // `write_word_count`) gives back 0, not 65536 — confirmed by
+            // Hatari (`Blitter_WordsPerLine_ReadWord`, `& 0xFFFF` mask).
             reg::X_COUNT => ((self.x_count & 0xFFFF) >> 8) as u8,
             reg::X_COUNT1 => (self.x_count & 0xFF) as u8,
             reg::Y_COUNT => ((self.y_count & 0xFFFF) >> 8) as u8,
@@ -250,18 +247,18 @@ impl Blitter {
         }
     }
 
-    /// Écrit le registre à l'offset `addr`.
+    /// Writes the register at offset `addr`.
     ///
-    /// Note sur l'accès `.B` isolé : le manuel Blitter officiel et Hatari
-    /// (`Blitter_CheckAccess_Byte`) documentent que la plupart de ces
-    /// registres IGNORENT un accès `.B` isolé sur le silicium réel (seul un
-    /// accès `.W`/`.L` complet est honoré). Une tentative d'implémenter
-    /// fidèlement cette règle ici a provoqué un plantage direct au premier
-    /// déclenchement d'un blit sur ce TOS/cette démo précis — signe que le
-    /// logiciel réel s'appuie bel et bien, quelque part, sur un accès `.B`
-    /// pour composer un registre, contrairement à ce que documente Hatari
-    /// pour le matériel de référence qu'il émule. Composition octet par
-    /// octet conservée ci-dessous en attendant de comprendre cet écart.
+    /// Note on isolated `.B` access: the official Blitter manual and
+    /// Hatari (`Blitter_CheckAccess_Byte`) document that most of these
+    /// registers IGNORE an isolated `.B` access on real silicon (only a
+    /// full `.W`/`.L` access is honored). An attempt to faithfully
+    /// implement this rule here caused an immediate crash on the first
+    /// blit triggered by this exact TOS/demo — a sign that the real
+    /// software does in fact rely, somewhere, on a `.B` access to compose
+    /// a register, contrary to what Hatari documents for the reference
+    /// hardware it emulates. Byte-by-byte composition kept below until
+    /// this discrepancy is understood.
     pub fn write(&mut self, addr: u32, value: u8) {
         match addr {
             a if a < 0x20 && a % 2 == 0 => {
@@ -293,13 +290,13 @@ impl Blitter {
                 self.src_addr = (self.src_addr & 0xFF00_FFFF) | ((value as u32) << 16)
             }
             reg::SRC_ADDR2 => self.src_addr = (self.src_addr & 0xFFFF_00FF) | ((value as u32) << 8),
-            // Bit 0 forcé à zéro (registre câblé mot uniquement sur le
-            // silicium réel — même contrainte que `write_long` applique
-            // déjà à l'écriture `.L` complète, et que les registres
-            // d'incrément appliquent déjà à leur propre octet bas
-            // ci-dessous) : sans ce masquage, une écriture octet isolée du
-            // bas de SRC_ADDR pouvait laisser une adresse impaire, désalignant
-            // la lecture des mots et mélangeant les plans de bits entrelacés.
+            // Bit 0 forced to zero (a word-only wired register on real
+            // silicon — the same constraint `write_long` already applies
+            // to the full `.L` write, and that the increment registers
+            // already apply to their own low byte below): without this
+            // masking, an isolated low-byte write to SRC_ADDR could leave
+            // an odd address, misaligning word reads and mixing up
+            // interleaved bitplanes.
             reg::SRC_ADDR3 => self.src_addr = (self.src_addr & 0xFFFF_FF00) | (value as u32 & 0xFE),
             reg::ENDMASK_1 => self.endmask[0] = (self.endmask[0] & 0x00FF) | ((value as u16) << 8),
             reg::ENDMASK_11 => self.endmask[0] = (self.endmask[0] & 0xFF00) | value as u16,
@@ -328,21 +325,21 @@ impl Blitter {
                 self.dst_addr = (self.dst_addr & 0xFF00_FFFF) | ((value as u32) << 16)
             }
             reg::DST_ADDR2 => self.dst_addr = (self.dst_addr & 0xFFFF_00FF) | ((value as u32) << 8),
-            // Bit 0 forcé à zéro — voir le commentaire équivalent sur
-            // `SRC_ADDR3` juste au-dessus.
+            // Bit 0 forced to zero — see the equivalent comment on
+            // `SRC_ADDR3` just above.
             reg::DST_ADDR3 => self.dst_addr = (self.dst_addr & 0xFFFF_FF00) | (value as u32 & 0xFE),
             reg::X_COUNT => self.x_count = (self.x_count & 0x00FF) | ((value as u32) << 8),
             reg::X_COUNT1 => self.x_count = (self.x_count & 0xFF00) | value as u32,
             reg::Y_COUNT => {
                 if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
-                    eprintln!("[blit-reg] pc={:#010x} write Y_COUNT(hi)={value:#04x} (skew_actuel={:#04x} dst_addr_actuel={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
+                    eprintln!("[blit-reg] pc={:#010x} write Y_COUNT(hi)={value:#04x} (current_skew={:#04x} current_dst_addr={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
                 }
                 self.y_count = (self.y_count & 0x00FF) | ((value as u32) << 8);
                 self.armed = true;
             }
             reg::Y_COUNT1 => {
                 if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
-                    eprintln!("[blit-reg] pc={:#010x} write Y_COUNT(lo)={value:#04x} (skew_actuel={:#04x} dst_addr_actuel={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
+                    eprintln!("[blit-reg] pc={:#010x} write Y_COUNT(lo)={value:#04x} (current_skew={:#04x} current_dst_addr={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
                 }
                 self.y_count = (self.y_count & 0xFF00) | value as u32;
                 self.armed = true;
@@ -357,7 +354,7 @@ impl Blitter {
             }
             reg::CONTROL => {
                 if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
-                    eprintln!("[blit-reg] pc={:#010x} write CONTROL={value:#04x} (skew_actuel={:#04x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew);
+                    eprintln!("[blit-reg] pc={:#010x} write CONTROL={value:#04x} (current_skew={:#04x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew);
                 }
                 self.write_control(value);
             }
@@ -365,20 +362,20 @@ impl Blitter {
         }
     }
 
-    /// Écrit un registre 16 bits par mot complet — chemin emprunté par le
-    /// board pour tout accès `.W` réel du CPU sur SRC_X_INC/SRC_Y_INC/
-    /// ENDMASK1-3/DST_X_INC/DST_Y_INC/X_COUNT/Y_COUNT (voir la doc de
-    /// [`Self::write`] : un accès `.B` isolé sur ces registres est ignoré
-    /// sur le silicium réel, seul cet accès mot complet est honoré).
+    /// Writes a 16-bit register as a full word — the path taken by the
+    /// board for any real CPU `.W` access on SRC_X_INC/SRC_Y_INC/
+    /// ENDMASK1-3/DST_X_INC/DST_Y_INC/X_COUNT/Y_COUNT (see [`Self::write`]'s
+    /// doc: an isolated `.B` access on these registers is ignored
+    /// on real silicon, only this full-word access is honored).
     ///
-    /// X_COUNT/Y_COUNT : le manuel Blitter officiel et Hatari documentent 0
-    /// comme désignant 65536 — mais TROIS tentatives indépendantes
-    /// d'implémenter cette règle (deux directement dans `execute` sur un
-    /// champ 16 bits, puis une à l'écriture avec un stockage 32 bits
-    /// correctement dimensionné) ont chacune aggravé nettement la
-    /// corruption observée en pratique sur ce TOS/ce cas d'usage précis —
-    /// revenu à la valeur écrite telle quelle (sans conversion) en
-    /// attendant de localiser la vraie cause amont.
+    /// X_COUNT/Y_COUNT: the official Blitter manual and Hatari document 0
+    /// as meaning 65536 — but THREE independent attempts at
+    /// implementing this rule (two directly in `execute` on a
+    /// 16-bit field, then one at write time with correctly-sized
+    /// 32-bit storage) each markedly worsened the
+    /// corruption observed in practice on this specific TOS/use case —
+    /// reverted to storing the written value as-is (no conversion) while
+    /// waiting to locate the real upstream cause.
     pub fn write_word(&mut self, addr: u32, value: u16) {
         match addr {
             a if a < 0x20 && a % 2 == 0 => self.halftone[(a / 2) as usize] = value,
@@ -392,7 +389,7 @@ impl Blitter {
             reg::X_COUNT => self.x_count = value as u32,
             reg::Y_COUNT => {
                 if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok() {
-                    eprintln!("[blit-reg] pc={:#010x} write_word Y_COUNT={value:#06x} (skew_actuel={:#04x} dst_addr_actuel={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
+                    eprintln!("[blit-reg] pc={:#010x} write_word Y_COUNT={value:#06x} (current_skew={:#04x} current_dst_addr={:#010x})", DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed), self.skew, self.dst_addr);
                 }
                 self.y_count = value as u32;
                 self.armed = true;
@@ -401,26 +398,26 @@ impl Blitter {
         }
     }
 
-    /// Écrit le registre CONTROL en tenant compte de l'"armement" du
-    /// Blitter — voir [`Self::execute`] pour le détail du bug réel que
-    /// cette logique corrige (redémarrages accidentels via `TAS.B` dans la
-    /// boucle de relance du mode non-HOG).
+    /// Writes the CONTROL register while accounting for the Blitter's
+    /// "arming" — see [`Self::execute`] for details on the real bug that
+    /// this logic fixes (accidental restarts via `TAS.B` in the
+    /// non-HOG mode's resume loop).
     ///
-    /// Sur le silicium réel (manuel Blitter officiel, section sur le mode
-    /// partagé CPU/Blitter) : "If the BUSY flag is reset when the Y_Count
+    /// On real silicon (official Blitter manual, section on shared
+    /// CPU/Blitter mode): "If the BUSY flag is reset when the Y_Count
     /// is zero, the flag will remain clear indicating BLiTTER completion
-    /// and the BLiTTER won't be restarted." — tant que le logiciel n'a pas
-    /// explicitement réécrit Y_COUNT depuis la dernière exécution complète,
-    /// toute tentative de poser le bit BUSY (y compris via `TAS.B`, utilisé
-    /// par TOS pour relancer le Blitter tranche par tranche en mode
-    /// partagé) est sans effet — le bit reste lisible à 0. Sans cette
-    /// protection, chaque itération de la boucle de relance ré-exécutait
-    /// un blit COMPLET depuis les adresses déjà avancées par le tour
-    /// précédent, écrivant du contenu erroné bien au-delà de la zone
-    /// prévue — cause réelle, une fois isolée par comparaison directe
-    /// Blitter activé/désactivé, de la corruption visuelle observée
-    /// (motif "déjà là" avant même l'application d'un blit de teinte, par
-    /// exemple).
+    /// and the BLiTTER won't be restarted." — as long as the software hasn't
+    /// explicitly rewritten Y_COUNT since the last complete execution,
+    /// any attempt to set the BUSY bit (including via `TAS.B`, used
+    /// by TOS to resume the Blitter slice by slice in shared
+    /// mode) has no effect — the bit stays readable as 0. Without this
+    /// protection, each iteration of the resume loop re-executed
+    /// a COMPLETE blit from the addresses already advanced by the previous
+    /// round, writing incorrect content well beyond the intended
+    /// area — the real cause, once isolated by direct comparison with the
+    /// Blitter enabled/disabled, of the visual corruption observed
+    /// (a pattern "already there" even before a tint blit is applied, for
+    /// example).
     fn write_control(&mut self, value: u8) {
         if value & CONTROL_BUSY != 0 && !self.armed && !self.mid_blit {
             self.control = (self.control & CONTROL_BUSY) | (value & !CONTROL_BUSY);
@@ -429,17 +426,17 @@ impl Blitter {
         }
     }
 
-    /// Écrit SRC_ADDR ou DST_ADDR par mot long complet (32 bits, seuls les
-    /// 24 bits bas sont significatifs) — même principe que
-    /// [`Self::write_word`] pour les registres 16 bits : un accès `.B` ou
-    /// `.W` isolé sur ces registres est ignoré sur le silicium réel, seul
-    /// un accès `.L` complet est honoré.
+    /// Writes SRC_ADDR or DST_ADDR as a full longword (32 bits, only the
+    /// low 24 bits are significant) — same principle as
+    /// [`Self::write_word`] for the 16-bit registers: an isolated `.B` or
+    /// `.W` access on these registers is ignored on real silicon, only
+    /// a full `.L` access is honored.
     pub fn write_long(&mut self, addr: u32, value: u32) {
         if std::env::var("RUST68_TRACE_BLIT_REGS").is_ok()
             && matches!(addr, reg::SRC_ADDR | reg::DST_ADDR)
         {
             eprintln!(
-                "[blit-reg] pc={:#010x} write_long {}={:#010x} control_actuel={:#04x} busy={} mid_blit={} armed={}",
+                "[blit-reg] pc={:#010x} write_long {}={:#010x} current_control={:#04x} busy={} mid_blit={} armed={}",
                 DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed),
                 if addr == reg::SRC_ADDR { "SRC_ADDR" } else { "DST_ADDR" },
                 value, self.control, self.busy(), self.mid_blit, self.armed,
@@ -452,10 +449,10 @@ impl Blitter {
         }
     }
 
-    /// Applique la fonction de demi-teinte (`HOP`, 2 bits) : combine le mot
-    /// source et le mot de demi-teinte courant selon la table standard du
-    /// datasheet (0=tous à 1, 1=demi-teinte seule, 2=source seule,
-    /// 3=source ET demi-teinte).
+    /// Applies the halftone function (`HOP`, 2 bits): combines the source
+    /// word and the current halftone word according to the datasheet's
+    /// standard table (0=all set to 1, 1=halftone only, 2=source only,
+    /// 3=source AND halftone).
     fn apply_hop(&self, source: u16, halftone: u16) -> u16 {
         match self.hop & 0x3 {
             0 => 0xFFFF,
@@ -466,23 +463,23 @@ impl Blitter {
         }
     }
 
-    /// Applique la fonction booléenne programmable (`OP`, 4 bits) : pour
-    /// chaque position de bit, l'index `3 - ((s<<1)|d)` (c'est-à-dire
-    /// `(NOT s << 1) | NOT d`) sélectionne le bit de sortie dans la table
-    /// de vérité de 4 bits.
+    /// Applies the programmable boolean function (`OP`, 4 bits): for
+    /// each bit position, the index `3 - ((s<<1)|d)` (i.e.
+    /// `(NOT s << 1) | NOT d`) selects the output bit in the 4-bit
+    /// truth table.
     ///
-    /// Convention vérifiée par résolution directe du système d'équations
-    /// posé par le manuel Blitter officiel (`User Manual for the Atari ST
-    /// Bit-Block Transfer Processor`, archive.org, recoupé avec
-    /// `BLITTER.TXT` — les deux donnent la même table) : OP=1 "source AND
+    /// Convention verified by directly solving the system of equations
+    /// posed by the official Blitter manual (`User Manual for the Atari ST
+    /// Bit-Block Transfer Processor`, archive.org, cross-checked against
+    /// `BLITTER.TXT` — both give the same table): OP=1 "source AND
     /// destination", OP=2 "source AND NOT destination", OP=4 "NOT source
-    /// AND destination", OP=8 "NOT source AND NOT destination" ne sont
-    /// simultanément satisfaisables qu'avec cet index inversé — l'index
-    /// direct `(s<<1)|d` (convention Amiga/X11 "naturelle", utilisée par
-    /// erreur ici auparavant) donne par ex. OP=3 = "NOT source" au lieu de
-    /// "source", et OP=7 = NON(s ET d) au lieu de "source OR destination"
-    /// — une confusion qui affecte le rendu de tout blit n'utilisant pas
-    /// une des 4 fonctions symétriques (0x0/0x5/0xA/0xF).
+    /// AND destination", OP=8 "NOT source AND NOT destination" are only
+    /// simultaneously satisfiable with this inverted index — the
+    /// direct index `(s<<1)|d` ("natural" Amiga/X11 convention, mistakenly
+    /// used here before) gives e.g. OP=3 = "NOT source" instead of
+    /// "source", and OP=7 = NOT(s AND d) instead of "source OR destination"
+    /// — a mix-up that affects the rendering of any blit not using
+    /// one of the 4 symmetric functions (0x0/0x5/0xA/0xF).
     fn apply_op(&self, s_word: u16, d_word: u16) -> u16 {
         let mut result = 0u16;
         for bit in 0..16 {
@@ -495,43 +492,42 @@ impl Blitter {
         result
     }
 
-    /// Décale le mot source courant de `skew` bits en le combinant avec le
-    /// mot précédent.
+    /// Shifts the current source word by `skew` bits, combining it with the
+    /// previous word.
     ///
-    /// Formule vérifiée contre un exemple chiffré concret de BLIT_FAQ.TXT
-    /// (dépôt `ggnkua/Atari_ST_Sources`) : pour `SKEW=3` et un parcours X
-    /// croissant, le Blitter "reads out bits 18..3" d'un tampon 32 bits où
-    /// le mot COURANT occupe les bits 0-15 (bas) et le mot PRÉCÉDENT
-    /// (recopié par le Blitter dans le tampon haut après chaque écriture)
-    /// occupe les bits 16-31 (haut) — soit `((precedent as u32) << 16 |
-    /// courant as u32) >> skew`, tronqué à 16 bits.
+    /// Formula verified against a concrete worked example from BLIT_FAQ.TXT
+    /// (`ggnkua/Atari_ST_Sources` repo): for `SKEW=3` and increasing X
+    /// traversal, the Blitter "reads out bits 18..3" of a 32-bit buffer where
+    /// the CURRENT word occupies bits 0-15 (low) and the PREVIOUS word
+    /// (copied by the Blitter into the high buffer after each write)
+    /// occupies bits 16-31 (high) — i.e. `((previous as u32) << 16 |
+    /// current as u32) >> skew`, truncated to 16 bits.
     ///
-    /// Direction du parcours (confirmé par Hatari, `Blitter_SourceShift`/
-    /// `Blitter_SourceFetch`) : ce tampon 32 bits est un registre à décalage
-    /// alimenté DIFFÉREMMENT selon le signe de `SRC_X_INC`. Pour un parcours
-    /// croissant (X_INC ≥ 0), le mot nouvellement lu va dans la moitié
-    /// BASSE et l'ancien contenu remonte en HAUT (l'ordre "precedent:haut,
-    /// courant:bas" ci-dessus). Pour un parcours DÉCROISSANT (X_INC < 0,
-    /// blit "miroir"), c'est l'INVERSE : le mot nouvellement lu va dans la
-    /// moitié HAUTE et l'ancien contenu (décalé) se retrouve en BAS — soit
-    /// "courant:haut, precedent:bas". Le décalage à droite de `skew` reste
-    /// identique dans les deux cas (même registre matériel), mais comme
-    /// l'ordre des moitiés est inversé, le résultat diffère. Cette
-    /// dépendance à la direction n'était pas modélisée dans une version
-    /// précédente (les deux moitiés étaient toujours dans l'ordre "parcours
-    /// croissant"). Un premier essai de ce correctif avait coïncidé avec
-    /// l'apparition d'un bruit RVB massif en test live — mais la vraie
-    /// cause s'est révélée être un bug d'armement du Blitter sans rapport
-    /// (redémarrages accidentels via `TAS.B` dans la boucle de relance du
-    /// mode non-HOG, voir [`Self::write_control`]), qui ré-exécutait des
-    /// blits entiers depuis des adresses déjà avancées — une fois ce bug
-    /// corrigé séparément, ce correctif de direction a pu être réappliqué
-    /// sans regression.
-    /// Décale le registre à décalage source 32 bits (`buffer`, voir
-    /// [`Self::execute`]) : pour un parcours croissant (`src_x_inc >= 0`),
-    /// l'ancien contenu remonte en HAUT (place nette en BAS pour le
-    /// prochain mot lu) ; pour un parcours décroissant, c'est l'inverse.
-    /// Traduction directe de `Blitter_SourceShift` (Hatari,
+    /// Traversal direction (confirmed by Hatari, `Blitter_SourceShift`/
+    /// `Blitter_SourceFetch`): this 32-bit buffer is a shift register
+    /// fed DIFFERENTLY depending on the sign of `SRC_X_INC`. For increasing
+    /// traversal (X_INC ≥ 0), the newly-read word goes into the LOW
+    /// half and the old content moves up to HIGH (the "previous:high,
+    /// current:low" order above). For DECREASING traversal (X_INC < 0,
+    /// "mirror" blit), it's the OPPOSITE: the newly-read word goes into the
+    /// HIGH half and the old (shifted) content ends up in LOW — i.e.
+    /// "current:high, previous:low". The right shift by `skew` stays
+    /// identical in both cases (same hardware register), but since
+    /// the order of the halves is inverted, the result differs. This
+    /// direction dependency was not modeled in a previous version
+    /// (both halves were always in "increasing traversal" order). A first
+    /// attempt at this fix coincided with the appearance of massive
+    /// RGB noise in a live test — but the real cause turned out to be
+    /// an unrelated Blitter-arming bug (accidental restarts via `TAS.B` in
+    /// the non-HOG mode's resume loop, see [`Self::write_control`]), which
+    /// re-executed entire blits from addresses already advanced — once that
+    /// bug was fixed separately, this direction fix could be reapplied
+    /// without regression.
+    /// Shifts the 32-bit source shift register (`buffer`, see
+    /// [`Self::execute`]): for increasing traversal (`src_x_inc >= 0`),
+    /// the old content moves up to HIGH (clearing room at LOW for the
+    /// next word read); for decreasing traversal, it's the opposite.
+    /// Direct translation of `Blitter_SourceShift` (Hatari,
     /// `src/blitter.c`).
     fn shift_buffer(buffer: &mut u32, src_x_inc: i16) {
         if src_x_inc < 0 {
@@ -541,8 +537,8 @@ impl Blitter {
         }
     }
 
-    /// Charge `word` dans la moitié du registre à décalage source que
-    /// [`Self::shift_buffer`] vient de libérer. Traduction directe de
+    /// Loads `word` into the half of the source shift register that
+    /// [`Self::shift_buffer`] just freed up. Direct translation of
     /// `Blitter_SourceFetch` (Hatari, `src/blitter.c`).
     fn fetch_buffer(buffer: &mut u32, src_x_inc: i16, word: u16) {
         if src_x_inc < 0 {
@@ -552,70 +548,69 @@ impl Blitter {
         }
     }
 
-    /// Exécute le blit dans son intégralité (modèle synchrone, voir
-    /// limitations du module), en utilisant `bus` pour lire/écrire la RAM
-    /// aux adresses source/destination courantes. Met à jour les
-    /// registres d'adresse source/destination en fin d'exécution ; efface
-    /// le bit BUSY.
+    /// Executes the blit in its entirety (synchronous model, see the
+    /// module's limitations), using `bus` to read/write RAM at the
+    /// current source/destination addresses. Updates the
+    /// source/destination address registers at the end of execution; clears
+    /// the BUSY bit.
     ///
-    /// Traite le blit **mot par mot** (pas ligne par ligne avec une
-    /// formule d'avance d'adresse précalculée) — traduction directe de la
-    /// machine à états de Hatari (`Blitter_ProcessWord`,
-    /// `Blitter_SourceShift`/`Blitter_SourceFetch`), afin de reproduire
-    /// fidèlement le registre à décalage source 32 bits (`buffer`
-    /// ci-dessous) : sur le silicium réel, ce registre **persiste sur la
-    /// durée ENTIÈRE du blit** (toutes les lignes), jamais remis à zéro
-    /// entre deux lignes — seuls un décalage puis une lecture le
-    /// modifient, à chaque mot lu (y compris l'amorçage FXSR). Une version
-    /// précédente, structurée ligne par ligne avec une formule d'avance
-    /// d'adresse batch, réinitialisait le mot "précédent" à 0 au début de
-    /// CHAQUE ligne (sauf FXSR) et gérait NFSR comme un cas particulier
-    /// local plutôt que la véritable suppression de lecture/avance
-    /// qu'implique le silicium réel — confirmé faux par un test
-    /// différentiel comparant exhaustivement notre sortie à un portage
-    /// direct de `Blitter_ProcessWord` (`tests/blitter_hatari_diff.rs`) :
-    /// pour un blit multi-lignes en direction négative avec SKEW=0 et
-    /// X_COUNT=1, l'ancienne version produisait 0 au lieu du mot de la
-    /// ligne précédente à chaque nouvelle ligne ; avec NFSR actif, elle
-    /// divergeait aussi de l'avance d'adresse source réelle (qui saute
-    /// entièrement l'avance de fin de ligne quand la dernière lecture est
-    /// omise).
+    /// Processes the blit **word by word** (not line by line with a
+    /// precomputed address-advance formula) — direct translation of Hatari's
+    /// state machine (`Blitter_ProcessWord`,
+    /// `Blitter_SourceShift`/`Blitter_SourceFetch`), in order to faithfully
+    /// reproduce the 32-bit source shift register (`buffer`
+    /// below): on real silicon, this register **persists for the
+    /// ENTIRE duration of the blit** (all lines), never cleared
+    /// between two lines — only a shift followed by a read
+    /// modify it, on every word read (including the FXSR priming). A
+    /// previous version, structured line by line with a batch address-advance
+    /// formula, reset the "previous" word to 0 at the start of
+    /// EVERY line (except FXSR) and handled NFSR as a local special
+    /// case rather than the true suppression of the read/advance
+    /// that real silicon implies — confirmed wrong by a differential
+    /// test exhaustively comparing our output against a direct port
+    /// of `Blitter_ProcessWord` (`tests/blitter_hatari_diff.rs`):
+    /// for a multi-line blit in negative direction with SKEW=0 and
+    /// X_COUNT=1, the old version produced 0 instead of the previous
+    /// line's word on every new line; with NFSR active, it also
+    /// diverged from the real source address advance (which entirely skips
+    /// the end-of-line advance when the last read is omitted).
     ///
-    /// **Armement** (voir [`Self::write_control`]) : ne fait RIEN si
-    /// [`Self::armed`] est faux — c'est-à-dire si le logiciel n'a pas
-    /// explicitement réécrit Y_COUNT depuis la dernière exécution complète.
-    /// C'est ce qui empêche un déclenchement CONTROL accidentel (par ex.
-    /// `TAS.B` dans la boucle de relance du mode non-HOG, qui pose
-    /// physiquement le bit BUSY à chaque itération) de ré-exécuter tout le
-    /// blit depuis des adresses déjà avancées par un tour précédent — voir
-    /// le commentaire détaillé de [`Self::write_control`] pour le bug réel
-    /// que ceci corrige.
+    /// **Arming** (see [`Self::write_control`]): does NOTHING if
+    /// [`Self::armed`] is false — i.e. if the software hasn't
+    /// explicitly rewritten Y_COUNT since the last complete execution.
+    /// This is what prevents an accidental CONTROL trigger (e.g.
+    /// `TAS.B` in the non-HOG mode's resume loop, which re-sets the BUSY bit
+    /// physically each iteration) from re-executing the entire
+    /// blit from addresses already advanced by a previous round — see
+    /// [`Self::write_control`]'s detailed comment for the real bug
+    /// that this fixes.
     pub fn execute(&mut self, bus: &mut impl crate::Bus) {
         if self.armed {
-            // Véritable démarrage (Y_COUNT vient d'être réécrit) : (ré)initialise
-            // tout l'état de progression persistant. `x_count_reset` reste
-            // borné à 1 (`.max(1)`) uniquement pour éviter une boucle
-            // infinie plus bas, pas pour lui donner une signification
-            // particulière.
+            // True start (Y_COUNT was just rewritten): (re)initializes
+            // all persistent progress state. `x_count_reset` stays
+            // clamped to 1 (`.max(1)`) only to avoid an infinite
+            // loop below, not to give it any particular
+            // meaning.
             self.x_count = self.x_count.max(1);
             self.x_count_reset = self.x_count;
-            // NE PAS remettre `self.buffer` à zéro ici : sur le silicium
-            // réel (confirmé par Hatari ET Steem SSE — aucune des deux
-            // références ne réinitialise jamais `BlitterVars.buffer`/
-            // `Blitter.SrcBuffer` au démarrage d'un blit, uniquement via
-            // les décalages/lectures normaux), le registre à décalage
-            // source persiste sur la durée de vie de la puce, y compris
-            // entre deux blits LOGIQUEMENT SÉPARÉS (Y_COUNT réécrit entre
-            // les deux). TOS dessine typiquement une icône ou un glyphe
-            // colonne par colonne via une SUITE de petits blits adjacents
-            // (X_COUNT=1, SKEW non nul) qui s'appuient sur ce
-            // chaînage pour reconstituer correctement les pixels à cheval
-            // sur une frontière de mot — une remise à zéro systématique ici
-            // clive alors chaque nouvelle colonne, cohérent avec la
-            // corruption RVB observée sur les icônes glissées et le texte
-            // des menus (uniquement les blits utilisant réellement la
-            // source, jamais les remplissages/inversions purs qui n'en ont
-            // pas besoin).
+            // Do NOT reset `self.buffer` to zero here: on real
+            // silicon (confirmed by both Hatari AND Steem SSE — neither
+            // reference ever resets `BlitterVars.buffer`/
+            // `Blitter.SrcBuffer` when a blit starts, only via
+            // normal shifts/reads), the source shift register
+            // persists for the chip's whole lifetime, including
+            // between two LOGICALLY SEPARATE blits (Y_COUNT rewritten between
+            // the two). TOS typically draws an icon or glyph
+            // column by column via a SEQUENCE of small adjacent blits
+            // (X_COUNT=1, nonzero SKEW) that rely on this
+            // chaining to correctly reconstruct pixels straddling
+            // a word boundary — a systematic reset here then
+            // splits every new column, consistent with the
+            // RGB corruption observed on dragged icons and menu
+            // text (only for blits that actually use the
+            // source, never pure fills/inversions which don't
+            // need it).
             self.bus_word = 0;
             self.have_fxsr = false;
             self.nfsr_dynamic = false;
@@ -624,7 +619,7 @@ impl Blitter {
             self.control |= CONTROL_BUSY;
             if std::env::var("RUST68_TRACE_BLIT_START").is_ok() {
                 eprintln!(
-                    "[blit-start] pc={:#010x} dst_addr={:#010x} src_addr={:#010x} x_count={} y_count={} dst_x_inc={} dst_y_inc={} src_x_inc={} src_y_inc={} hop={} op={:#04x} skew={:#04x} control={:#04x} endmask={:#06x},{:#06x},{:#06x} buffer_avant={:#010x}",
+                    "[blit-start] pc={:#010x} dst_addr={:#010x} src_addr={:#010x} x_count={} y_count={} dst_x_inc={} dst_y_inc={} src_x_inc={} src_y_inc={} hop={} op={:#04x} skew={:#04x} control={:#04x} endmask={:#06x},{:#06x},{:#06x} buffer_before={:#010x}",
                     DEBUG_LAST_PC.load(std::sync::atomic::Ordering::Relaxed),
                     self.dst_addr, self.src_addr, self.x_count, self.y_count,
                     self.dst_x_inc, self.dst_y_inc, self.src_x_inc, self.src_y_inc,
@@ -641,55 +636,55 @@ impl Blitter {
         let fxsr_reg = self.skew & 0x80 != 0;
         let nfsr_reg = self.skew & 0x40 != 0;
         let skew = (self.skew & 0x0F) as u32;
-        // Mode HOG (bit 6 de CONTROL) : le Blitter garde le bus jusqu'à la
-        // fin complète du blit, sans jamais rendre la main au CPU. En mode
-        // non-HOG, le silicium réel ne traite qu'un nombre BORNÉ d'accès
-        // bus RÉELS (lecture OU écriture, chacun compté séparément — pas un
-        // nombre de MOTS traités) avant de rendre le bus — le logiciel doit
-        // reposer BUSY (typiquement via `TAS.B`, qui relit/rendosse au
-        // passage le numéro de ligne demi-teinte déjà avancé par le
-        // matériel) pour faire progresser la suite. Confirmé nécessaire
-        // par trace réelle Hatari (`--trace blitter`) sur ce cas précis :
-        // une longue série d'écritures CONTROL avec BUSY posé et un numéro
-        // de ligne qui progresse entre chaque écriture (pas une seule
-        // écriture qui termine tout d'un coup), avec des centaines de
-        // cycles d'instructions CPU authentiques entre deux écritures —
-        // c'est-à-dire du VRAI travail CPU entrelacé avec la progression
-        // du blit. Une version précédente exécutait tout le blit
-        // instantanément dès le premier déclenchement CONTROL, empêchant
-        // ce travail CPU entrelacé de s'exécuter dans le bon ordre relatif
-        // à la progression réelle du blit — cohérent avec la corruption
-        // observée dans le rendu de menus GEM (TOS 1.62/STE) qui persistait
-        // malgré une vérification exhaustive, par ailleurs correcte, de
-        // l'arithmétique interne du Blitter (table OP, HOP, skew, endmask,
-        // avance d'adresse — voir `tests/blitter_hatari_diff.rs`).
+        // HOG mode (CONTROL bit 6): the Blitter keeps the bus until the
+        // blit is completely finished, never handing control back to the CPU. In
+        // non-HOG mode, real silicon only processes a BOUNDED number of
+        // REAL bus accesses (read OR write, each counted separately — not a
+        // number of WORDS processed) before releasing the bus — the software must
+        // re-set BUSY (typically via `TAS.B`, which incidentally re-reads/re-applies
+        // the halftone line number already advanced by the
+        // hardware) to move progress forward. Confirmed necessary
+        // by a real Hatari trace (`--trace blitter`) on this exact case:
+        // a long series of CONTROL writes with BUSY set and a line
+        // number that progresses between each write (not a single
+        // write that finishes everything at once), with hundreds of
+        // authentic CPU instruction cycles between two writes —
+        // i.e. REAL CPU work interleaved with the blit's
+        // progress. A previous version executed the entire blit
+        // instantly on the first CONTROL trigger, preventing
+        // this interleaved CPU work from executing in the correct order relative
+        // to the blit's actual progress — consistent with the corruption
+        // observed in GEM menu rendering (TOS 1.62/STE) that persisted
+        // despite an exhaustive, otherwise correct, verification of
+        // the Blitter's internal arithmetic (OP table, HOP, skew, endmask,
+        // address advance — see `tests/blitter_hatari_diff.rs`).
         //
-        // Le seuil de 64 accès bus (`BUS_ACCESSES_PER_SLICE` ci-dessous) et
-        // le fait qu'il compte des accès réels et non des mots viennent
-        // directement du source de Hatari (`src/blitter.c`,
-        // `BLITTER_NONHOG_BUS_BLITTER`, avec un commentaire notant qu'un
-        // silicium réel peut occasionnellement s'arrêter à 63 au lieu de 64
-        // — cas de bug non reproduit ici, comme l'irrégularité de
-        // rafraîchissement RAM déjà documentée ailleurs). Une version
-        // précédente comptait 16 MOTS traités par tranche (pas d'accès bus)
-        // — un mot "normal" avec lecture source ET écriture destination vaut
-        // 3 accès bus réels (lecture source, lecture destination pour la
-        // combinaison OP, écriture destination), donc l'ancienne tranche de
-        // 16 mots représentait en réalité 32 à 48 accès bus selon le blit
-        // (jamais 64) : la fréquence de rendu de main au CPU était
-        // systématiquement trop élevée, cohérent avec un blit qui progresse
-        // plus lentement (en cycles CPU réels) que sur silicium réel/Hatari.
+        // The 64-bus-access threshold (`BUS_ACCESSES_PER_SLICE` below) and
+        // the fact that it counts real accesses rather than words come
+        // directly from Hatari's source (`src/blitter.c`,
+        // `BLITTER_NONHOG_BUS_BLITTER`, with a comment noting that real
+        // silicon can occasionally stop at 63 instead of 64
+        // — a bug case not reproduced here, like the RAM refresh
+        // irregularity already documented elsewhere). A previous version
+        // counted 16 WORDS processed per slice (not bus accesses)
+        // — a "normal" word with both a source read AND a destination write costs
+        // 3 real bus accesses (source read, destination read for the
+        // OP combination, destination write), so the old 16-word
+        // slice actually represented 32 to 48 bus accesses depending on the blit
+        // (never 64): the frequency of handing control back to the CPU was
+        // systematically too high, consistent with a blit that progresses
+        // more slowly (in real CPU cycles) than on real silicon/Hatari.
         let hog = self.control & CONTROL_HOG != 0;
         const BUS_ACCESSES_PER_SLICE: u32 = 64;
         let mut bus_accesses_this_slice: u32 = 0;
 
-        // `need_src` (repris de Hatari, `Blitter_Step`) : le pointeur
-        // source n'avance QUE si l'opération lit effectivement la source —
-        // c'est-à-dire si OP n'est pas l'une des 4 fonctions logiques qui
-        // ignorent la source (0x0/0x5/0xA/0xF : constante 0, "destination",
-        // "NOT destination", constante 1) ET si HOP produit une valeur
-        // dépendant de la source (HOP=2/3, ou HOP=1 seulement en mode
-        // SMUDGE, qui lit la source pour choisir la demi-teinte).
+        // `need_src` (taken from Hatari, `Blitter_Step`): the source
+        // pointer advances ONLY if the operation actually reads the source —
+        // i.e. if OP is not one of the 4 logical functions that
+        // ignore the source (0x0/0x5/0xA/0xF: constant 0, "destination",
+        // "NOT destination", constant 1) AND if HOP produces a value
+        // dependent on the source (HOP=2/3, or HOP=1 only in
+        // SMUDGE mode, which reads the source to pick the halftone).
         let lop_needs_src = !matches!(self.op, 0x00 | 0x05 | 0x0A | 0x0F);
         let hop_needs_src = (self.hop & 0x02) != 0 || (self.hop == 1 && smudge);
         let need_src = lop_needs_src && hop_needs_src;
@@ -699,7 +694,7 @@ impl Blitter {
 
         if trace_slices {
             eprintln!(
-                "[slice] entree hog={hog} y_count={} x_count={} mid_blit_deja={}",
+                "[slice] entry hog={hog} y_count={} x_count={} mid_blit_already={}",
                 self.y_count, self.x_count, self.mid_blit,
             );
         }
@@ -707,14 +702,14 @@ impl Blitter {
             if !hog && bus_accesses_this_slice >= BUS_ACCESSES_PER_SLICE {
                 if trace_slices {
                     eprintln!(
-                        "[slice] pause budget epuise, y_count_restant={} x_count_restant={}",
+                        "[slice] pause budget exhausted, y_count_remaining={} x_count_remaining={}",
                         self.y_count, self.x_count,
                     );
                 }
-                // Tranche épuisée : on rend la main au CPU sans effacer
-                // BUSY — le prochain déclenchement CONTROL (typiquement
-                // `TAS.B` dans la boucle de relance logicielle) reprendra
-                // exactement où on s'est arrêté, via `mid_blit`.
+                // Slice exhausted: hand control back to the CPU without clearing
+                // BUSY — the next CONTROL trigger (typically
+                // `TAS.B` in the software resume loop) will resume
+                // exactly where we stopped, via `mid_blit`.
                 return;
             }
 
@@ -724,10 +719,10 @@ impl Blitter {
                 self.nfsr_dynamic = false;
             }
 
-            // Cas particulier d'une ligne d'un seul mot (`x_count_reset ==
-            // 1`) : d'après le manuel Blitter officiel, ENDMASK_1 est
-            // utilisé seul (pas de combinaison avec ENDMASK_3, qui est
-            // simplement ignoré) — "In the case of a one word line
+            // Special case of a single-word line (`x_count_reset ==
+            // 1`): per the official Blitter manual, ENDMASK_1 is
+            // used alone (no combination with ENDMASK_3, which is
+            // simply ignored) — "In the case of a one word line
             // ENDMASK 1 is used."
             let mask = if first_word || x_count_reset == 1 {
                 self.endmask[0]
@@ -737,11 +732,11 @@ impl Blitter {
                 self.endmask[1]
             };
 
-            // FXSR (lecture d'amorçage, une fois en début de ligne) : sur
-            // le silicium réel, cette lecture a lieu à l'adresse COURANTE,
-            // PUIS `src_addr` avance de SRC_X_INC avant même la première
-            // lecture "normale" du mot 0 — le mot 0 est donc réellement lu
-            // à `src_addr+SRC_X_INC`, pas à `src_addr`.
+            // FXSR (priming read, once at the start of a line): on
+            // real silicon, this read happens at the CURRENT address,
+            // THEN `src_addr` advances by SRC_X_INC even before the first
+            // "normal" read of word 0 — word 0 is thus actually read
+            // at `src_addr+SRC_X_INC`, not at `src_addr`.
             if fxsr_reg && !self.have_fxsr && need_src {
                 Self::shift_buffer(&mut self.buffer, self.src_x_inc);
                 let w = bus.read16(self.src_addr & crate::ADDR_MASK);
@@ -752,10 +747,10 @@ impl Blitter {
                 self.have_fxsr = true;
             }
 
-            // Lecture source normale — omise si NFSR est actif ET que ce
-            // mot est celui identifié comme "dernier" par le mécanisme
-            // dynamique ci-dessous (`nfsr_dynamic`, posé quand X_COUNT==2
-            // était vrai au mot précédent).
+            // Normal source read — omitted if NFSR is active AND this
+            // word is the one identified as "last" by the
+            // dynamic mechanism below (`nfsr_dynamic`, set when X_COUNT==2
+            // was true on the previous word).
             let mut fetch_src = false;
             if need_src && !self.nfsr_dynamic {
                 Self::shift_buffer(&mut self.buffer, self.src_x_inc);
@@ -766,15 +761,15 @@ impl Blitter {
                 fetch_src = true;
             }
 
-            // Cas particulier NFSR : le silicium réel effectue un
-            // décalage+relecture (réutilisant le dernier mot bus lu) avant
-            // ET après le traitement du DERNIER mot de CHAQUE ligne — pas
-            // seulement les lignes d'un seul mot. Confirmé dans le vrai
-            // source Hatari (`Blitter_ProcessWord`, blitter.c) : la
-            // condition y est `BlitterVars.nfsr && BlitterRegs.x_count ==
-            // 1`, où `BlitterRegs.x_count` est le compteur COURANT (pas la
-            // valeur initiale `x_count_reset`) — donc vrai à la fin de
-            // chaque ligne, quelle que soit sa largeur.
+            // Special NFSR case: real silicon performs a
+            // shift+reread (reusing the last bus word read) both BEFORE
+            // AND after processing the LAST word of EVERY line — not
+            // only single-word lines. Confirmed in the real
+            // Hatari source (`Blitter_ProcessWord`, blitter.c): the
+            // condition there is `BlitterVars.nfsr && BlitterRegs.x_count ==
+            // 1`, where `BlitterRegs.x_count` is the CURRENT counter (not the
+            // initial value `x_count_reset`) — so true at the end of
+            // every line, regardless of its width.
             let weird_single_word_nfsr = nfsr_reg && x_count == 1;
             if weird_single_word_nfsr {
                 Self::shift_buffer(&mut self.buffer, self.src_x_inc);
@@ -800,7 +795,7 @@ impl Blitter {
                     || (self.hop == 1 && self.halftone[0] != self.halftone[1]))
             {
                 eprintln!(
-                    "[bw] src={:#08x} dst={:#08x} x_count={x_count} fxsr={fxsr_reg} nfsr={nfsr_reg} buffer={:#010x} skewed={source:#06x} halftone_line={halftone_line} halftone={halftone_word:#06x} hop={hop_result:#06x} dest_avant={dest_current:#06x} mask={mask:#06x} ecrit={result:#06x}",
+                    "[bw] src={:#08x} dst={:#08x} x_count={x_count} fxsr={fxsr_reg} nfsr={nfsr_reg} buffer={:#010x} skewed={source:#06x} halftone_line={halftone_line} halftone={halftone_word:#06x} hop={hop_result:#06x} dest_before={dest_current:#06x} mask={mask:#06x} written={result:#06x}",
                     self.src_addr & crate::ADDR_MASK,
                     self.dst_addr & crate::ADDR_MASK,
                     self.buffer,
@@ -815,19 +810,19 @@ impl Blitter {
                 Self::fetch_buffer(&mut self.buffer, self.src_x_inc, self.bus_word);
             }
 
-            // Le mot qui vient d'être traité est celui où X_COUNT==2 :
-            // c'est le mot qui PRÉCÈDE le dernier de la ligne. Si NFSR est
-            // actif, la lecture source du PROCHAIN mot (le dernier) doit
-            // être omise — posé ici pour le prochain tour de boucle.
+            // The word that was just processed is the one where X_COUNT==2:
+            // it's the word that PRECEDES the last one on the line. If NFSR is
+            // active, the source read for the NEXT word (the last one) must
+            // be omitted — set here for the next loop iteration.
             if x_count == 2 && nfsr_reg {
                 self.nfsr_dynamic = true;
             }
 
-            // Avance de l'adresse source : uniquement si une lecture a eu
-            // lieu ce mot-ci. Sur le DERNIER mot de la ligne (ou si la
-            // lecture suivante sera omise par NFSR), l'avance utilise
-            // SRC_Y_INC au lieu de SRC_X_INC — le logiciel appelant
-            // configure donc SRC_Y_INC en connaissance de cause.
+            // Source address advance: only if a read happened on this word.
+            // On the LAST word of the line (or if the next read will be
+            // omitted by NFSR), the advance uses SRC_Y_INC instead of
+            // SRC_X_INC — the calling software therefore
+            // configures SRC_Y_INC accordingly.
             if fetch_src {
                 if x_count == 1 || self.nfsr_dynamic {
                     self.src_addr = self.src_addr.wrapping_add(self.src_y_inc as i32 as u32);
@@ -837,10 +832,10 @@ impl Blitter {
             }
 
             if x_count == 1 {
-                // Fin de ligne : DST_Y_INC remplace DST_X_INC (pas en
-                // plus) — le logiciel appelant précalcule donc Y_INC en
-                // tenant déjà compte des (X_COUNT-1) pas de X_INC déjà
-                // parcourus.
+                // End of line: DST_Y_INC replaces DST_X_INC (not in
+                // addition) — the calling software therefore precomputes Y_INC
+                // already accounting for the (X_COUNT-1) X_INC steps already
+                // traversed.
                 self.have_fxsr = false;
                 self.y_count -= 1;
                 self.x_count = x_count_reset;
@@ -857,24 +852,24 @@ impl Blitter {
             }
         }
 
-        // NOTE : ne PAS remettre `self.y_count`/`self.x_count` (registres
-        // VISIBLES) à zéro ici — voir le commentaire de
-        // [`Self::write_control`] pour la distinction entre ce registre
-        // (qui doit revenir à sa valeur initiale, documentée) et
-        // `self.armed` (qui, lui, passe à faux ci-dessous et empêche tout
-        // redémarrage tant que le logiciel n'a pas explicitement réécrit
+        // NOTE: do NOT reset `self.y_count`/`self.x_count` (VISIBLE
+        // registers) to zero here — see [`Self::write_control`]'s
+        // comment for the distinction between this register
+        // (which must return to its documented initial value) and
+        // `self.armed` (which does go false below and prevents any
+        // restart until the software has explicitly rewritten
         // Y_COUNT).
         //
-        // Le bit HOG (bit 6) est également effacé en fin de blit, pas
-        // seulement BUSY — confirmé par Steem SSE (`blitter.cpp`,
-        // `Blitter_Start_Line`, commentaire "hog bit also reset
-        // (BLTBENCH.TOS)", citant un comportement observé sur silicium réel
-        // via l'outil de test BLTBENCH.TOS). Une version précédente ne
-        // touchait pas ce bit, laissant HOG visible à `1` après un blit en
-        // mode HOG même une fois terminé — un logiciel qui relit CONTROL
-        // pour décider de son comportement pour le blit SUIVANT (dans une
-        // longue séquence d'appels, comme le dessin d'un menu GEM) pouvait
-        // donc prendre un chemin différent de celui du matériel réel.
+        // The HOG bit (bit 6) is also cleared at the end of the blit, not
+        // just BUSY — confirmed by Steem SSE (`blitter.cpp`,
+        // `Blitter_Start_Line`, comment "hog bit also reset
+        // (BLTBENCH.TOS)", citing behavior observed on real silicon
+        // via the BLTBENCH.TOS test tool). A previous version didn't
+        // touch this bit, leaving HOG visible as `1` after a blit in
+        // HOG mode even once finished — software that re-reads CONTROL
+        // to decide its behavior for the NEXT blit (in a
+        // long sequence of calls, like drawing a GEM menu) could
+        // therefore take a different path than real hardware would.
         self.control &= !(CONTROL_BUSY | CONTROL_HOG);
         self.armed = false;
         self.mid_blit = false;

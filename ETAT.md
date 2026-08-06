@@ -1,997 +1,978 @@
-# Rust68 — État de l'émulateur MC68000
+# Rust68 — MC68000 Emulator Status
 
-> Dernière mise à jour : 2026-08-06
+> Last updated: 2026-08-06
 
-## Licence
+## License
 
-GPL-3.0-or-later (voir [LICENSE](LICENSE)). Toute redistribution, y
-compris dans un projet fermé ou commercial, doit republier le code source
-de ses modifications sous les mêmes termes.
+GPL-3.0-or-later (see [LICENSE](LICENSE)). Any redistribution, including
+in a closed-source or commercial project, must republish the source code
+of its modifications under the same terms.
 
-## Score TomHarte actuel
+## Current TomHarte score
 
-| Catégorie | Nombre |
+| Category | Count |
 |-----------|--------|
-| **Réussis (état registres/RAM ET cycles)** | **317 500** |
-| Échecs | **0** |
-| **Total tests** | **317 500** |
+| **Passed (register/RAM state AND cycles)** | **317,500** |
+| Failures | **0** |
+| **Total tests** | **317,500** |
 
-**Conformité état (registres/RAM) : 100 %. Conformité cycle-exacte : 100 %.**
+**State compliance (registers/RAM): 100%. Cycle-exact compliance: 100%.**
 
 ```sh
-# Test ciblé (~1s)
+# Targeted test (~1s)
 TOMHARTE_DIR=… FOCUS=MOVE.l cargo test --release --test tomharte -- --nocapture
 
-# Run complet avec détection de régression (~40s)
+# Full run with regression detection (~40s)
 TOMHARTE_DIR=… cargo test --release --test tomharte -- --nocapture
 
-# Mettre à jour la baseline après amélioration
+# Update the baseline after an improvement
 TOMHARTE_DIR=… BASELINE=1 cargo test --release --test tomharte -- --nocapture
 ```
 
-La baseline (`tomharte_baseline.txt`, dans .gitignore) permet de détecter les
-régressions et de visualiser les progrès instruction par instruction.
+The baseline (`tomharte_baseline.txt`, in .gitignore) is used to detect
+regressions and to visualize progress instruction by instruction.
 
 ---
 
-## Architecture du code
+## Code architecture
 
-Le cœur 68000 (`cpu.rs`/`addressing.rs`/`execute.rs`/`bus.rs`) ne dépend
-d'aucun système particulier. Les périphériques et boards sont rangés **un
-sous-module par système émulé** sous `peripherals/`/`systems/`, chacun
-derrière sa propre feature Cargo — aucune activée par défaut : `cargo
-build`/`cargo test` sans option ne compilent/rapatrient que le cœur, il
-faut explicitement `--features atari-st` pour l'Atari ST :
+The 68000 core (`cpu.rs`/`addressing.rs`/`execute.rs`/`bus.rs`) does not
+depend on any particular system. Peripherals and boards are organized
+**one submodule per emulated system** under `peripherals/`/`systems/`,
+each behind its own Cargo feature — none enabled by default: `cargo
+build`/`cargo test` with no options only compile/pull in the core, you
+need `--features atari-st` explicitly for the Atari ST:
 
 ```
 src/
-  cpu.rs          (~685 l.)  — registres, SR, USP/SSP, fetch_word, take_exception,
+  cpu.rs          (~685 l.)  — registers, SR, USP/SSP, fetch_word, take_exception,
                                 take_bus_error_full, take_interrupt, take_trace_exception,
                                 exception_log
-  addressing.rs   (~455 l.)  — Operand, Size, resolve_ea (tous les modes 68000)
-  execute.rs     (~3290 l.)  — décodage et exécution de toutes les instructions
-  bus.rs          (~320 l.)  — trait Bus + FlatBus (16 Mo RAM plate) + TimedBus
-                                (wait-states DRAM/vidéo) + take_bus_fault() + irq_level/irq_ack
+  addressing.rs   (~455 l.)  — Operand, Size, resolve_ea (all 68000 addressing modes)
+  execute.rs     (~3290 l.)  — decoding and execution of all instructions
+  bus.rs          (~320 l.)  — Bus trait + FlatBus (16 MB flat RAM) + TimedBus
+                                (DRAM/video wait-states) + take_bus_fault() + irq_level/irq_ack
   peripherals/
     mod.rs                   — `#[cfg(feature = "atari-st")] pub mod atari_st;`
     atari_st/
-      mfp.rs      (~670 l.)  — MC68901 MFP (chip seul, cf. section dédiée)
-      glue.rs     (~370 l.)  — timing HBL/VBL du GLUE + bordure verticale STE (cf. section dédiée)
-      acia.rs     (~150 l.)  — MC6850 ACIA (chip seul, cf. section dédiée)
-      ikbd.rs     (~520 l.)  — contrôleur IKBD HD6301 clavier/souris (cf. section dédiée)
-      ym2149.rs   (~555 l.)  — PSG YM2149 (chip seul, cf. section dédiée)
-      microwire.rs(~465 l.)  — interface série vers le mixeur LMC1992 (STE), filtre graves/aigus
-      dma_sound.rs(~310 l.)  — DMA Sound STE (lecture PCM 8 bits depuis la RAM)
-      drive_sound.rs(~270 l.)— bruitage mécanique du lecteur de disquette
-      shifter.rs  (~1150 l.) — vidéo Shifter (chip seul, cf. section dédiée)
-      wd1772.rs   (~945 l.)  — contrôleur disquette WD1772 (chip seul, cf. section dédiée)
-      stx.rs      (~610 l.)  — lecteur minimal de disquettes `.stx` (Pasti)
-      msa.rs      (~265 l.)  — lecteur de disquettes `.msa` (Magic Shadow Archiver)
-      blitter.rs  (~880 l.)  — coprocesseur BitBlt Blitter (chip seul, cf. section dédiée)
+      mfp.rs      (~670 l.)  — MC68901 MFP (chip alone, see dedicated section)
+      glue.rs     (~370 l.)  — GLUE HBL/VBL timing + STE vertical border (see dedicated section)
+      acia.rs     (~150 l.)  — MC6850 ACIA (chip alone, see dedicated section)
+      ikbd.rs     (~520 l.)  — IKBD HD6301 keyboard/mouse controller (see dedicated section)
+      ym2149.rs   (~555 l.)  — YM2149 PSG (chip alone, see dedicated section)
+      microwire.rs(~465 l.)  — serial interface to the LMC1992 mixer (STE), bass/treble filter
+      dma_sound.rs(~310 l.)  — STE DMA Sound (8-bit PCM playback from RAM)
+      drive_sound.rs(~270 l.)— floppy drive mechanical sound effects
+      shifter.rs  (~1150 l.) — Shifter video (chip alone, see dedicated section)
+      wd1772.rs   (~945 l.)  — WD1772 floppy controller (chip alone, see dedicated section)
+      stx.rs      (~610 l.)  — minimal `.stx` (Pasti) floppy disk reader
+      msa.rs      (~265 l.)  — `.msa` (Magic Shadow Archiver) floppy disk reader
+      blitter.rs  (~880 l.)  — Blitter BitBlt coprocessor (chip alone, see dedicated section)
   systems/
     mod.rs                   — `#[cfg(feature = "atari-st")] pub mod atari_st;`
     atari_st/
-      mod.rs     (~1760 l.)  — board ST minimal (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
-                                Blitter, cf. section dédiée)
-      model.rs                — lexique des modèles ST/STE/Mega ST/Mega STE (RAM, Blitter, TOS
-                                d'origine — cf. section dédiée)
+      mod.rs     (~1760 l.)  — minimal ST board (RAM/ROM/MFP/GLUE/ACIA/YM2149/Shifter/WD1772/
+                                Blitter, see dedicated section)
+      model.rs                — ST/STE/Mega ST/Mega STE model lexicon (RAM, Blitter, original
+                                TOS — see dedicated section)
   bin/
-    atari_st_sdl2.rs         — frontend SDL2 (vidéo/clavier/souris/son), feature `sdl2-frontend`
-  lib.rs                     — exports publics
+    atari_st_sdl2.rs         — SDL2 frontend (video/keyboard/mouse/sound), `sdl2-frontend` feature
+  lib.rs                     — public exports
 tests/
-  instructions.rs            — tests unitaires ciblés (CPU)
-  interrupts.rs               — tests du mécanisme IPL (Cpu::take_interrupt)
-  trace.rs                     — tests du mode trace (Cpu::take_trace_exception)
-  mfp.rs                      — tests du MFP 68901 (feature `atari-st`)
-  glue.rs                      — tests du GLUE (HBL/VBL) (feature `atari-st`)
-  acia.rs                      — tests du MC6850 ACIA (feature `atari-st`)
-  ym2149.rs                    — tests du PSG YM2149 (feature `atari-st`)
-  shifter.rs                   — tests de la vidéo Shifter (feature `atari-st`)
-  wd1772.rs                    — tests du contrôleur disquette WD1772 (feature `atari-st`)
-  blitter.rs                   — tests du Blitter (feature `atari-st`)
-  blitter_hatari_diff.rs      — oracle différentiel (portage direct de `Blitter_ProcessWord`)
-  atari_st.rs                 — tests du board Atari ST, bout-en-bout (feature `atari-st`)
-  tomharte.rs                — harnais de conformité TomHarte (avec FOCUS et baseline)
+  instructions.rs            — targeted unit tests (CPU)
+  interrupts.rs               — tests of the IPL mechanism (Cpu::take_interrupt)
+  trace.rs                     — tests of trace mode (Cpu::take_trace_exception)
+  mfp.rs                      — MFP 68901 tests (`atari-st` feature)
+  glue.rs                      — GLUE tests (HBL/VBL) (`atari-st` feature)
+  acia.rs                      — MC6850 ACIA tests (`atari-st` feature)
+  ym2149.rs                    — YM2149 PSG tests (`atari-st` feature)
+  shifter.rs                   — Shifter video tests (`atari-st` feature)
+  wd1772.rs                    — WD1772 floppy controller tests (`atari-st` feature)
+  blitter.rs                   — Blitter tests (`atari-st` feature)
+  blitter_hatari_diff.rs      — differential oracle (direct port of `Blitter_ProcessWord`)
+  atari_st.rs                 — end-to-end Atari ST board tests (`atari-st` feature)
+  tomharte.rs                — TomHarte compliance harness (with FOCUS and baseline)
 examples/
-  rd_menu_repro.rs / rd_menu_ca6a.rs — reproduction headless (sans SDL2) d'un clic-glisser
-                                de menu GEM, avec traçage Blitter/CPU ciblé — infrastructure
-                                de diagnostic conservée, pas des scripts jetables.
+  rd_menu_repro.rs / rd_menu_ca6a.rs — headless (no SDL2) reproduction of a GEM menu
+                                click-drag, with targeted Blitter/CPU tracing — diagnostic
+                                infrastructure kept in the tree, not throwaway scripts.
 ```
 
-### Features Cargo
+### Cargo features
 
-| Feature | Défaut | Effet |
+| Feature | Default | Effect |
 |---|---|---|
-| `atari-st` | désactivée | Compile `peripherals::atari_st` et `systems::atari_st`. Sans elle (défaut), on n'a que le cœur 68000. |
-| `sdl2-frontend` | désactivée | Compile le binaire `atari_st_sdl2` (dépend de `atari-st`, active `sdl2` en dépendance). |
+| `atari-st` | disabled | Compiles `peripherals::atari_st` and `systems::atari_st`. Without it (default), only the 68000 core is available. |
+| `sdl2-frontend` | disabled | Compiles the `atari_st_sdl2` binary (depends on `atari-st`, enables the `sdl2` dependency). |
 
 ---
 
-## Instructions implémentées (jeu complet MC68000)
+## Implemented instructions (complete MC68000 set)
 
-### Transferts de données
+### Data transfers
 - `MOVE.b/w/l`, `MOVEA.w/l`, `MOVEQ`
 - `MOVEM.w/l`, `MOVEP.w/l`
 - `LEA`, `PEA`
-- `MOVE from/to CCR`, `MOVE from/to SR` *(to SR : privilégié)*
-- `MOVE from/to USP` *(privilégié)*
+- `MOVE from/to CCR`, `MOVE from/to SR` *(to SR: privileged)*
+- `MOVE from/to USP` *(privileged)*
 - `EXT.w/l`, `SWAP`, `EXG`, `CLR`
 
-### Arithmétique entière
+### Integer arithmetic
 - `ADD/ADDA/ADDQ/ADDX`, `SUB/SUBA/SUBQ/SUBX`
 - `NEG/NEGX`, `MULU/MULS`, `DIVU/DIVS`
 
-### Arithmétique BCD
-- `ABCD`, `SBCD`, `NBCD` *(flags V/N indéfinis côté hardware)*
+### BCD arithmetic
+- `ABCD`, `SBCD`, `NBCD` *(V/N flags undefined on hardware)*
 
-### Logique & bits
+### Logic & bits
 - `AND/OR/EOR/NOT`, `ORI/ANDI/EORI to CCR/SR`
 - `BTST/BSET/BCLR/BCHG`
 
-### Comparaison & test
+### Comparison & test
 - `CMP/CMPA/CMPI/CMPM`, `TST`, `CHK`
 
-### Décalages & rotations
-- `LSL/LSR`, `ASL/ASR`, `ROL/ROR`, `ROXL/ROXR` (b/w/l, registre et mémoire)
+### Shifts & rotations
+- `LSL/LSR`, `ASL/ASR`, `ROL/ROR`, `ROXL/ROXR` (b/w/l, register and memory)
 
-### Branchements
+### Branches
 - `BRA`, `BSR`, `Bcc`, `DBcc`, `Scc`, `JMP`, `JSR`, `RTS`, `RTR`
 - `LINK`, `UNLK`
 
-### Contrôle CPU
+### CPU control
 - `NOP`, `RESET`, `STOP`, `RTE`, `TAS`
 
-### Exceptions logicielles
+### Software exceptions
 - `TRAP #0–#15`, `TRAPV`, `ILLEGAL`, Line-A, Line-F
-- Privilege violation pour toutes les instructions privilégiées en user mode
-- Divide-by-zero (vecteur 5) : frame PC = adresse de l'instruction
-  *suivante* (trap post-instruction, RTE ne doit pas ré-exécuter le DIVU/DIVS)
+- Privilege violation for all privileged instructions in user mode
+- Divide-by-zero (vector 5): PC frame = address of the *next*
+  instruction (post-instruction trap, RTE must not re-execute the DIVU/DIVS)
 
-### Address Error (vecteur 3) & Bus Error (vecteur 2)
-Implémentation complète du frame 14 octets pour tous les accès word/long sur
-adresse impaire : read AE, write AE, instruction fetch AE. Gestion correcte de
-tous les cas MOVE.l (ordre d'écriture LSW-first pour `-(An)`, CCR selon src/dst
-mode, frame_pc pipeline-correct), avec `fault_prefix` calculé automatiquement
-par `resolve_ea` pour ne pas re-facturer le coût déjà engagé par
-l'instruction fautive.
+### Address Error (vector 3) & Bus Error (vector 2)
+Full implementation of the 14-byte frame for all word/long accesses at an
+odd address: read AE, write AE, instruction fetch AE. Correct handling of
+all MOVE.l cases (LSW-first write order for `-(An)`, CCR depending on
+src/dst mode, pipeline-correct frame_pc), with `fault_prefix` computed
+automatically by `resolve_ea` so as not to re-charge the cost already
+incurred by the faulting instruction.
 
-Le Bus error (même frame, vecteur 2) est déclenché via `Bus::take_bus_fault()`
-— un hook optionnel (défaut : jamais de fault) que l'implémentation de `Bus`
-peut renseigner pour signaler un accès dans une zone sans aucun chip select
-(le « trou » physique entre RAM installée et ROM sur un ST/STE réel). C'est le
-mécanisme qu'utilisent de nombreux programmes/démos pour détecter la RAM
-installée (handler au vecteur $8 + scan d'adresses croissantes). Vérifié après
-le fetch d'opcode et après chaque exécution dans `Cpu::step`.
+Bus error (same frame, vector 2) is triggered via `Bus::take_bus_fault()`
+— an optional hook (default: never faults) that the `Bus` implementation
+can fill in to signal an access to an area with no chip select at all
+(the physical "hole" between installed RAM and ROM on a real ST/STE).
+This is the mechanism many programs/demos use to detect installed RAM
+(handler at vector $8 + scanning increasing addresses). Checked after the
+opcode fetch and after each execution in `Cpu::step`.
 
-**Double bus fault (`Cpu::halted`)** : un bus/address error survenant en
-empilant le frame d'un précédent bus/address error (ou en lisant son
-vecteur) — typiquement un pointeur de pile hors de toute zone mappée —
-est détecté et arrête définitivement le CPU (`StepError::DoubleFault`),
-comme le ferait un vrai 68000 (HALT jusqu'à un `/RESET` matériel), plutôt
-que de rebondir indéfiniment sur un vecteur avec un frame corrompu. Bug
-réel trouvé en creusant le boot froid Atari ST (voir plus bas) :
-auparavant, le flag de fault posé par la poussée de frame elle-même
-restait non consommé et contaminait le `step` suivant, provoquant une
-cascade infinie et silencieuse.
+**Double bus fault (`Cpu::halted`)**: a bus/address error occurring while
+pushing the frame of a previous bus/address error (or while reading its
+vector) — typically a stack pointer outside any mapped area — is detected
+and permanently halts the CPU (`StepError::DoubleFault`), as a real 68000
+would (HALT until a hardware `/RESET`), rather than bouncing indefinitely
+on a vector with a corrupted frame. Real bug found while digging into the
+Atari ST cold boot (see below): previously, the fault flag set by the
+frame push itself remained unconsumed and contaminated the next `step`,
+causing a silent infinite cascade.
 
-### Interruptions IPL
-`Cpu::take_interrupt` (appelé par `Cpu::step` avant le fetch de chaque
-opcode) : reconnaît une demande d'interruption externe et la prend si son
-niveau dépasse le masque IPL courant du SR (niveau 7 = NMI, toujours pris).
-Frame standard 6 octets (SR+PC), bascule superviseur, masque IPL relevé au
-niveau accepté, cycle d'acquittement via deux méthodes du trait `Bus` :
+### IPL interrupts
+`Cpu::take_interrupt` (called by `Cpu::step` before fetching each opcode):
+recognizes an external interrupt request and takes it if its level exceeds
+the current IPL mask of the SR (level 7 = NMI, always taken). Standard
+6-byte frame (SR+PC), switch to supervisor mode, IPL mask raised to the
+accepted level, acknowledge cycle via two methods of the `Bus` trait:
 
-- `Bus::irq_level() -> u8` : niveau demandé (0 = aucune demande) par le
-  système hôte.
-- `Bus::irq_ack(level) -> u8` : vecteur à utiliser (défaut : autovecteur
+- `Bus::irq_level() -> u8`: level requested (0 = no request) by the host
+  system.
+- `Bus::irq_ack(level) -> u8`: vector to use (default: autovector
   24+level).
 
-Coût approximatif de 44 cycles (aucune suite TomHarte ne couvre les
-interruptions). Testé dans `tests/interrupts.rs`. Pas géré : réveil sur
-STOP, edge-detect propre du niveau 7.
+Approximate cost of 44 cycles (no TomHarte suite covers interrupts).
+Tested in `tests/interrupts.rs`. Not handled: wake-up from STOP, proper
+edge-detect for level 7.
 
-### Trace (bit T du SR)
-Le 68000 déclenche l'exception vecteur 9 après chaque instruction si le
-bit T du SR est actif à la fin de celle-ci (relu après l'instruction, pas
-avant : une instruction qui pose T elle-même — MOVE/ANDI/ORI to SR, RTE
-qui dépile un SR avec T=1 — se trace donc dès sa propre fin). TomHarte
-capture volontairement l'effet d'une seule instruction sans enchaîner sur
-la trace même quand T=1 en entrée (le `final.sr`/`final.pc` d'un NOP avec
-T=1 est identique à T=0, aucun frame poussé) : `Cpu::step` ne prend donc
-**pas** l'exception lui-même, il pose `Cpu::trace_pending` à vrai — à
-l'appelant (une vraie boucle d'émulation, pas le harnais de conformité)
-d'appeler `Cpu::take_trace_exception` après chaque `step` s'il veut
-l'effet réel, avant le `step` suivant (préserve la priorité
-trace-avant-interruption du silicium). Frame standard 6 octets, coût de
-34 cycles. Aucune exception logicielle interne à l'instruction (TRAP,
-CHK, division par zéro, ILLEGAL, Line-A/F, violation de privilège) ne
-déclenche de trace supplémentaire : leur propre `take_exception` efface
-déjà T en entrant dans leur frame. Testé dans `tests/trace.rs` (7 tests).
+### Trace (SR T bit)
+The 68000 triggers the vector 9 exception after each instruction if the
+SR's T bit is set at the end of it (re-read after the instruction, not
+before: an instruction that sets T itself — MOVE/ANDI/ORI to SR, RTE
+popping an SR with T=1 — therefore traces as soon as it finishes).
+TomHarte deliberately captures the effect of a single instruction without
+chaining into the trace even when T=1 on entry (the `final.sr`/`final.pc`
+of a NOP with T=1 is identical to T=0, no frame pushed): `Cpu::step`
+therefore does **not** take the exception itself, it sets
+`Cpu::trace_pending` to true — it is up to the caller (a real emulation
+loop, not the compliance harness) to call `Cpu::take_trace_exception`
+after each `step` if it wants the real effect, before the next `step`
+(preserves the silicon's trace-before-interrupt priority). Standard
+6-byte frame, cost of 34 cycles. No exception internal to an instruction
+(TRAP, CHK, division by zero, ILLEGAL, Line-A/F, privilege violation)
+triggers an additional trace: their own `take_exception` already clears T
+on entering their frame. Tested in `tests/trace.rs` (7 tests).
 
-### Journal diagnostique
-`Cpu::exception_log` : buffer circulaire (`EXCEPTION_LOG_CAP` = 4096) des
-exceptions prises (vecteur, PC empilé, adresse fautive, write?, PC du handler,
-cycles). Pur enregistrement sans effet sur l'exécution, pour les harnais de
-diagnostic externes.
+### Diagnostic log
+`Cpu::exception_log`: circular buffer (`EXCEPTION_LOG_CAP` = 4096) of
+exceptions taken (vector, pushed PC, faulting address, write?, handler PC,
+cycles). Pure logging with no effect on execution, for external
+diagnostic harnesses.
 
 ---
 
 ## MFP 68901 (`src/peripherals/atari_st/mfp.rs`)
 
-`peripherals::atari_st::mfp::Mfp` modélise la puce **seule**, indépendamment de tout
-câblage système : c'est au board de mapper `Mfp::read`/`write` dans son
-`Bus`, de brancher `Mfp::iack` sur `Bus::irq_ack`, et de relier
-`Mfp::interrupt_requested()` à `Bus::irq_level` (câblé sur IPL6 sur
-ST/STE réel).
+`peripherals::atari_st::mfp::Mfp` models the chip **alone**, independent
+of any system wiring: it is up to the board to map `Mfp::read`/`write`
+into its `Bus`, wire `Mfp::iack` to `Bus::irq_ack`, and connect
+`Mfp::interrupt_requested()` to `Bus::irq_level` (wired to IPL6 on a real
+ST/STE).
 
-Couvert :
-- 24 registres logiques (`mfp::reg`) : GPIP/AER/DDR, IERA/B, IPRA/B,
-  ISRA/B, IMRA/B, VR, TACR/TBCR/TCDCR + 4 registres de données timer,
+Covered:
+- 24 logical registers (`mfp::reg`): GPIP/AER/DDR, IERA/B, IPRA/B,
+  ISRA/B, IMRA/B, VR, TACR/TBCR/TCDCR + 4 timer data registers,
   SCR/UCR/RSR/TSR/UDR (USART).
-- Contrôleur d'interruption à 16 canaux (`mfp::channel`, table fixée par
-  le datasheet) : IPR ne s'arme que si IER actif, `interrupt_requested()`
-  ne remonte que si IMR non masqué, IPR/ISR ne s'effacent que par écriture
-  de 0 (jamais par écriture de 1). `iack()` calcule le vecteur
-  (`VR[7:3] | canal`), efface IPR, puis selon le bit S (bit 3 du VR,
-  vérifié contre Hatari `mfp.c`, `MFP_ProcessIACK` — sens contre-intuitif :
-  bit POSÉ = SEI/"software end-of-interrupt", ISR reste armé jusqu'à
-  effacement logiciel ; bit à 0 = EOI automatique, ISR armé PUIS effacé
-  dans le MÊME cycle, jamais observable posé). Une écriture VR faisant
-  transiter le bit S de 1 (SEI) vers 0 (auto) efface ISRA/ISRB en bloc.
-  **Bug réel corrigé** : une version antérieure armait ISR
-  INCONDITIONNELLEMENT (sans regarder le bit S), ce qui, combiné à la
-  priorité imbriquée ci-dessous, bloquait indéfiniment tout canal MFP de
-  priorité inférieure dès le premier EOI-automatique — reproduit en
-  pratique par un son qui ne s'arrête plus et une souris qui répond mal
-  sous GEM (Bureau > Informations).
-- **Priorité imbriquée entre canaux** (`highest_priority_pending`) : un
-  canal pending+enabled+non masqué ne demande service que si aucun canal
-  de priorité STRICTEMENT supérieure n'est déjà "in service" (ISR) — un
-  ISR de priorité inférieure reste préemptable par un canal supérieur,
-  mais bloque tout canal de priorité inférieure ou égale jusqu'à son
-  propre acquittement. Vérifié contre Hatari (`mfp.c`,
+- 16-channel interrupt controller (`mfp::channel`, table fixed by the
+  datasheet): IPR only arms if IER is active, `interrupt_requested()`
+  only surfaces if IMR is unmasked, IPR/ISR only clear on a write of 0
+  (never on a write of 1). `iack()` computes the vector
+  (`VR[7:3] | channel`), clears IPR, then depending on the S bit (bit 3
+  of VR, checked against Hatari `mfp.c`, `MFP_ProcessIACK` —
+  counter-intuitive meaning: bit SET = SEI/"software end-of-interrupt",
+  ISR stays armed until cleared by software; bit 0 = automatic EOI, ISR
+  armed THEN cleared in the SAME cycle, never observably set). A VR write
+  that transitions the S bit from 1 (SEI) to 0 (auto) clears ISRA/ISRB in
+  bulk. **Real bug fixed**: an earlier version armed ISR
+  UNCONDITIONALLY (without looking at the S bit), which, combined with
+  the nested priority below, indefinitely blocked any lower-priority MFP
+  channel as soon as the first auto-EOI happened — reproduced in practice
+  as a sound that never stops and a mouse that responds poorly under GEM
+  (Desktop > Info).
+- **Nested priority between channels** (`highest_priority_pending`): a
+  pending+enabled+unmasked channel only requests service if no channel
+  of STRICTLY higher priority is already "in service" (ISR) — a
+  lower-priority ISR remains preemptable by a higher one, but blocks any
+  channel of equal or lower priority until its own acknowledgment.
+  Checked against Hatari (`mfp.c`,
   `MFP_InterruptRequest`/`MFP_CheckPendingInterrupts`).
-- 4 timers A/B/C/D : mode delay (prescale ÷4/÷10/÷16/÷50/÷64/÷100/÷200) et
-  mode event-count (A/B uniquement, piloté par `pulse_ta`/`pulse_tb`
-  plutôt que par l'horloge). Lire le registre de données d'un timer EN
-  MARCHE renvoie le compte à rebours courant (comportement réel du chip,
-  utilisé par TOS pour lire une horloge sans l'arrêter).
-- GPIP avec détection de front (AER) par broche, sur les 8 canaux dédiés.
-- USART simplifié "au byte" (`push_rx_byte`/`take_tx_byte`) : pas de
-  simulation bit start/stop/parité ni de baud rate réel.
+- 4 timers A/B/C/D: delay mode (prescale ÷4/÷10/÷16/÷50/÷64/÷100/÷200)
+  and event-count mode (A/B only, driven by `pulse_ta`/`pulse_tb` rather
+  than the clock). Reading the data register of a RUNNING timer returns
+  the current countdown value (real chip behavior, used by TOS to read a
+  clock without stopping it).
+- GPIP with per-pin edge detection (AER), on the 8 dedicated channels.
+- Simplified "byte-level" USART (`push_rx_byte`/`take_tx_byte`): no
+  simulation of start/stop/parity bits nor a real baud rate.
 
-Limitations connues, documentées dans le module — choix de portée
-délibérés, pas des bugs :
-- `tick()` suppose une horloge CPU fixe à 8 MHz (ST/STE) ; la période d'un
-  timer delay-mode est modélisée comme `(data+1) × prescale` cycles MFP —
-  non vérifiée contre une référence matérielle externe (aucune suite de
-  test équivalente à TomHarte n'existe pour le MFP), cohérent avec
-  `model::MachineProfile` qui documente `cpu_hz` comme informatif seul
-  pour la même raison.
-- Si plusieurs périodes de timer s'écoulent en un seul appel `tick()`, le
-  canal ne s'arme qu'une fois — conforme au silicium réel (`IPR` est un
-  bit, pas un compteur d'occurrences).
+Known limitations, documented in the module — deliberate scope choices,
+not bugs:
+- `tick()` assumes a fixed 8 MHz CPU clock (ST/STE); the period of a
+  delay-mode timer is modeled as `(data+1) × prescale` MFP cycles — not
+  verified against an external hardware reference (no test suite
+  equivalent to TomHarte exists for the MFP), consistent with
+  `model::MachineProfile`, which documents `cpu_hz` as informative only
+  for the same reason.
+- If several timer periods elapse within a single `tick()` call, the
+  channel only arms once — consistent with real silicon (`IPR` is a bit,
+  not an occurrence counter).
 
-Testé dans `tests/mfp.rs` (15 tests, dont la préemption/le blocage par
-priorité imbriquée).
+Tested in `tests/mfp.rs` (15 tests, including preemption/blocking via
+nested priority).
 
 ---
 
 ## GLUE (`src/peripherals/atari_st/glue.rs`)
 
-`peripherals::atari_st::glue::Glue` modélise le générateur de timing HBL/VBL de la
-puce GLUE (rôle mémoire/bus de GLUE non couvert) :
+`peripherals::atari_st::glue::Glue` models the HBL/VBL timing generator
+of the GLUE chip (GLUE's memory/bus role is not covered):
 
-- `tick(cpu_cycles)` avance un compteur de ligne ; à chaque fin de ligne,
-  arme HBL (IPL2) ; à chaque fin de trame (313 lignes en PAL 50 Hz, 263
-  en NTSC 60 Hz — `VideoMode`), arme VBL (IPL4) et incrémente
+- `tick(cpu_cycles)` advances a line counter; at the end of each line, it
+  arms HBL (IPL2); at the end of each frame (313 lines in PAL 50 Hz, 263
+  in NTSC 60 Hz — `VideoMode`), it arms VBL (IPL4) and increments
   `frame_count()`.
-- `ack_hbl`/`ack_vbl` acquittent (à appeler depuis `Bus::irq_ack`).
-- `current_line()`/`frame_count()`/`lines_per_frame()` exposés en lecture
-  pour synchroniser un rendu vidéo sur la position de balayage.
-- **Numérotation alignée sur Hatari** : `current_line()` est une position
-  ABSOLUE dans la trame (0..`lines_per_frame()`), incluant un vrai
-  blanking haut avant la fenêtre visible nominale
-  (`VideoMode::frame_start_line()`, 63 en PAL/34 en NTSC —
-  `VIDEO_START_HBL_50HZ`/`_60HZ` de Hatari) — pas seulement un blanking
-  bas comme dans une version antérieure. `display_line()` renvoie l'index
-  dans le framebuffer (`Some(0..200)`) ou `None` si la ligne courante est
-  en blanking/bordure.
-- **Overscan vertical** (`$FF820A`, `write_sync`/`read_sync`) : un switch
-  50/60Hz (bit 1) survenant dans la bonne fenêtre de cycle
-  (`LINE_REMOVE_BORDER_CYCLE`) près du haut (proche de
-  `frame_start_line()`) ou du bas (proche de la fin de la fenêtre visible
-  nominale) étend la fenêtre affichée de la trame en cours — +29 lignes
-  en haut (34 au lieu de 63), +47 en bas en PAL (façon Hatari,
-  `Video_Update_Glue_State`). Simplification : l'extension, une fois
-  déclenchée pour une trame, n'est jamais annulée par une écriture
-  ultérieure qui reviendrait en arrière (Hatari gère quelques cas
-  d'annulation plus fins, non modélisés ici). Bordure horizontale
-  (gauche/droite, `$FF8260`) : modélisée côté `Shifter`, pas ici — voir sa
-  section dédiée.
+- `ack_hbl`/`ack_vbl` acknowledge (to be called from `Bus::irq_ack`).
+- `current_line()`/`frame_count()`/`lines_per_frame()` exposed for
+  reading, to synchronize video rendering with the scan position.
+- **Numbering aligned with Hatari**: `current_line()` is an ABSOLUTE
+  position within the frame (0..`lines_per_frame()`), including a real
+  top blanking period before the nominal visible window
+  (`VideoMode::frame_start_line()`, 63 in PAL/34 in NTSC —
+  Hatari's `VIDEO_START_HBL_50HZ`/`_60HZ`) — not just a bottom blanking
+  as in an earlier version. `display_line()` returns the index into the
+  framebuffer (`Some(0..200)`) or `None` if the current line is in
+  blanking/border.
+- **Vertical overscan** (`$FF820A`, `write_sync`/`read_sync`): a 50/60Hz
+  switch (bit 1) occurring in the right cycle window
+  (`LINE_REMOVE_BORDER_CYCLE`) near the top (close to
+  `frame_start_line()`) or the bottom (close to the end of the nominal
+  visible window) extends the displayed window of the current frame —
+  +29 lines at the top (34 instead of 63), +47 at the bottom in PAL
+  (Hatari-style, `Video_Update_Glue_State`). Simplification: once
+  triggered for a frame, the extension is never canceled by a later
+  write that would revert it (Hatari handles a few finer cancellation
+  cases, not modeled here). Horizontal border (left/right, `$FF8260`):
+  modeled on the `Shifter` side, not here — see its dedicated section.
 
-Limitations : uniquement le timing (pas le rôle mémoire/bus de GLUE) ;
-constantes 512 cycles/ligne (PAL) et 508 (NTSC) usuelles Hatari/WinSTon,
-non vérifiées contre une référence matérielle formelle.
+Limitations: timing only (not GLUE's memory/bus role); the usual
+Hatari/WinSTon constants of 512 cycles/line (PAL) and 508 (NTSC), not
+verified against a formal hardware reference.
 
-Testé dans `tests/glue.rs` (8 tests) et `tests/atari_st.rs` (overscan
-vertical bout-en-bout).
+Tested in `tests/glue.rs` (8 tests) and `tests/atari_st.rs` (end-to-end
+vertical overscan).
 
 ---
 
 ## ACIA 6850 (`src/peripherals/atari_st/acia.rs`)
 
-`peripherals::atari_st::acia::Acia` modélise une puce MC6850 seule ; l'Atari ST en
-embarque **deux** (clavier, MIDI), chacune une instance séparée dans
-`AtariSt` (`acia_keyboard`/`acia_midi`), dont les IRQ sont OR câblées sur
-`GPIP4` du MFP.
+`peripherals::atari_st::acia::Acia` models a single MC6850 chip; the
+Atari ST has **two** of them onboard (keyboard, MIDI), each a separate
+instance in `AtariSt` (`acia_keyboard`/`acia_midi`), whose IRQs are
+OR-wired onto `GPIP4` of the MFP.
 
-- Registres CONTROL/STATUS et DATA, flags RDRF/TDRE/OVRN/FE fidèles au
-  MC6850 : lire DATA efface RDRF+OVRN ensemble ; écrire CONTROL avec
-  bits0-1=`11` déclenche un Master Reset (efface les flags, réarme TDRE).
-- Pas de FIFO de réception (comme le silicium réel) : un octet reçu alors
-  que le précédent n'a pas été lu déclenche `OVRN` et le nouvel octet est
-  **perdu**.
-- `irq_requested()` : `(RDRF && RIE) || (TDRE && TIE)` — `DCD`/`CTS`
-  toujours à 0 (pas de handshake externe simulé), `PE` toujours à 0 (pas
-  de simulation de parité).
-- `push_rx_byte`/`take_tx_byte` : modèle "au byte".
+- CONTROL/STATUS and DATA registers, RDRF/TDRE/OVRN/FE flags faithful to
+  the MC6850: reading DATA clears RDRF+OVRN together; writing CONTROL
+  with bits0-1=`11` triggers a Master Reset (clears the flags, re-arms
+  TDRE).
+- No receive FIFO (as on real silicon): a byte received while the
+  previous one hasn't been read triggers `OVRN` and the new byte is
+  **lost**.
+- `irq_requested()`: `(RDRF && RIE) || (TDRE && TIE)` — `DCD`/`CTS`
+  always 0 (no external handshake simulated), `PE` always 0 (no parity
+  simulation).
+- `push_rx_byte`/`take_tx_byte`: "byte-level" model.
 
-Testé dans `tests/acia.rs` (7 tests).
+Tested in `tests/acia.rs` (7 tests).
 
 ---
 
 ## IKBD (`src/peripherals/atari_st/ikbd.rs`)
 
-`peripherals::atari_st::ikbd::Ikbd` modélise le contrôleur HD6301
-(clavier/souris/joystick), câblé sur `acia_keyboard` — auparavant absent :
-les commandes envoyées par le TOS pour configurer l'IKBD (reset,
-modes souris…) étaient écrites dans l'ACIA mais jamais lues/interprétées
-(`take_tx_byte` n'était appelé nulle part), et le binaire de démonstration
-gérait lui-même, à la main, une file de sortie ad hoc (`ikbd_tx_queue`).
-Port très largement inspiré du projet compagnon Stay (mêmes constats,
-mêmes correctifs, adaptés à l'absence de joystick ici) :
+`peripherals::atari_st::ikbd::Ikbd` models the HD6301 controller
+(keyboard/mouse/joystick), wired to `acia_keyboard` — previously absent:
+the commands sent by TOS to configure the IKBD (reset, mouse modes…)
+were written to the ACIA but never read/interpreted (`take_tx_byte` was
+never called anywhere), and the demo binary handled an ad hoc output
+queue by hand (`ikbd_tx_queue`) itself. Port very largely inspired by
+the companion project Stay (same findings, same fixes, adapted to the
+absence of a joystick here):
 
-- Réponse d'autotest `0xF1` **différée** (`IKBD_RESET_CYCLES`, 5 000 000
-  cycles) plutôt qu'immédiate au reset : la livrer trop tôt fait arriver
-  l'octet avant que le TOS ait fini de configurer IERB/IMRB du MFP,
-  l'interruption ACIA correspondante (en attente mais encore masquée)
-  étant alors silencieusement effacée par l'écriture ultérieure normale du
-  TOS dans IERB — l'octet n'est ensuite jamais lu, RDRF reste plein en
-  permanence, bloquant tout octet suivant (clavier ET souris) pour
-  toujours.
-- `receive_cmd`/`execute_cmd` : reset (`0x80 0x01`), mode souris relatif
-  (`0x08`) ET absolu (`0x09`, voir ci-dessous), action souris (`0x07`),
-  axe Y (`0x0F`/`0x10`), interrogation de position absolue (`0x0D`),
-  chargement direct de la position interne (`0x0E`) réellement implémentés ;
-  les commandes joystick (non modélisé, pas de frontend manette)
-  consomment quand même le bon nombre d'octets de paramètres pour ne pas
-  désynchroniser le flux de commandes suivant.
-- **Mode souris absolu (`0x09`), bug réel corrigé** : la commande était
-  reconnue (bon nombre d'octets de paramètre consommés) mais totalement
-  ignorée — `execute_cmd` n'avait aucun cas pour `0x09`, donc la souris
-  restait en mode relatif pour toujours et continuait d'émettre des
-  paquets `0xF8` même une fois GEM basculé en mode absolu (ex: ouverture
-  d'une boîte de dialogue modale type Bureau > Informations, qui utilise
-  `0x09` pour borner/calibrer la souris à sa propre zone). Résultat :
-  désynchronisation du flux série côté GEM, mouvement de curseur en
-  apparence "tourné" (les octets `dx`/`dy` mal réinterprétés comme un
-  paquet d'un autre format) tant que la boîte de dialogue reste ouverte,
-  plus un signal sonore répété (comportement d'erreur de GEM face à des
-  données inattendues) — reproduit et diagnostiqué en conditions réelles,
-  confirmé contre Hatari (`ikbd.c`, `IKBD_Cmd_AbsMouseMode`/
-  `IKBD_SendAutoKeyboardCommands`) : en mode absolu, le silicium réel
-  n'envoie **jamais** de paquet automatique sur mouvement — seulement en
-  réponse à `0x0D`, ou sur appui/relâchement de bouton si `0x07` l'a
-  demandé (bits 0-1). `mouse_x`/`mouse_y` restent suivis en PERMANENCE
-  (quel que soit le mode actif) et bornés par les `MaxX`/`MaxY` de la
-  dernière commande `0x09` reçue (639/399 par défaut, avant toute
-  commande) — le bornage ne s'applique qu'au PROCHAIN mouvement, pas
-  rétroactivement à la position déjà suivie.
-- `mouse_move(dx, dy, buttons)` : position absolue interne suivie et
-  bornée (voir ci-dessus), paquet relatif standard `0xF8|boutons, dx, dy`
-  émis seulement si quelque chose a changé (mode relatif uniquement).
-- `AtariSt::tick` relie l'ensemble : drainage de `take_tx_byte` vers
-  `Ikbd::receive_cmd`, livraison d'un octet de `Ikbd::pop_tx` par tick
-  (gardée par RDRF), et **force explicitement un relâchement GPIP4** avant
-  de réarmer RDRF pour l'octet suivant dans le même tick — sur silicium
-  réel, `/IRQ` de l'ACIA remonte réellement le temps de l'intervalle série
-  entre deux octets ; sans ce relâchement forcé, le 2e/3e octet de chaque
-  trame (ex. une trame souris) ne produit jamais de front pour
-  `Mfp::set_gpip_input`, qui est à juste titre edge-triggered — bug exact
-  déjà isolé et corrigé dans Stay.
-- Le binaire de démonstration (`atari_st_sdl2`) échantillonne le
-  mouvement souris une seule fois par trame vidéo plutôt qu'à chaque
-  évènement SDL brut (potentiellement bien plus fréquent que le ~50 Hz
-  réel), et plafonne chaque paquet à ±15 unités (limite réelle du
-  firmware IKBD, pas seulement ±127 du champ signé sur un octet),
-  découpant un déplacement plus grand en plusieurs paquets — même
-  approche que `Machine::flush_input_vbl`/`mouse_move` de Stay.
-- Pré-remplissage RAM supplémentaire au boot "redémarrage à chaud" (voir
-  section suivante) : `$0EE4`/`$0EE5` = `0x11`/`0x11` (porte Timer-C de
-  l'IKBD, normalement posée par le TOS lui-même pendant sa mise en place —
-  sans elle, `ASL.W #3,($0EE4).L; BPL` du gestionnaire Timer C prendrait
-  la mauvaise branche et n'écoulerait jamais les octets IKBD en attente).
+- Self-test response `0xF1` **deferred** (`IKBD_RESET_CYCLES`, 5,000,000
+  cycles) rather than immediate on reset: delivering it too early makes
+  the byte arrive before TOS has finished configuring the MFP's
+  IERB/IMRB, with the corresponding ACIA interrupt (pending but still
+  masked) then silently cleared by TOS's later normal write to IERB —
+  the byte is then never read, RDRF stays permanently full, blocking
+  every subsequent byte (keyboard AND mouse) forever.
+- `receive_cmd`/`execute_cmd`: reset (`0x80 0x01`), relative mouse mode
+  (`0x08`) AND absolute mode (`0x09`, see below), mouse action (`0x07`),
+  Y axis (`0x0F`/`0x10`), absolute position query (`0x0D`), direct
+  loading of the internal position (`0x0E`) actually implemented;
+  joystick commands (not modeled, no gamepad frontend) still consume the
+  correct number of parameter bytes so as not to desynchronize the
+  following command stream.
+- **Absolute mouse mode (`0x09`), real bug fixed**: the command was
+  recognized (correct number of parameter bytes consumed) but completely
+  ignored — `execute_cmd` had no case for `0x09`, so the mouse stayed in
+  relative mode forever and kept emitting `0xF8` packets even after GEM
+  switched to absolute mode (e.g. opening a modal dialog such as
+  Desktop > Info, which uses `0x09` to bound/calibrate the mouse to its
+  own area). Result: desynchronization of the serial stream on the GEM
+  side, cursor movement appearing "rotated" (the `dx`/`dy` bytes
+  misinterpreted as a packet of a different format) as long as the
+  dialog stayed open, plus a repeated beep (GEM's error behavior when
+  faced with unexpected data) — reproduced and diagnosed under real
+  conditions, confirmed against Hatari (`ikbd.c`,
+  `IKBD_Cmd_AbsMouseMode`/`IKBD_SendAutoKeyboardCommands`): in absolute
+  mode, real silicon **never** sends an automatic packet on movement —
+  only in response to `0x0D`, or on button press/release if `0x07`
+  requested it (bits 0-1). `mouse_x`/`mouse_y` are tracked PERMANENTLY
+  (regardless of the active mode) and bounded by the `MaxX`/`MaxY` of the
+  last `0x09` command received (639/399 by default, before any command)
+  — the bounding only applies to the NEXT movement, not retroactively to
+  the position already tracked.
+- `mouse_move(dx, dy, buttons)`: internal absolute position tracked and
+  bounded (see above), standard relative packet `0xF8|buttons, dx, dy`
+  emitted only if something changed (relative mode only).
+- `AtariSt::tick` wires everything together: draining `take_tx_byte` into
+  `Ikbd::receive_cmd`, delivering one byte from `Ikbd::pop_tx` per tick
+  (gated by RDRF), and **explicitly forcing a GPIP4 release** before
+  re-arming RDRF for the next byte within the same tick — on real
+  silicon, the ACIA's `/IRQ` genuinely rises over the serial interval
+  between two bytes; without this forced release, the 2nd/3rd byte of
+  each frame (e.g. a mouse frame) never produces an edge for
+  `Mfp::set_gpip_input`, which is rightly edge-triggered — the exact bug
+  already isolated and fixed in Stay.
+- The demo binary (`atari_st_sdl2`) samples mouse movement only once per
+  video frame rather than on every raw SDL event (potentially much more
+  frequent than the real ~50 Hz), and caps each packet at ±15 units
+  (real IKBD firmware limit, not just the ±127 of a signed byte field),
+  splitting a larger movement across several packets — the same approach
+  as Stay's `Machine::flush_input_vbl`/`mouse_move`.
+- Additional RAM pre-fill at "warm restart" boot (see next section):
+  `$0EE4`/`$0EE5` = `0x11`/`0x11` (IKBD Timer-C gate, normally set by
+  TOS itself during its setup — without it, the Timer C handler's
+  `ASL.W #3,($0EE4).L; BPL` would take the wrong branch and never drain
+  pending IKBD bytes).
 
-Testé dans `src/peripherals/atari_st/ikbd.rs` (15 tests unitaires, dont le
-mode absolu : aucun paquet automatique sur mouvement, bornage MaxX/MaxY,
-rapport conditionnel sur bouton via `0x07`, retour au mode relatif via
-`0x08`, chargement direct via `0x0E`).
+Tested in `src/peripherals/atari_st/ikbd.rs` (15 unit tests, including
+absolute mode: no automatic packet on movement, MaxX/MaxY bounding,
+conditional button reporting via `0x07`, return to relative mode via
+`0x08`, direct loading via `0x0E`).
 
 ---
 
 ## Audio (YM2149, DMA Sound, Microwire/LMC1992)
 
-Pipeline complet, du silicium à la sortie SDL2, cadencé une fois par
-échantillon de sortie (44100 Hz fixe, `atari_st_sdl2.rs::mix_sample` +
-suite du traitement dans `main`) : YM2149 (3 canaux) + DMA Sound (PCM STE)
-mixés en un échantillon stéréo brut, DC retiré (artefact du mixage, pas un
-phénomène physique), gain + filtre graves/aigus Microwire appliqués en une
-passe, bruitage mécanique du lecteur ajouté par-dessus.
+Complete pipeline, from silicon to SDL2 output, clocked once per output
+sample (fixed 44100 Hz, `atari_st_sdl2.rs::mix_sample` + further
+processing in `main`): YM2149 (3 channels) + DMA Sound (STE PCM) mixed
+into a raw stereo sample, DC removed (a mixing artifact, not a physical
+phenomenon), Microwire gain + bass/treble filter applied in one pass,
+drive mechanical sound added on top.
 
 ### YM2149 (`src/peripherals/atari_st/ym2149.rs`)
 
-`peripherals::atari_st::ym2149::Ym2149` modélise la puce seule (compatible registre à
-registre avec le General Instrument AY-3-8910) : 3 canaux de tonalité
-carrée, un générateur de bruit partagé, un générateur d'enveloppe, 2 ports
-d'E/S 8 bits. Mappée dans `AtariSt` (champ public `ym2149`) au sélecteur
-`0xFF8800` / données `0xFF8802`, cadencée par `AtariSt::tick` (CPU/4 = 2 MHz
-sur ST/STE). Ne génère pas d'IPL (pas d'interruption sur ST).
+`peripherals::atari_st::ym2149::Ym2149` models the chip alone
+(register-for-register compatible with the General Instrument
+AY-3-8910): 3 square-tone channels, a shared noise generator, an
+envelope generator, 2 8-bit I/O ports. Mapped into `AtariSt` (public
+field `ym2149`) at selector `0xFF8800` / data `0xFF8802`, clocked by
+`AtariSt::tick` (CPU/4 = 2 MHz on ST/STE). Does not generate an IPL (no
+interrupt on ST).
 
-- 16 registres avec masquage exact de leur largeur réelle (ex: tone coarse
-  4 bits, période de bruit 5 bits, forme d'enveloppe 4 bits).
-- Générateurs de tonalité (3×) et de bruit (LFSR 17 bits, polynôme
-  standard bit0 XOR bit3) pilotés par `tick()`.
-- Générateur d'enveloppe : rampe 5 bits (résolution double de l'ampli fixe
-  4 bits), table des 10 formes standard (Continue/Attack/Alternate/Hold).
-  Écrire le registre de forme relance toujours l'enveloppe depuis le
-  début (comportement documenté du silicium).
-- `channel_level(canal)` : niveau 0-31 combinant le portillonnage
-  tonalité/bruit (`MIXER`) et l'amplitude fixe (convertie 4->5 bits via
-  `VOLUME_4_TO_5`, table MESURÉE reprise de Hatari — PAS un simple ×2, voir
-  ci-dessous) ou l'enveloppe (déjà 0-31 nativement).
-- `take_averaged_levels()` : moyenne temporelle des niveaux depuis le
-  dernier appel (anti-repliement pour les tonalités aiguës — spécifique à
-  Rust68, ni Hatari ni Steem SSE n'ont besoin de ça car ils échantillonnent
-  à un rythme interne bien plus fin que la sortie).
-- **Mixage 3 canaux non-linéaire** (`mix_channels_model`, façon Hatari
-  `YM2149_BuildModelVolumeTable`/`YM_MODEL_MIXING`, `sound.c`) : modélise le
-  DAC réel comme trois résistances de tirage réglables en parallèle sur une
-  résistance de charge fixe (diviseur de tension), PAS une simple somme —
-  combiner 2-3 canaux à pleine amplitude sature nettement en dessous de 3×
-  une seule voie sur le vrai silicium. Constantes (`WARP`, `FOURTH2`)
-  reprises telles quelles de Hatari (modèle attribué à David Savinkoff,
-  d'après des mesures réelles de Paulo Simoes/Benjamin Gerard) ; Steem SSE
-  confirme indépendamment le phénomène (sa propre table mesurée "LJBK",
-  commentaire : "there's some interaction between channels on the ST. The
-  sound is very saturated"). Table de conductances construite une fois
-  (32 valeurs), interpolée linéairement pour les niveaux FRACTIONNAIRES que
-  renvoie `take_averaged_levels` (le modèle de Hatari est nativement discret
-  0-31, cette interpolation est une adaptation, pas une approximation de la
-  formule elle-même).
-- Ports A/B : registres 8 bits bruts, direction par bits 6-7 de `MIXER` ;
-  signification des bits (sélection lecteur, joystick, Centronics…) non
-  interprétée, à charge du board/de l'appelant.
+- 16 registers with exact masking of their real width (e.g. tone coarse
+  4 bits, noise period 5 bits, envelope shape 4 bits).
+- Tone generators (3×) and noise generator (17-bit LFSR, standard
+  bit0 XOR bit3 polynomial) driven by `tick()`.
+- Envelope generator: 5-bit ramp (double the resolution of the fixed
+  4-bit amplitude), table of the 10 standard shapes
+  (Continue/Attack/Alternate/Hold). Writing the shape register always
+  restarts the envelope from the beginning (documented silicon
+  behavior).
+- `channel_level(channel)`: level 0-31 combining the tone/noise gating
+  (`MIXER`) and the fixed amplitude (converted 4->5 bits via
+  `VOLUME_4_TO_5`, a MEASURED table taken from Hatari — NOT a simple ×2,
+  see below) or the envelope (already 0-31 natively).
+- `take_averaged_levels()`: time average of levels since the last call
+  (anti-aliasing for high tones — specific to Rust68, neither Hatari nor
+  Steem SSE need this because they sample at an internal rate far finer
+  than the output rate).
+- **Non-linear 3-channel mixing** (`mix_channels_model`, Hatari-style
+  `YM2149_BuildModelVolumeTable`/`YM_MODEL_MIXING`, `sound.c`): models
+  the real DAC as three adjustable pull-up resistors in parallel on a
+  fixed load resistor (voltage divider), NOT a simple sum — combining
+  2-3 channels at full amplitude saturates well below 3× a single voice
+  on real silicon. Constants (`WARP`, `FOURTH2`) taken as-is from Hatari
+  (model attributed to David Savinkoff, based on real measurements by
+  Paulo Simoes/Benjamin Gerard); Steem SSE independently confirms the
+  phenomenon (its own measured "LJBK" table, comment: "there's some
+  interaction between channels on the ST. The sound is very saturated").
+  Conductance table built once (32 values), linearly interpolated for
+  the FRACTIONAL levels that `take_averaged_levels` returns (Hatari's
+  model is natively discrete 0-31, this interpolation is an adaptation,
+  not an approximation of the formula itself).
+- Ports A/B: raw 8-bit registers, direction set by bits 6-7 of `MIXER`;
+  bit meaning (drive select, joystick, Centronics…) not interpreted, left
+  to the board/caller.
 
-Testé dans `tests/ym2149.rs` (15 tests, dont la saturation non-linéaire du
-mixage 3 canaux et sa monotonie/interpolation).
+Tested in `tests/ym2149.rs` (15 tests, including the non-linear
+saturation of 3-channel mixing and its monotonicity/interpolation).
 
-### DMA Sound STE (`src/peripherals/atari_st/dma_sound.rs`)
+### STE DMA Sound (`src/peripherals/atari_st/dma_sound.rs`)
 
-`peripherals::atari_st::dma_sound::DmaSound` lit des échantillons PCM 8
-bits signés depuis la RAM à l'une des 4 fréquences matérielles
-(6258/12517/25033/50066 Hz), mono ou stéréo, avec boucle/arrêt de fin de
-trame et conversion vers la fréquence de sortie hôte via un accumulateur
-32.32 fixe (même technique que Hatari, `dmaSnd.c`). Mappé dans `AtariSt`
-(`$FF8900`-`$FF8921`), XSINT câblé sur Timer A du MFP à chaque fin de
-trame.
+`peripherals::atari_st::dma_sound::DmaSound` reads signed 8-bit PCM
+samples from RAM at one of 4 hardware frequencies (6258/12517/25033/50066
+Hz), mono or stereo, with end-of-frame loop/stop and conversion to the
+host output frequency via a fixed 32.32 accumulator (same technique as
+Hatari, `dmaSnd.c`). Mapped into `AtariSt` (`$FF8900`-`$FF8921`), XSINT
+wired to the MFP's Timer A on each end of frame.
 
-Limitation documentée (voir sa doc de module) : pas de FIFO 8 octets
-matériel (lecture au rythme HBL sur silicium réel, ici au rythme exact de
-chaque échantillon consommé) — effet audible réel mais étroit, seulement
-pour les logiciels qui réécrivent le tampon d'échantillons PENDANT la
-lecture (2 cas nommés côté Hatari : "Mental Hangover", "Power Up Plus" —
-aucun cas connu dans ce projet). Steem SSE lui-même ne modélise pas non
-plus cette FIFO pour le son DMA STE. À reconsidérer si un cas concret
-révèle un problème.
+Documented limitation (see its module doc): no 8-byte hardware FIFO
+(read at the HBL rate on real silicon, here at the exact rate of each
+sample consumed) — a real but narrow audible effect, only for software
+that rewrites the sample buffer WHILE it plays (2 cases named on the
+Hatari side: "Mental Hangover", "Power Up Plus" — no known case in this
+project). Steem SSE itself does not model this FIFO for STE DMA sound
+either. To be reconsidered if a concrete case reveals a problem.
 
-Testé dans `src/peripherals/atari_st/dma_sound.rs` (tests internes, 3
-tests) et `tests/atari_st.rs` (lecture bout-en-bout via le bus, XSINT/Timer
-A).
+Tested in `src/peripherals/atari_st/dma_sound.rs` (internal tests, 3
+tests) and `tests/atari_st.rs` (end-to-end playback via the bus,
+XSINT/Timer A).
 
 ### Microwire / LMC1992 (`src/peripherals/atari_st/microwire.rs`)
 
-`peripherals::atari_st::microwire::Microwire` modélise le mixeur externe
-LMC1992 (STE), piloté en série via `$FF8922` (DATA)/`$FF8924` (MASK) :
-volume maître, volume gauche/droite indépendant, ET filtre graves/aigus —
-appliqué au signal de sortie FINAL (PSG *et* DMA Sound déjà mélangés), pas
-à une source individuelle.
+`peripherals::atari_st::microwire::Microwire` models the external
+LMC1992 mixer (STE), driven serially via `$FF8922` (DATA)/`$FF8924`
+(MASK): master volume, independent left/right volume, AND a bass/treble
+filter — applied to the FINAL output signal (PSG *and* DMA Sound already
+mixed), not to an individual source.
 
-- Décodage de commande : reproduit l'algorithme du LMC1992 (préfixe
-  d'adresse, sélecteur de commande, valeur), tables de volume (maître,
-  gauche/droite) reprises telles quelles de Hatari.
-- **Filtre graves/aigus** (`filter_left`/`filter_right`, façon Hatari
+- Command decoding: reproduces the LMC1992 algorithm (address prefix,
+  command selector, value), volume tables (master, left/right) taken
+  as-is from Hatari.
+- **Bass/treble filter** (`filter_left`/`filter_right`, Hatari-style
   `DmaSnd_Bass_Shelf`/`Treble_Shelf`/`Set_Tone_Level`/`IIRfilterL`/`R`,
-  `dmaSnd.c`) : deux filtres "plateau" (shelf) du premier ordre — graves
-  (coude 118.2763 Hz), aigus (coude 8438.756 Hz), valeurs mesurées sur le
-  vrai circuit LMC1992 — combinés algébriquement en un seul biquad, 13
-  paliers de gain (-12dB à +12dB par pas de 2dB) précalculés pour la
-  fréquence de sortie fixe de Rust68 (44100 Hz). Le gain de volume
-  s'applique à l'ENTRÉE du filtre (même passe), pas en aval — la
-  cartouche/le binaire SDL2 lissent ce gain dans le temps AVANT de
-  l'injecter, pour éviter un "clic" de zipper noise sur un changement
-  brutal. État du filtre (2 échantillons intermédiaires) INDÉPENDANT par
-  canal gauche/droit. Steem SSE implémente aussi un filtre graves/aigus
-  mais avec une topologie différente (forme "Audio EQ Cookbook") et son
-  propre code admet ne pas être fidèle ("does give bass and treble but
-  certainly not close to the STE") — c'est pourquoi la version Hatari a
-  été portée, pas celle de Steem.
-- Non modélisé : mode de mixage (pas d'effet audible avec une seule source
-  de sortie hôte), temporisation série réelle (décodage instantané,
-  documenté sans conséquence fonctionnelle).
+  `dmaSnd.c`): two first-order "shelf" filters — bass (118.2763 Hz
+  knee), treble (8438.756 Hz knee), values measured on the real
+  LMC1992 circuit — algebraically combined into a single biquad, 13 gain
+  steps (-12dB to +12dB in 2dB increments) precomputed for Rust68's
+  fixed output frequency (44100 Hz). The volume gain applies at the
+  filter's INPUT (same pass), not downstream — the cartridge/SDL2 binary
+  smooths this gain over time BEFORE injecting it, to avoid a zipper
+  noise "click" on an abrupt change. Filter state (2 intermediate
+  samples) INDEPENDENT per left/right channel. Steem SSE also implements
+  a bass/treble filter but with a different topology ("Audio EQ
+  Cookbook" form) and its own code admits it is not faithful ("does give
+  bass and treble but certainly not close to the STE") — which is why
+  the Hatari version was ported, not Steem's.
+- Not modeled: mixing mode (no audible effect with a single host output
+  source), real serial timing (instantaneous decoding, documented as
+  having no functional consequence).
 
-Testé dans `src/peripherals/atari_st/microwire.rs` (tests internes, 9
-tests dont le comportement du filtre en régime établi pour les graves à
-fond/au minimum, la transparence exacte au réglage par défaut, et
-l'indépendance des canaux) et `tests/atari_st.rs` (câblage bout-en-bout du
-volume maître).
+Tested in `src/peripherals/atari_st/microwire.rs` (internal tests, 9
+tests including filter behavior at steady state for bass at maximum/
+minimum, exact transparency at the default setting, and channel
+independence) and `tests/atari_st.rs` (end-to-end master volume wiring).
 
 ---
 
 ## Shifter (`src/peripherals/atari_st/shifter.rs`)
 
-`peripherals::atari_st::shifter::Shifter` modélise la puce vidéo seule : lit la RAM
-vidéo ligne par ligne et la convertit en pixels RGB 24 bits selon la
-résolution programmée (basse 320×200/4 plans, moyenne 640×200/2 plans,
-haute 640×400/1 plan monochrome). Mappé dans `AtariSt` (champ public
-`shifter`, adresses `$FF8201`/`03` base vidéo, `$FF8205`/`07`/`09` compteur
-vidéo, `$FF8240`-`$FF825E` palette 16 couleurs, `$FF8260` résolution).
+`peripherals::atari_st::shifter::Shifter` models the video chip alone: it
+reads video RAM line by line and converts it to 24-bit RGB pixels
+according to the programmed resolution (low 320×200/4 planes, medium
+640×200/2 planes, high 640×400/1 monochrome plane). Mapped into
+`AtariSt` (public field `shifter`, addresses `$FF8201`/`03` video base,
+`$FF8205`/`07`/`09` video counter, `$FF8240`-`$FF825E` 16-color palette,
+`$FF8260` resolution).
 
-- Déinterlacement des plans (format bitplane word-interleaved standard
-  Atari ST : pour un groupe de 16 pixels, un mot consécutif par plan) —
-  fait mot par mot puis bit par bit, MSB en premier.
-- Palette 16 couleurs, deux formats selon `set_ste_palette`/
-  `MachineProfile::ste_palette` (câblé dans `AtariSt::from_model`) : ST
-  (9 bits, 3 bits/composante, masque `0x0777`) ou STE (12 bits, 4
-  bits/composante, masque `0x0FFF`) — les deux masques vérifiés contre
-  Hatari (`video.c`, `Video_ColorReg_WriteWord`).
-- **Bug réel corrigé** : en palette STE, le bit 3 de chaque nibble
-  couleur n'est PAS le bit de poids fort d'une valeur 4 bits normale —
-  c'est un bit de précision fine ajouté EN BAS par le matériel pour
-  rester compatible avec le format 3 bits du ST (bits 2-0, mêmes
-  positions bus). La vraie intensité est `(bits2-0 << 1) | bit3`, pas le
-  nibble lu tel quel (confirmé contre Hatari, `conv_st.c`,
-  `ConvST_SetupRGBTable`). Avant correctif, `0x0777` (le maximum "façon
-  ST 3 bits", ce qu'écrit naturellement un jeu STE pour une composante à
-  pleine intensité) donnait RGB 119/255 (47 %) au lieu de 238/255 (93 %,
-  un cran sous le vrai blanc) — un assombrissement systématique et sévère
-  de toute palette construite ainsi, cohérent avec des couleurs de jeu
-  rapportées "très sombres". Voir `ste_nibble_to_intensity` dans le
-  module.
-- Câblé dans `AtariSt::tick` sur le rythme HBL/VBL du GLUE : détecte les
-  changements de `Glue::current_line`/`frame_count` (via un compteur de
-  ligne **absolu**, pas le compteur bouclant du GLUE) et alimente
-  `AtariSt::framebuffer` (`Vec<Vec<(u8,u8,u8)>>`, une entrée par ligne).
-- **Défilement fin STE cycle-exact** (`$FF8264`/`$FF8265` HorScroll SANS/
-  AVEC préchargement, `$FF820F` LineWidth), façon Hatari. Hatari lui-même
-  ne fait pas de rendu pixel-par-pixel en temps réel : il horodate les
-  écritures de registre pendant la ligne pour décider où elles
-  s'appliquent, puis convertit la ligne entière d'un coup à HBL — modèle
-  déjà en place ici (`render_scanline` par ligne), pas de refonte du
-  pipeline nécessaire. `Glue` expose 3 nouveaux accesseurs
-  (`cycles_in_line`/`line_start_cycle`/`line_end_cycle`, 56/376 en PAL,
-  52/372 en NTSC) permettant au board de calculer si une écriture
-  s'applique à la ligne EN COURS ou est différée à la suivante
-  (`pending_h_scroll`/`pending_line_width`, committés en fin de
-  `render_scanline`) — seuils identiques à Hatari (`video.c`,
-  `Video_HorScroll_Write`/`Video_LineWidth_WriteByte`). `$FF8265` (avec
-  préchargement) lit un groupe de 16 pixels en plus par ligne pour remplir
-  le bord droit sans perte ; `$FF8264` (sans) noircit les 16 premiers
-  pixels (registre à décalage pas encore chargé). Hors périmètre,
-  délibérément : le bug "`$8265` puis `$8264`=0" (ligne à 336 pixels,
-  démos spécifiques), variantes de timing par révision de carte mère STF
-  — aucun rapport avec le mécanisme de défilement lui-même.
-- **Suppression de bordure/overscan (façon Hatari, sauf mention contraire)** :
-  l'overscan VERTICAL (haut/bas, `$FF820A`) est modélisé — voir section
-  GLUE ci-dessus, `Glue::write_sync`/`display_line`. Une PARTIE de
-  l'overscan HORIZONTAL est modélisée (`Shifter::write_resolution`/
-  `write_sync`, module `border`) : `LEFT_OFF_2_STE` (bordure gauche, trick
-  hi-res puis retour pile au cycle 4, +20 octets, variante STE courte
-  uniquement — pas la variante ST d'origine avec stabilisateur moyenne
-  résolution), `RIGHT_OFF` (bordure droite via `$FF820A` dans la fenêtre
-  `]372,376]`, +44 octets), et les nudges `LEFT_PLUS_2`/`RIGHT_MINUS_2`
-  (±2 octets, switch 60Hz précoce). Constantes de cycle et effets en
-  octets repris tels quels de Hatari (`video.h`/`video.c`,
-  `Video_Update_Glue_State`, valeurs machine STE), y compris les fenêtres
-  d'annulation PROPRES à chaque mécanisme sur un retour au 50Hz
-  (`LEFT_PLUS_2` jusqu'au cycle 52, `RIGHT_MINUS_2`/`RIGHT_OFF` jusqu'au
-  cycle 376 — pas une annulation globale, vérifié contre `video.c`).
-  `STOP_MIDDLE` (ligne raccourcie de 106 octets, switch hi-res en milieu
-  de ligne, `]4,164]`) et `RIGHT_OFF_FULL` (suppression TOTALE de la
-  bordure droite, +22 octets EN PLUS de `RIGHT_OFF`, switch hi-res dans
-  `]164,376]`, qui FORCE `LEFT_OFF_2_STE` dès le DÉBUT de la ligne
-  SUIVANTE — cascade inter-lignes, `pending_left_off_next_line`) sont
-  aussi modélisés, déclenchés par `Shifter::write_resolution` (pas
-  `$FF820A`). Limitations documentées (voir la doc de module de
-  `Shifter`) : `BORDERBYTES_*` calibrés pour la basse résolution et
-  appliqués tels quels aux autres résolutions (pas de mise à l'échelle
-  par plan) ; bordure gauche/droite rendue INDÉPENDAMMENT du défilement
-  fin STE (pas de fidélité si les deux tricks sont combinés sur la même
-  ligne) ; `RIGHT_MINUS_2` sans `RIGHT_OFF` n'a pas d'effet ; annulation
-  de `STOP_MIDDLE` modélisée via un retour de résolution (`$FF8260`,
-  avant le cycle 164), pas via `$FF820A` comme le fait réellement Hatari
-  dans ce cas précis (déviation documentée, choix de conception) ; une
-  fois déclenché, `RIGHT_OFF_FULL` n'est pas annulable dans la même ligne
-  (Hatari a une fenêtre d'annulation via `$FF820A`, non modélisée).
-  **`OVERSCAN_MED_RES`/`FOUR_BIT_SCROLL` (bordure gauche moyenne résolution
-  affinée) : modélisés, mais d'après Steem SSE, pas Hatari.** Recherche
-  faite d'abord côté Hatari (`video.c`, `Video_WriteToGlueRes`) : la
-  détection y est une pile d'heuristiques reverse-engineered au cas par
-  cas sur des démos précises (branches littéralement commentées "No
-  Cooper", "PYM", "ST Connexion", chacune avec ses propres seuils de
-  cycle), dont deux constantes de décalage spécifiques STE que Hatari
-  lui-même qualifie de non vérifiées ("should be measured on real STE",
-  `video.c`, commentaires près des lignes 3940-3981) — jugé trop fragile
-  à porter tel quel. Steem SSE (autre émulateur ST/STE open source,
-  `glue.cpp`, `TGlue::CheckSideOverscan`) modélise le MÊME trick avec une
-  approche généralisable : au lieu de seuils fixes, il mesure le nombre de
-  cycles RÉELLEMENT écoulés entre changements de résolution successifs
-  dans la ligne (historique des écritures `$FF8260`) — les fenêtres de
-  cycle convergent bien avec celles de Hatari (corroboration réelle), et
-  cette formule GÉNÉRALE (pas des seuils figés cas par cas) a été jugée
-  portable. C'est celle-ci qui est implémentée
-  (`Shifter::detect_med_res_tricks`/`resolution_write_history`) :
-  précondition `LEFT_OFF_2_STE` déjà actif sur la ligne (ces deux tricks
-  affinent une bordure gauche déjà révélée, ils ne la déclenchent pas
-  eux-mêmes) ; `OVERSCAN_MED_RES` (dernier passage en moyenne résolution
-  dans `]24,48]`) et `FOUR_BIT_SCROLL` (même déclencheur, fenêtre
-  `[16,48]`, mesure aussi le changement suivant) décalent la position de
-  LECTURE de la bordure gauche (façon `SHIFT_SDP` de Steem) sans changer
-  sa largeur ni l'avance du compteur vidéo. Limitations documentées (voir
-  la doc de module de `Shifter`) : le garde-fou Steem
-  `!ShiftModeChangeAtCycle(...)` n'est pas reproduit (fonction non
-  entièrement comprise) ; `HblPixelShift` (décalage fin au niveau du
-  pixel, via le registre `hscroll`, pour deux valeurs de cycle précises)
-  n'est pas modélisé — Steem lui-même qualifie cette valeur de "peut-être
-  venue de l'auteur de la démo", donc pas davantage vérifiée que le reste.
+- Bitplane deinterleaving (standard Atari ST word-interleaved bitplane
+  format: for a group of 16 pixels, one consecutive word per plane) —
+  done word by word then bit by bit, MSB first.
+- 16-color palette, two formats depending on `set_ste_palette`/
+  `MachineProfile::ste_palette` (wired in `AtariSt::from_model`): ST
+  (9 bits, 3 bits/component, `0x0777` mask) or STE (12 bits, 4
+  bits/component, `0x0FFF` mask) — both masks checked against Hatari
+  (`video.c`, `Video_ColorReg_WriteWord`).
+- **Real bug fixed**: in the STE palette, bit 3 of each color nibble is
+  NOT the high-order bit of a normal 4-bit value — it is a fine-precision
+  bit added at the BOTTOM by the hardware to stay compatible with the
+  ST's 3-bit format (bits 2-0, same bus positions). The real intensity
+  is `(bits2-0 << 1) | bit3`, not the nibble read as-is (confirmed
+  against Hatari, `conv_st.c`, `ConvST_SetupRGBTable`). Before the fix,
+  `0x0777` (the "ST 3-bit style" maximum, what an STE game naturally
+  writes for a component at full intensity) gave RGB 119/255 (47%)
+  instead of 238/255 (93%, one notch below true white) — a systematic
+  and severe darkening of any palette built this way, consistent with
+  game colors reported as "very dark". See `ste_nibble_to_intensity` in
+  the module.
+- Wired into `AtariSt::tick` on the GLUE's HBL/VBL rhythm: detects
+  changes in `Glue::current_line`/`frame_count` (via an **absolute**
+  line counter, not the GLUE's wrapping counter) and feeds
+  `AtariSt::framebuffer` (`Vec<Vec<(u8,u8,u8)>>`, one entry per line).
+- **Cycle-exact STE fine scrolling** (`$FF8264`/`$FF8265` HorScroll
+  WITHOUT/WITH preload, `$FF820F` LineWidth), Hatari-style. Hatari itself
+  does not do real-time pixel-by-pixel rendering: it timestamps register
+  writes during the line to decide where they apply, then converts the
+  whole line at once at HBL — a model already in place here
+  (`render_scanline` per line), no pipeline overhaul needed. `Glue`
+  exposes 3 new accessors (`cycles_in_line`/`line_start_cycle`/
+  `line_end_cycle`, 56/376 in PAL, 52/372 in NTSC) letting the board
+  compute whether a write applies to the CURRENT line or is deferred to
+  the next one (`pending_h_scroll`/`pending_line_width`, committed at the
+  end of `render_scanline`) — thresholds identical to Hatari (`video.c`,
+  `Video_HorScroll_Write`/`Video_LineWidth_WriteByte`). `$FF8265` (with
+  preload) reads one extra group of 16 pixels per line to fill the right
+  edge without loss; `$FF8264` (without) blackens the first 16 pixels
+  (shift register not yet loaded). Deliberately out of scope: the
+  "`$8265` then `$8264`=0" bug (336-pixel line, specific demos), timing
+  variants across STF motherboard revisions — unrelated to the
+  scrolling mechanism itself.
+- **Border/overscan removal (Hatari-style unless otherwise noted)**: the
+  VERTICAL overscan (top/bottom, `$FF820A`) is modeled — see the GLUE
+  section above, `Glue::write_sync`/`display_line`. Part of the
+  HORIZONTAL overscan is modeled (`Shifter::write_resolution`/
+  `write_sync`, `border` module): `LEFT_OFF_2_STE` (left border, hi-res
+  trick then a stack-precise return at cycle 4, +20 bytes, short STE
+  variant only — not the original ST variant with medium-resolution
+  stabilizer), `RIGHT_OFF` (right border via `$FF820A` in the
+  `]372,376]` window, +44 bytes), and the `LEFT_PLUS_2`/`RIGHT_MINUS_2`
+  nudges (±2 bytes, early 60Hz switch). Cycle constants and byte effects
+  taken as-is from Hatari (`video.h`/`video.c`, `Video_Update_Glue_State`,
+  STE machine values), including the cancellation windows SPECIFIC to
+  each mechanism on a return to 50Hz (`LEFT_PLUS_2` up to cycle 52,
+  `RIGHT_MINUS_2`/`RIGHT_OFF` up to cycle 376 — not a global
+  cancellation, checked against `video.c`). `STOP_MIDDLE` (line
+  shortened by 106 bytes, hi-res switch mid-line, `]4,164]`) and
+  `RIGHT_OFF_FULL` (TOTAL removal of the right border, +22 bytes ON TOP
+  OF `RIGHT_OFF`, hi-res switch in `]164,376]`, which FORCES
+  `LEFT_OFF_2_STE` from the START of the NEXT line — cross-line cascade,
+  `pending_left_off_next_line`) are also modeled, triggered by
+  `Shifter::write_resolution` (not `$FF820A`). Documented limitations
+  (see `Shifter`'s module doc): `BORDERBYTES_*` calibrated for low
+  resolution and applied as-is to other resolutions (no per-plane
+  scaling); left/right border rendered INDEPENDENTLY of STE fine
+  scrolling (no fidelity if both tricks are combined on the same line);
+  `RIGHT_MINUS_2` without `RIGHT_OFF` has no effect; `STOP_MIDDLE`
+  cancellation modeled via a resolution change back (`$FF8260`, before
+  cycle 164), not via `$FF820A` as Hatari actually does in this specific
+  case (documented deviation, design choice); once triggered,
+  `RIGHT_OFF_FULL` cannot be canceled within the same line (Hatari has a
+  cancellation window via `$FF820A`, not modeled).
+  **`OVERSCAN_MED_RES`/`FOUR_BIT_SCROLL` (refined medium-resolution left
+  border): modeled, but based on Steem SSE, not Hatari.** Research was
+  done on the Hatari side first (`video.c`, `Video_WriteToGlueRes`):
+  detection there is a stack of case-by-case reverse-engineered
+  heuristics tied to specific demos (branches literally commented "No
+  Cooper", "PYM", "ST Connexion", each with its own cycle thresholds),
+  including two STE-specific offset constants that Hatari itself labels
+  unverified ("should be measured on real STE", `video.c`, comments near
+  lines 3940-3981) — judged too fragile to port as-is. Steem SSE
+  (another open-source ST/STE emulator, `glue.cpp`,
+  `TGlue::CheckSideOverscan`) models the SAME trick with a generalizable
+  approach: instead of fixed thresholds, it measures the number of
+  cycles that ACTUALLY elapsed between successive resolution changes
+  within the line (history of `$FF8260` writes) — the cycle windows
+  converge well with Hatari's (real corroboration), and this GENERAL
+  formula (not case-by-case fixed thresholds) was judged portable. This
+  is the one implemented (`Shifter::detect_med_res_tricks`/
+  `resolution_write_history`): precondition that `LEFT_OFF_2_STE` is
+  already active on the line (these two tricks refine an already
+  revealed left border, they do not trigger it themselves);
+  `OVERSCAN_MED_RES` (last switch to medium resolution within `]24,48]`)
+  and `FOUR_BIT_SCROLL` (same trigger, `[16,48]` window, also measures
+  the following change) shift the READ position of the left border
+  (Steem's `SHIFT_SDP` style) without changing its width or the video
+  counter's advance. Documented limitations (see `Shifter`'s module
+  doc): Steem's guard `!ShiftModeChangeAtCycle(...)` is not reproduced
+  (function not fully understood); `HblPixelShift` (fine pixel-level
+  offset, via the `hscroll` register, for two precise cycle values) is
+  not modeled — Steem itself labels this value as "maybe coming from the
+  demo author", so no more verified than the rest.
 
-Limitations : compteur vidéo toujours accepté en écriture (comportement
-STE, pas lecture-seule comme sur ST d'origine) ; convention de polarité du
-mode haute résolution (bit=1 → noir) non vérifiée contre une capture
-matérielle réelle ; pas de contention DRAM/vidéo modélisée pour l'accès
-Shifter.
+Limitations: video counter always accepted for writes (STE behavior, not
+read-only as on the original ST); high-resolution mode polarity
+convention (bit=1 → black) not verified against a real hardware capture;
+no DRAM/video contention modeled for Shifter access.
 
-Testé dans `tests/shifter.rs` (35 tests, dont le réordonnancement du bit
-de précision fine STE, le défilement fin avec/sans préchargement, et les
-mécanismes de bordure horizontale `LEFT_OFF_2_STE`/`RIGHT_OFF`/nudges/
-`STOP_MIDDLE`/`RIGHT_OFF_FULL`/`OVERSCAN_MED_RES`/`FOUR_BIT_SCROLL`) et
-`tests/atari_st.rs` (rendu de trame PAL complète de 313 lignes, "gating"
-cycle-exact des écritures de défilement/largeur de ligne selon la
-position dans la ligne, entre autres tests bout-en-bout).
+Tested in `tests/shifter.rs` (35 tests, including reordering of the STE
+fine-precision bit, fine scrolling with/without preload, and the
+horizontal border mechanisms `LEFT_OFF_2_STE`/`RIGHT_OFF`/nudges/
+`STOP_MIDDLE`/`RIGHT_OFF_FULL`/`OVERSCAN_MED_RES`/`FOUR_BIT_SCROLL`) and
+`tests/atari_st.rs` (full 313-line PAL frame rendering, cycle-exact
+"gating" of scroll/line-width writes depending on position within the
+line, among other end-to-end tests).
 
 ---
 
 ## WD1772 (`src/peripherals/atari_st/wd1772.rs`)
 
-`peripherals::atari_st::wd1772::Wd1772` modélise le contrôleur de disquette seul :
-4 registres (Commande/Statut, Piste, Secteur, Donnée) multiplexés par les
-lignes A1-A0, jeu de commandes Type I (Restore/Seek/Step/Step-In/
-Step-Out), Type II (Read/Write Sector, mono et multi-secteur) et Type IV
-(Force Interrupt).
+`peripherals::atari_st::wd1772::Wd1772` models the floppy controller
+alone: 4 registers (Command/Status, Track, Sector, Data) multiplexed by
+the A1-A0 lines, Type I command set (Restore/Seek/Step/Step-In/
+Step-Out), Type II (Read/Write Sector, single- and multi-sector) and
+Type IV (Force Interrupt).
 
-- Le disque est abstrait via le trait `FloppyDisk` (adressage piste/face/
-  secteur, pas octet), objet (`Box<dyn FloppyDisk>` côté `AtariSt`) pour
-  accepter plusieurs formats sans coupler le board à l'un d'eux :
-  `RawDiskImage` pour le `.st` brut (secteurs linéaires), `stx::StxImage`
-  pour un lecteur `.stx` (Pasti) minimal — reverse-engineé par inspection
-  directe de fichiers réels puis recoupé avec la doc publique du format et
-  Hatari, expose désormais `bit_position` (position réelle du champ ID sur
-  la piste physique, utilisée par `Wd1772::cycles_to_target_sector` pour un
-  calcul de latence rotationnelle fidèle même sur une piste au formatage
-  non standard) — et `msa::parse` pour `.msa` (Magic Shadow Archiver,
-  simple conteneur compressé RLE piste par piste, décompressé en mémoire
-  vers une `RawDiskImage` équivalente, aucune métadonnée de protection dans
-  ce format).
-- Transfert Type II via le trait `DmaChannel` (`pull`/`push` un octet à la
-  fois) : le WD1772 ne connaît pas la RAM, seulement le disque et ce
-  canal — c'est au board de l'implémenter avec accès à sa RAM.
-- **Temporisation réelle, pas instantanée** : `execute_command` ne fait
-  que DÉMARRER la commande (pose `BUSY`) ; c'est `tick()`, appelé par le
-  board à chaque avancée d'horloge, qui fait progresser le délai réel et
-  termine la commande (statut final, `/INTRQ`) une fois écoulé — `BUSY`
-  est donc bien observable par un logiciel qui le sonde, comme sur
-  silicium réel. Latence de rotation via une position angulaire du disque
-  suivie en continu (`rotation_phase`, pas un simple délai moyen fixe :
-  une lecture séquentielle secteur par secteur retrouve un secteur voisin
-  bien plus vite qu'un secteur pris au hasard, comme sur silicium réel) ;
-  chargement de tête (15 ms) conditionné au bit `E` de la commande, pas
-  systématique. Constantes vérifiées contre Hatari (`fdc.c`). Pas de
-  vérification/CRC réels (bit V toujours réussi), Type III (Read
-  Address/Track, Write Track/Format) non implémenté.
+- The disk is abstracted via the `FloppyDisk` trait (track/side/sector
+  addressing, not byte), an object (`Box<dyn FloppyDisk>` on the
+  `AtariSt` side) to accept several formats without coupling the board
+  to any one of them: `RawDiskImage` for raw `.st` (linear sectors),
+  `stx::StxImage` for a minimal `.stx` (Pasti) reader — reverse-engineered
+  by direct inspection of real files then cross-checked against the
+  format's public documentation and Hatari, now exposes `bit_position`
+  (the real position of the ID field on the physical track, used by
+  `Wd1772::cycles_to_target_sector` for a faithful rotational latency
+  calculation even on a non-standard-formatted track) — and `msa::parse`
+  for `.msa` (Magic Shadow Archiver, a simple RLE-compressed
+  track-by-track container, decompressed in memory into an equivalent
+  `RawDiskImage`, no protection metadata in this format).
+- Type II transfer via the `DmaChannel` trait (`pull`/`push` one byte at
+  a time): the WD1772 knows nothing of RAM, only the disk and this
+  channel — it is up to the board to implement it with access to its
+  RAM.
+- **Real timing, not instantaneous**: `execute_command` only STARTS the
+  command (sets `BUSY`); it is `tick()`, called by the board on every
+  clock advance, that progresses the real delay and finishes the command
+  (final status, `/INTRQ`) once elapsed — `BUSY` is therefore genuinely
+  observable by software polling it, as on real silicon. Rotational
+  latency via a disk angular position tracked continuously
+  (`rotation_phase`, not a simple fixed average delay: sequential
+  sector-by-sector reading finds a neighboring sector much faster than a
+  randomly picked one, as on real silicon); head load (15 ms) gated on
+  the command's `E` bit, not automatic. Constants checked against Hatari
+  (`fdc.c`). No real verification/CRC (V bit always succeeds), Type III
+  (Read Address/Track, Write Track/Format) not implemented.
 
-Câblage dans `systems::atari_st::AtariSt` : registre multiplexé à
-`0xFF8604` (sélecteur de registre via `0xFF8606`, modèle simplifié — pas
-de registre de nombre de secteurs ni de sélection FDC/HDC réels),
-compteur d'adresse DMA à `0xFF8609`/`0B`/`0D`. `/INTRQ` câblé sur `GPIP5`
-du MFP, relayé par `AtariSt::tick`. Disque inséré via le champ public
+Wiring in `systems::atari_st::AtariSt`: multiplexed register at
+`0xFF8604` (register select via `0xFF8606`, simplified model — no real
+sector-count register nor real FDC/HDC selection), DMA address counter
+at `0xFF8609`/`0B`/`0D`. `/INTRQ` wired to `GPIP5` of the MFP, relayed
+by `AtariSt::tick`. Disk inserted via the public field
 `AtariSt::floppy_a`.
 
-Testé dans `tests/wd1772.rs` (20 tests, dont la latence rotationnelle via
-`bit_position` et l'arrêt au compte réel de secteurs par piste),
+Tested in `tests/wd1772.rs` (20 tests, including rotational latency via
+`bit_position` and stopping at the real sector count per track),
 `src/peripherals/atari_st/msa.rs` (8 tests), `src/peripherals/atari_st/stx.rs`
-(9 tests) et `tests/atari_st.rs` (aller-retour lecture/écriture secteur
-bout-en-bout via DMA, entre autres tests bout-en-bout).
+(9 tests) and `tests/atari_st.rs` (end-to-end sector read/write
+round-trip via DMA, among other end-to-end tests).
 
 ---
 
 ## Blitter (`src/peripherals/atari_st/blitter.rs`)
 
-`peripherals::atari_st::blitter::Blitter` modélise le coprocesseur de transfert de
-blocs (BitBlt) de l'Atari STE seul : combine un mot source (optionnellement
-décalé bit à bit via `skew`, registre à décalage 32 bits PERSISTANT sur
-toute la durée de vie de la puce — pas remis à zéro entre deux lignes ni
-entre deux blits logiquement séparés), un motif de demi-teinte, et le
-contenu destination, via une fonction booléenne programmable (`OP`, une des
-16 fonctions à 2 entrées, convention de table de vérité standard partagée
-par de nombreuses puces "raster op"), avec masquage de bord de ligne
-(`ENDMASK1/2/3`) et parcours par incréments X/Y. Mappé dans `AtariSt` à
-`0xFF8A00` (champ public `blitter`). Traité **mot par mot** (traduction
-directe de la machine à états de Hatari, `Blitter_ProcessWord`), pas ligne
-par ligne avec une formule d'avance précalculée, pour reproduire fidèlement
-ce registre à décalage persistant.
+`peripherals::atari_st::blitter::Blitter` models the Atari STE's block
+transfer coprocessor (BitBlt) alone: it combines a source word
+(optionally shifted bit by bit via `skew`, a 32-bit shift register
+PERSISTENT across the chip's entire lifetime — not reset to zero between
+two lines nor between two logically separate blits), a halftone pattern,
+and the destination content, via a programmable boolean function (`OP`,
+one of 16 two-input functions, standard truth-table convention shared by
+many "raster op" chips), with line-edge masking (`ENDMASK1/2/3`) and
+X/Y increment traversal. Mapped into `AtariSt` at `0xFF8A00` (public
+field `blitter`). Processed **word by word** (a direct translation of
+Hatari's state machine, `Blitter_ProcessWord`), not line by line with a
+precomputed advance formula, in order to faithfully reproduce this
+persistent shift register.
 
-En mode HOG (bit 6 de `CONTROL`), `execute()` traite tout le blit en un
-seul appel. En mode non-HOG (le plus courant en pratique), un seul appel ne
-traite que 64 accès bus réels (lecture source, lecture/écriture
-destination, chacun compté séparément — valeur et méthode de comptage
-reprises de Hatari, `BLITTER_NONHOG_BUS_BLITTER`) avant de rendre la main,
-`BUSY` restant posé entre deux tranches — le CPU dispose alors de 256
-cycles (`AtariSt::BLITTER_SLICE_CYCLES`, calibré sur le même `64*4` que
-Hatari) pour s'exécuter en parallèle avant que `AtariSt::tick` ne rappelle
-`execute()` pour la tranche suivante. Le déclenchement initial se fait via
-l'écriture du bit BUSY/START du registre de contrôle ; un déclenchement
-CONTROL accidentel (`TAS.B` dans la boucle de relance logicielle typique)
-n'y ré-exécute PAS tout le blit depuis le début — `execute()` reprend
-exactement où la tranche précédente s'est arrêtée (voir `armed`).
+In HOG mode (bit 6 of `CONTROL`), `execute()` processes the whole blit in
+a single call. In non-HOG mode (the most common in practice), a single
+call only processes 64 real bus accesses (source read, destination
+read/write, each counted separately — value and counting method taken
+from Hatari, `BLITTER_NONHOG_BUS_BLITTER`) before yielding control, with
+`BUSY` staying set between two slices — the CPU then has 256 cycles
+(`AtariSt::BLITTER_SLICE_CYCLES`, calibrated on the same `64*4` as
+Hatari) to run in parallel before `AtariSt::tick` calls `execute()` again
+for the next slice. The initial trigger happens via a write to the
+BUSY/START bit of the control register; an accidental CONTROL trigger
+(`TAS.B` in the typical software restart loop) does NOT re-execute the
+whole blit from the start — `execute()` resumes exactly where the
+previous slice stopped (see `armed`).
 
-Registres `CONTROL` (`0xFF8A3C` : BUSY/HOG/SMUDGE/numéro de ligne de
-demi-teinte) et `SKEW` (`0xFF8A3D` : FXSR/NFSR/décalage) conformes à
-l'offset réel de la puce — croisés contre le datasheet `BLITTER.TXT`
-(info-coach.fr), le `BLIT_FAQ.TXT` (dépôt `ggnkua/Atari_ST_Sources`) et
-le code source de Hatari (`src/blitter.c`), qui se recoupent tous les
-trois. Une première version avait ces deux offsets inversés (bug
-corrigé) et prenait `HOP=0` pour "tout à zéro" au lieu de "tout à un"
-(table du datasheet, également corrigé).
+`CONTROL` (`0xFF8A3C`: BUSY/HOG/SMUDGE/halftone line number) and `SKEW`
+(`0xFF8A3D`: FXSR/NFSR/shift) registers match the chip's real offset —
+cross-checked against the `BLITTER.TXT` datasheet (info-coach.fr), the
+`BLIT_FAQ.TXT` (`ggnkua/Atari_ST_Sources` repo), and Hatari's source code
+(`src/blitter.c`), all three of which agree. An earlier version had
+these two offsets swapped (fixed bug) and treated `HOP=0` as "all zero"
+instead of "all one" (per the datasheet's table, also fixed).
 
-- `FXSR`/`NFSR` (bits du registre `SKEW`) honorés explicitement plutôt
-  que déduits de `skew != 0` : `FXSR` déclenche la lecture d'amorçage en
-  début de ligne, `NFSR` supprime la dernière lecture source de la ligne.
-- `SMUDGE` (bit du registre `CONTROL`) implémenté : le mot de demi-teinte
-  utilisé pour chaque mot vient des 4 bits bas du mot source décalé,
-  potentiellement différent à chaque mot d'une même ligne (au lieu du
-  numéro de ligne courant en mode normal).
-- Le numéro de ligne de demi-teinte (bits 0-3 de `CONTROL`) est
-  directement lisible/inscriptible par le logiciel (pas un compteur
-  interne caché), et avance ou recule en fin de ligne selon le signe de
-  `DST_Y_INC`, conformément au datasheet.
-- Pas de mode "dessin de ligne" pour tracé de polygone (contrairement au
-  Blitter Amiga) : ce n'est pas une limitation de cette implémentation,
-  la puce Atari STE n'a simplement pas cette fonctionnalité — le champ
-  "numéro de ligne" du registre CONTROL sert uniquement à la sélection
-  de demi-teinte ci-dessus.
+- `FXSR`/`NFSR` (bits of the `SKEW` register) honored explicitly rather
+  than deduced from `skew != 0`: `FXSR` triggers the priming read at the
+  start of a line, `NFSR` suppresses the last source read of the line.
+- `SMUDGE` (bit of the `CONTROL` register) implemented: the halftone word
+  used for each word comes from the low 4 bits of the shifted source
+  word, potentially different for each word of the same line (instead of
+  the current line number in normal mode).
+- The halftone line number (bits 0-3 of `CONTROL`) is directly
+  readable/writable by software (not a hidden internal counter), and
+  advances or retreats at the end of a line depending on the sign of
+  `DST_Y_INC`, per the datasheet.
+- No "line draw" mode for polygon plotting (unlike the Amiga Blitter):
+  this is not a limitation of this implementation, the Atari STE chip
+  simply doesn't have this feature — the CONTROL register's "line
+  number" field is used only for halftone selection as above.
 
-`skew` gère bien la direction du parcours (`SRC_X_INC` positif/négatif,
-blit "miroir") : le registre à décalage source est alimenté différemment
-selon le signe (`shift_buffer`/`fetch_buffer`, traduction directe de
-`Blitter_SourceShift`/`Blitter_SourceFetch` de Hatari) — une version
-antérieure supposait toujours un parcours croissant.
+`skew` correctly handles traversal direction (positive/negative
+`SRC_X_INC`, "mirrored" blit): the source shift register is fed
+differently depending on the sign (`shift_buffer`/`fetch_buffer`, a
+direct translation of Hatari's `Blitter_SourceShift`/
+`Blitter_SourceFetch`) — an earlier version always assumed forward
+traversal.
 
-**Limitations restantes, à prendre avec prudence** (aucune suite
-équivalente à TomHarte n'existe pour ce périphérique) :
-- Le modèle de tranche à 64 accès bus reste une approximation du mode
-  "cycle exact" de Hatari, qui entrelace ces accès AU MILIEU de
-  l'exécution des instructions CPU (pas seulement entre deux instructions
-  complètes) et reproduit un cas de bug documenté du silicium réel où le
-  Blitter s'arrête parfois à 63 accès au lieu de 64 — non modélisé ici.
+**Remaining limitations, to take with caution** (no suite equivalent to
+TomHarte exists for this peripheral):
+- The 64-bus-access slice model remains an approximation of Hatari's
+  "cycle exact" mode, which interleaves these accesses IN THE MIDDLE of
+  CPU instruction execution (not just between complete instructions) and
+  reproduces a documented real-silicon bug case where the Blitter
+  sometimes stops at 63 accesses instead of 64 — not modeled here.
 
-Testé dans `tests/blitter.rs` (23 tests : table de vérité OP, HOP y
-compris HOP=0, endmask, parcours X/Y, cycle et registre de numéro de
-ligne de demi-teinte, FXSR, NFSR, SMUDGE, skew=0/miroir, tranches non-HOG
-comptées en accès bus réels), `tests/blitter_hatari_diff.rs` (portage
-direct de `Blitter_ProcessWord` comme oracle différentiel) et
-`tests/atari_st.rs` (blit bout-en-bout déclenché via le registre de
-contrôle, entre autres tests bout-en-bout).
+Tested in `tests/blitter.rs` (23 tests: OP truth table, HOP including
+HOP=0, endmask, X/Y traversal, halftone line number cycle and register,
+FXSR, NFSR, SMUDGE, skew=0/mirror, non-HOG slices counted in real bus
+accesses), `tests/blitter_hatari_diff.rs` (direct port of
+`Blitter_ProcessWord` as a differential oracle) and `tests/atari_st.rs`
+(end-to-end blit triggered via the control register, among other
+end-to-end tests).
 
 ---
 
-## Board Atari ST (`src/systems/atari_st/mod.rs`)
+## Atari ST Board (`src/systems/atari_st/mod.rs`)
 
-`systems::atari_st::AtariSt` implémente `Bus` pour un ST/STE minimal, en
-reliant toutes les puces ci-dessus :
+`systems::atari_st::AtariSt` implements `Bus` for a minimal ST/STE,
+wiring together all the chips above:
 
-- RAM installée à `0x000000` (taille au choix), ROM TOS à `0xFC0000`
-  (`DEFAULT_ROM_BASE`, lecture seule).
-- MFP 68901 aux adresses impaires `0xFFFA01`-`0xFFFA2F` (champ public
-  `mfp`). ACIA clavier (`0xFFFC00`/`02`) et MIDI (`0xFFFC04`/`06`), champs
-  publics `acia_keyboard`/`acia_midi`, la première câblée sur un
-  contrôleur IKBD (champ `ikbd`, voir section dédiée). YM2149
-  (`0xFF8800`/`02`, champ `ym2149`). Shifter (`0xFF8201`+, champ
-  `shifter`). WD1772/DMA (`0xFF8604`+, champs `wd1772`/`floppy_a`).
-  Blitter (`0xFF8A00`+, champ `blitter`, déclenché par l'écriture du bit
-  BUSY/START de son registre de contrôle).
-- Au-delà de la RAM installée mais dans l'espace d'adressage "RAM ST" fixe
-  de 4 Mo (deux banques MMU de 2 Mo sur ST/STE réel), l'accès ne
-  déclenche **jamais** de bus error : le MMU y répond toujours /DTACK sur
-  silicium réel, même sans RAM physique à l'adresse précise (confirmé par
-  la communauté Atari). Modélisé par une valeur fixe non stockée (une
-  lecture ne renvoie jamais ce qui vient d'être écrit) plutôt que la
-  valeur réelle (résidu de capacité du bus, non déterministe). C'est
-  cette absence de persistance, pas un bus error, que le TOS observe pour
-  sa détection de RAM au tout début du boot froid. Le vrai "trou"
-  (bus error via `take_bus_fault`, mécanisme qu'utilisent de nombreux
-  programmes/démos une fois le TOS démarré) commence seulement à 4 Mo,
-  jusqu'à `0xFF8000`.
-- Reste de la zone d'E/S non mappée : chip select réel mais périphérique
-  pas encore émulé → lecture neutre `0xFF`, écriture ignorée (pas de bus
-  error, pour ne pas casser le polling de statut du logiciel).
-- `irq_level`/`irq_ack` câblent MFP (IPL6), VBL (IPL4) et HBL (IPL2) par
-  priorité décroissante. Les deux ACIA et le WD1772 ne génèrent pas d'IPL
-  directement : leurs IRQ sont OR câblées sur `GPIP4`/`GPIP5` du MFP.
-- `reset_bus` réinitialise MFP/ACIA×2/YM2149/Shifter/WD1772 ; le GLUE,
-  lui, n'est **pas** réinitialisé (le timing vidéo continue indépendamment
-  d'un `/RESET` CPU sur silicium réel) ; le disque inséré (`floppy_a`)
-  non plus (support physique, pas état de puce).
-- `AtariSt::tick(cpu_cycles)` fait progresser MFP/GLUE/YM2149, relaie les
-  IRQ ACIA/WD1772, et déclenche le rendu vidéo (Shifter) au rythme
-  HBL/VBL du GLUE — à appeler explicitement par l'appelant après chaque
-  `Cpu::step` (ce crate ne fait pas progresser les périphériques tout
-  seul).
+- Installed RAM at `0x000000` (chosen size), TOS ROM at `0xFC0000`
+  (`DEFAULT_ROM_BASE`, read-only).
+- MFP 68901 at odd addresses `0xFFFA01`-`0xFFFA2F` (public field `mfp`).
+  Keyboard ACIA (`0xFFFC00`/`02`) and MIDI ACIA (`0xFFFC04`/`06`), public
+  fields `acia_keyboard`/`acia_midi`, the first wired to an IKBD
+  controller (field `ikbd`, see dedicated section). YM2149
+  (`0xFF8800`/`02`, field `ym2149`). Shifter (`0xFF8201`+, field
+  `shifter`). WD1772/DMA (`0xFF8604`+, fields `wd1772`/`floppy_a`).
+  Blitter (`0xFF8A00`+, field `blitter`, triggered by a write to the
+  BUSY/START bit of its control register).
+- Beyond installed RAM but within the fixed 4 MB "ST RAM" address space
+  (two 2 MB MMU banks on a real ST/STE), an access **never** triggers a
+  bus error: the MMU always responds with /DTACK there on real silicon,
+  even without physical RAM at the precise address (confirmed by the
+  Atari community). Modeled with a fixed unstored value (a read never
+  returns what was just written) rather than the real value (a bus
+  capacitance residue, non-deterministic). It is this lack of
+  persistence, not a bus error, that TOS observes for its RAM detection
+  at the very start of the cold boot. The real "hole" (bus error via
+  `take_bus_fault`, the mechanism many programs/demos use once TOS has
+  started) only begins at 4 MB, up to `0xFF8000`.
+- Rest of the unmapped I/O area: real chip select but peripheral not yet
+  emulated → neutral read `0xFF`, write ignored (no bus error, so as not
+  to break software status polling).
+- `irq_level`/`irq_ack` wire the MFP (IPL6), VBL (IPL4) and HBL (IPL2) in
+  decreasing priority order. The two ACIAs and the WD1772 don't generate
+  an IPL directly: their IRQs are OR-wired onto `GPIP4`/`GPIP5` of the
+  MFP.
+- `reset_bus` resets MFP/ACIA×2/YM2149/Shifter/WD1772; the GLUE, however,
+  is **not** reset (video timing keeps going independently of a CPU
+  `/RESET` on real silicon); neither is the inserted disk (`floppy_a`)
+  (physical medium, not chip state).
+- `AtariSt::tick(cpu_cycles)` advances MFP/GLUE/YM2149, relays
+  ACIA/WD1772 IRQs, and triggers video rendering (Shifter) at the GLUE's
+  HBL/VBL rate — to be called explicitly by the caller after each
+  `Cpu::step` (this crate does not advance peripherals on its own).
 
-Limitations connues : pas de miroir ROM `0xE00000` (130ST) ; pas de
-contention DRAM/vidéo (`is_contended` reste `false`) ; décodage UDS/LDS
-des adresses paires adjacentes au MFP non modélisé précisément ;
-registres DMA/WD1772 simplifiés (voir section WD1772).
+Known limitations: no ROM mirror at `0xE00000` (130ST); no DRAM/video
+contention (`is_contended` stays `false`); UDS/LDS decoding of even
+addresses adjacent to the MFP not precisely modeled; simplified
+DMA/WD1772 registers (see WD1772 section).
 
-Testé dans `tests/atari_st.rs` (55 tests, dont plusieurs bout-en-bout :
-interruption GPIP→MFP→IPL, priorité MFP/VBL/HBL, ACIA→GPIP4→MFP,
-WD1772→GPIP5→MFP, rendu vidéo, lecture/écriture disquette via DMA, blit
-déclenché via le registre de contrôle, moniteur couleur persistant après
+Tested in `tests/atari_st.rs` (55 tests, including several end-to-end
+ones: GPIP→MFP→IPL interrupt, MFP/VBL/HBL priority, ACIA→GPIP4→MFP,
+WD1772→GPIP5→MFP, video rendering, floppy read/write via DMA, blit
+triggered via the control register, color monitor persisting across
 `/RESET`).
 
 ---
 
-## Lexique des modèles (`src/systems/atari_st/model.rs`)
+## Model lexicon (`src/systems/atari_st/model.rs`)
 
-Principe général, valable pour n'importe quelle machine qu'on émule (pas
-seulement celle-ci) : émuler une machine réelle précise, ce n'est pas
-choisir une taille de RAM au hasard puis espérer que ça marche — c'est un
-ensemble de caractéristiques qui vont ensemble (vitesse CPU, RAM
-d'origine, ROM/BIOS attendue, options matérielles). `model::AtariModel`
-rassemble ces caractéristiques pour la gamme ST/STE sous forme
-consultable (`AtariModel::profile() -> MachineProfile`) plutôt que de les
-laisser éparpillées en constantes magiques dans le binaire de
-démonstration.
+General principle, valid for any machine being emulated (not just this
+one): emulating a specific real machine isn't about picking a random RAM
+size and hoping it works — it's a set of characteristics that go
+together (CPU speed, original RAM, expected ROM/BIOS, hardware options).
+`model::AtariModel` gathers these characteristics for the ST/STE range in
+a queryable form (`AtariModel::profile() -> MachineProfile`) rather than
+leaving them scattered as magic constants in the demo binary.
 
-- 6 modèles couverts : `St520`, `St1040`, `MegaSt`, `Ste520`, `Ste1040`,
-  `MegaSte` — caractéristiques (RAM, Blitter de série, TOS d'origine,
-  fréquence CPU) croisées depuis plusieurs références publiques
-  (Wikipedia, old-computers.com, atari-wiki.com, atari-forum.com).
-- `AtariModel::parse(nom)` : reconnaissance insensible à la casse et aux
-  séparateurs (`"1040ste"`, `"1040STE"`, `"Mega-STE"`…).
-- `AtariSt::from_model(profile, rom)` : construit le board avec la RAM et
-  la présence du Blitter du modèle choisi (`AtariSt::blitter_present`,
-  vérifié par `is_blitter_addr`) ; le ROM est fourni séparément (la
-  version de TOS installée n'est **pas** une propriété du modèle — un ST
-  réel peut très bien tourner avec un TOS plus récent que celui
-  d'origine, mise à jour EPROM courante). La base ROM (`0xFC0000` vs
-  `0xE00000`) reste réglée indépendamment via `set_rom_base`, déjà
-  auto-détectée depuis `os_version` dans l'en-tête TOS.
-- Binaire de démonstration : `--model <nom>` (défaut `1040ste`) — lancer le
-  binaire SANS argument (pas de flag `--help` dédié : `--help` serait
-  traité comme chemin de ROM et échouerait à sa lecture) affiche le
-  message d'usage listant les modèles. Exemple :
+- 6 models covered: `St520`, `St1040`, `MegaSt`, `Ste520`, `Ste1040`,
+  `MegaSte` — characteristics (RAM, stock Blitter, original TOS, CPU
+  frequency) cross-checked from several public references (Wikipedia,
+  old-computers.com, atari-wiki.com, atari-forum.com).
+- `AtariModel::parse(name)`: case- and separator-insensitive recognition
+  (`"1040ste"`, `"1040STE"`, `"Mega-STE"`…).
+- `AtariSt::from_model(profile, rom)`: builds the board with the RAM and
+  Blitter presence of the chosen model (`AtariSt::blitter_present`,
+  checked by `is_blitter_addr`); the ROM is supplied separately (the
+  installed TOS version is **not** a property of the model — a real ST
+  can perfectly well run with a newer TOS than the original one, a
+  common EPROM upgrade). The ROM base (`0xFC0000` vs `0xE00000`) is
+  still set independently via `set_rom_base`, already auto-detected from
+  `os_version` in the TOS header.
+- Demo binary: `--model <name>` (default `1040ste`) — running the binary
+  WITHOUT arguments (no dedicated `--help` flag: `--help` would be
+  treated as a ROM path and fail to be read) prints the usage message
+  listing the models. Example:
   `cargo run --release --features sdl2-frontend --bin atari_st_sdl2 --
-  --model 520ste tos162.img disque.stx`.
+  --model 520ste tos162.img disk.stx`.
 
-Ce qui n'est **pas** (encore) modélisé par ce lexique :
-- `cpu_hz` est informatif seulement : le rythme MFP (ratio horloge fixe
-  192/625) et le pacing audio du binaire `atari_st_sdl2` supposent tous
-  les deux un CPU à 8 MHz. Choisir un modèle Mega STE ne fait donc pas
-  tourner l'émulation à 16 MHz.
-- Le Mega ST est modélisé Blitter présent par défaut (support PLCC
-  existant sur toutes les cartes mères mais pas systématiquement peuplé
-  en usine sur les premières séries) — à ajuster manuellement via
-  `MachineProfile.has_blitter` si besoin d'un Mega ST sans Blitter précis.
+What this lexicon does **not** (yet) model:
+- `cpu_hz` is informative only: both the MFP rate (fixed 192/625 clock
+  ratio) and the `atari_st_sdl2` binary's audio pacing assume an 8 MHz
+  CPU. Choosing a Mega STE model therefore does not make the emulation
+  run at 16 MHz.
+- The Mega ST is modeled with the Blitter present by default (PLCC
+  socket present on all motherboards but not always populated at the
+  factory in early runs) — adjust manually via `MachineProfile.has_blitter`
+  if a precise Blitter-less Mega ST is needed.
 
-Testé dans `src/systems/atari_st/model.rs` (3 tests unitaires) et
-`tests/atari_st.rs` (1 test bout-en-bout : RAM/Blitter réglés d'après le
-modèle).
+Tested in `src/systems/atari_st/model.rs` (3 unit tests) and
+`tests/atari_st.rs` (1 end-to-end test: RAM/Blitter set according to the
+model).
 
 ---
 
-## Ce qui reste pour l'émulation Atari ST
+## What remains for the Atari ST emulation
 
-Le CPU MC68000 est complet, 100 % conforme en état ET 100 % cycle-exact,
-trace mode compris. L'interruption IPL, le MFP 68901, le GLUE, les deux
-ACIA 6850, le YM2149, le Shifter, le WD1772, le Blitter et un board
-minimal reliant tout ça sont en place — tous les composants de la feuille
-de route initiale sont couverts.
+The MC68000 CPU is complete, 100% state-compliant AND 100% cycle-exact,
+trace mode included. IPL interrupts, the MFP 68901, the GLUE, the two
+MC6850 ACIAs, the YM2149, the Shifter, the WD1772, the Blitter, and a
+minimal board wiring it all together are in place — every component of
+the original roadmap is covered.
 
-Un vrai TOS 1.62 non modifié démarre jusqu'au bureau GEM interactif
-(vidéo couleur basse résolution, clavier, souris, icônes disquette, menus
-déroulants) via le binaire de démonstration `atari_st_sdl2` (`cargo run
+A real, unmodified TOS 1.62 boots up to the interactive GEM desktop
+(low-resolution color video, keyboard, mouse, floppy disk icons,
+pull-down menus) via the `atari_st_sdl2` demo binary (`cargo run
 --release --features sdl2-frontend --bin atari_st_sdl2 -- <rom.img>
-[disque.st|.stx|.msa]`) — voir la section Architecture pour le détail des
-features Cargo. Le raccourci "redémarrage à chaud" (cookies
-`memvalid`/`memval2`/`memval3`/`phystop` pré-remplis, voir le code de
-`main`) reste le chemin par défaut recommandé (rapide, fiable) ;
-`RUST68_COLD_BOOT=1` force un vrai boot froid (détection de RAM réelle
-par le TOS, plus lente), fonctionnel mais moins testé au quotidien.
+[disk.st|.stx|.msa]`) — see the Architecture section for details on
+Cargo features. The "warm restart" shortcut (pre-filled
+`memvalid`/`memval2`/`memval3`/`phystop` cookies, see the `main` code)
+remains the recommended default path (fast, reliable);
+`RUST68_COLD_BOOT=1` forces a real cold boot (real RAM detection by TOS,
+slower), functional but less tested day-to-day.
 
-**Bugs GEM résolus** :
-- *Clics souris sans effet* (icônes, items de menu) — cause en plusieurs
-  couches : le contrôleur IKBD n'existait pas du tout (commandes TOS
-  jamais interprétées, front GPIP4 starvé entre octets d'une même trame,
-  `$0EE4` non pré-rempli — voir section IKBD), puis un dernier bug plus
-  simple une fois l'IKBD en place : les bits gauche/droit du paquet
-  souris étaient inversés (`queue_mouse_move`, `atari_st_sdl2.rs`). Le
-  mode souris "exclusif" (`Cmd+Shift+F10`) a été ajouté à cette occasion.
-- *Texte corrompu dans les menus déroulants GEM* — `AtariSt::write16`
-  scindait toute écriture `.W` combinée CONTROL+SKEW du Blitter
-  (`$FF8A3C`/`3D`) en deux `write8` séquentiels, CONTROL puis SKEW ; or
-  l'écriture de CONTROL déclenche `Blitter::execute()` de façon
-  synchrone dès que le bit BUSY est posé, donc le Blitter démarrait
-  parfois avec l'ANCIEN SKEW, un instant avant que le nouveau ne soit
-  posé par ce même accès `.W` (cas réel de TOS 1.62 : `MOVE.W D7,(A5)`
-  en `$E11746`, armant les 4 plans d'un blit de restauration de menu
-  avec un SKEW partagé). Corrigé en écrivant SKEW avant de déléguer à
-  `write8` pour CONTROL. Vérifié par comparaison directe avec un vrai
-  Hatari (patch de trace différentiel `RUST68_HATARI_TRACE` sur
-  `blitter.c`) : les deux tournent désormais à l'identique sur ce blit.
-  Outils de diagnostic conservés (coût nul si non activés) :
-  `RUST68_TRACE_BLIT_REGS`/`RUST68_TRACE_BLIT_START`/
+**Resolved GEM bugs**:
+- *Mouse clicks with no effect* (icons, menu items) — a multi-layered
+  cause: the IKBD controller didn't exist at all (TOS commands never
+  interpreted, GPIP4 edge starved between bytes of the same frame,
+  `$0EE4` not pre-filled — see the IKBD section), then one final,
+  simpler bug once the IKBD was in place: the left/right bits of the
+  mouse packet were swapped (`queue_mouse_move`, `atari_st_sdl2.rs`).
+  "Exclusive" mouse mode (`Cmd+Shift+F10`) was added on this occasion.
+- *Corrupted text in GEM pull-down menus* — `AtariSt::write16` split
+  every combined `.W` write to the Blitter's CONTROL+SKEW (`$FF8A3C`/
+  `3D`) into two sequential `write8` calls, CONTROL then SKEW; but
+  writing CONTROL synchronously triggers `Blitter::execute()` as soon as
+  the BUSY bit is set, so the Blitter sometimes started with the OLD
+  SKEW, an instant before the new one was set by that same `.W` access
+  (a real TOS 1.62 case: `MOVE.W D7,(A5)` at `$E11746`, arming the 4
+  planes of a menu-restoring blit with a shared SKEW). Fixed by writing
+  SKEW before delegating to `write8` for CONTROL. Verified by direct
+  comparison with a real Hatari (differential trace patch
+  `RUST68_HATARI_TRACE` on `blitter.c`): both now run identically on
+  this blit. Diagnostic tools kept in the tree (zero cost when not
+  enabled): `RUST68_TRACE_BLIT_REGS`/`RUST68_TRACE_BLIT_START`/
   `RUST68_TRACE_BLITTER_WORDS`, `examples/rd_menu_repro.rs`/
-  `rd_menu_ca6a.rs` (reproduction headless d'un clic-glisser de menu,
-  sans SDL2 ni interaction réelle).
+  `rd_menu_ca6a.rs` (headless reproduction of a menu click-drag, without
+  SDL2 or real interaction).
 
-Pistes pour aller plus loin (aucune n'est un blocage, ce sont des
-approfondissements) :
-- Vérification des points documentés comme non confirmés contre une
-  référence matérielle réelle (timing MFP/GLUE, polarité haute
-  résolution du Shifter, cas limite "63 accès bus au lieu de 64" du
-  Blitter).
-- Contention DRAM/vidéo pour les accès Shifter/Blitter (mécanisme déjà
-  générique via `Bus::is_contended`, pas encore branché sur ces deux
-  puces).
-- `.stx` : métadonnées de protection par secteur (fuzzy bits, timing)
-  volontairement ignorées par le lecteur minimal — de vraies protections
-  de jeux resteraient bloquées.
-- Résidu de dérive de timing (~60-80 VBL sur un très gros transfert
-  disquette protégé, `Rick_Dangerous.stx`) après le correctif de latence
-  rotationnelle STX (`bit_position`) — cause non identifiée, crash final
-  inchangé (A6=0 au même endroit).
-- **Bug GEM non résolu** : dans le bureau GEM standard (TOS 1.62, sans
-  logiciel tiers), ouvrir `Bureau > Informations` (dont le logo Atari
-  s'anime par cycle de couleurs, seule boîte de dialogue du bureau à
-  faire un travail continu pendant qu'elle reste affichée) déclenche un
-  signal sonore répété (le "ping" interne, plusieurs fois par seconde) et
-  fait apparaître un mouvement de curseur souris "tourné" (droite→bas,
-  gauche→haut, haut→gauche, bas→droite — un échange dx↔dy). Les deux
-  cessent à la fermeture de la boîte de dialogue ; aucune autre boîte
-  modale testée ne reproduit le problème. Pistes déjà écartées après
-  investigation (traces `RUST68_TRACE_IKBD`/`_DISPATCH`/`_READER`,
-  `RUST68_TRACE_MFP_REQUEST`, capture d'écran pendant le bug) : paquets
-  souris malformés au niveau octet (non — bien formés tout du long),
-  mode souris absolu `$09` jamais envoyé pour cette boîte précise (non —
-  aucune commande `$09` dans la trace), rendu vidéo corrompu (non —
-  capture d'écran propre, logo animé normalement), flot de requêtes MFP
-  chan=4/GPIP4 (rouge-hareng confirmé — comportement normal et attendu
-  dès que la souris bouge, pas un signe de dysfonctionnement). Deux bugs
-  réels et non liés ont été trouvés et corrigés en cours de route (voir
-  sections MFP et IKBD) mais aucun des deux n'a résolu ce cas précis.
-  Piste la plus prometteuse mais non encore vérifiée : le VBL (qui pilote
-  le cycle de couleurs du logo) pourrait être retardé/perturbé par le
-  trafic ACIA pendant cette boîte de dialogue précisément parce que
-  c'est la seule à solliciter le chemin VBL en continu — nécessiterait
-  une trace `RUST68_TRACE_IRQ` seule (pas combinée à `_MFP_REQUEST`, trop
-  volumineux ensemble) pour confirmer.
+Avenues for further work (none of them are blockers, they are
+deepenings):
+- Verification of points documented as unconfirmed against a real
+  hardware reference (MFP/GLUE timing, Shifter high-resolution polarity,
+  the Blitter's "63 bus accesses instead of 64" edge case).
+- DRAM/video contention for Shifter/Blitter accesses (the mechanism is
+  already generic via `Bus::is_contended`, just not yet wired to these
+  two chips).
+- `.stx`: per-sector protection metadata (fuzzy bits, timing)
+  deliberately ignored by the minimal reader — real game protections
+  would remain blocked.
+- Residual timing drift (~60-80 VBL on a very large protected floppy
+  transfer, `Rick_Dangerous.stx`) after the STX rotational latency fix
+  (`bit_position`) — cause not identified, final crash unchanged (A6=0
+  at the same location).
+- **Unresolved GEM bug**: in the standard GEM desktop (TOS 1.62, no
+  third-party software), opening `Desktop > Info` (whose Atari logo
+  animates through a color cycle, the only desktop dialog to do
+  continuous work while it stays open) triggers a repeated beep (the
+  internal "ping", several times per second) and produces a "rotated"
+  mouse cursor movement (right→down, left→up, up→left, down→right — a
+  dx↔dy swap). Both stop when the dialog is closed; no other modal
+  dialog tested reproduces the problem. Avenues already ruled out after
+  investigation (`RUST68_TRACE_IKBD`/`_DISPATCH`/`_READER` traces,
+  `RUST68_TRACE_MFP_REQUEST`, screenshot taken during the bug): malformed
+  mouse packets at the byte level (no — well-formed throughout),
+  absolute mouse mode `$09` never sent for this specific dialog (no — no
+  `$09` command in the trace), corrupted video rendering (no — clean
+  screenshot, logo animating normally), MFP request flow chan=4/GPIP4
+  (confirmed red herring — normal, expected behavior as soon as the
+  mouse moves, not a sign of malfunction). Two real, unrelated bugs were
+  found and fixed along the way (see the MFP and IKBD sections) but
+  neither resolved this specific case. Most promising lead, not yet
+  verified: the VBL (which drives the logo's color cycle) might be
+  delayed/disrupted by ACIA traffic during this particular dialog,
+  precisely because it's the only one that continuously exercises the
+  VBL path — would need an `RUST68_TRACE_IRQ`-only trace (not combined
+  with `_MFP_REQUEST`, too voluminous together) to confirm.
