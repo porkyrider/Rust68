@@ -10,7 +10,8 @@ use rust68::peripherals::atari_st::ym2149;
 use rust68::systems::atari_st::{
     ACIA_KEYBOARD_CONTROL, ACIA_KEYBOARD_DATA, ACIA_MIDI_CONTROL, ACIA_MIDI_DATA, AtariSt,
     BLITTER_BASE, DEFAULT_ROM_BASE, DMA_ADDR_HIGH, DMA_ADDR_LOW, DMA_ADDR_MID, DMA_MODE, FDC_DATA,
-    IO_BASE, MEMORY_CONF, MFP_BASE, STE_DMA_SOUND_BASE, YM2149_DATA, YM2149_SELECT, model,
+    GLUE_SYNC, IO_BASE, MEMORY_CONF, MFP_BASE, STE_DMA_SOUND_BASE, YM2149_DATA, YM2149_SELECT,
+    model,
 };
 use rust68::{Bus, Cpu};
 
@@ -500,7 +501,9 @@ fn tick_fait_progresser_le_ym2149() {
     st.write8(YM2149_DATA, 0x0F);
 
     st.tick(4);
-    assert_eq!(st.ym2149.channel_level(0), 30, "le YM2149 doit avoir été cadencé par tick()");
+    // 31, pas 30 : amplitude 4 bits -> échelle 5 bits façon Hatari
+    // (`YmVolume4to5`), pas un simple ×2 — voir `Ym2149::channel_level`.
+    assert_eq!(st.ym2149.channel_level(0), 31, "le YM2149 doit avoir été cadencé par tick()");
 }
 
 #[test]
@@ -524,8 +527,10 @@ fn shifter_registres_mappes_correctement() {
 }
 
 /// Test d'intégration bout-en-bout : écrit un motif connu en RAM vidéo,
-/// avance le board d'une ligne complète (512 cycles CPU, PAL), et vérifie
-/// que le framebuffer contient les pixels attendus.
+/// avance le board jusqu'à la première ligne AFFICHÉE (voir
+/// `Glue::display_line` — un vrai blanking haut de 63 lignes PAL précède la
+/// première ligne affichée, nécessaire pour la suppression de bordure
+/// haute STE), et vérifie que le framebuffer contient les pixels attendus.
 #[test]
 fn tick_rend_une_ligne_video_dans_le_framebuffer() {
     let mut st = AtariSt::new(0x10000, vec![]);
@@ -541,10 +546,11 @@ fn tick_rend_une_ligne_video_dans_le_framebuffer() {
     st.write8(0x0000, 0x80);
     st.write8(0x0001, 0x00);
 
-    st.tick(512); // une ligne PAL complète
+    st.tick(512 * 63); // traverse le blanking haut (63 lignes PAL) jusqu'à la 1re ligne affichée
 
     assert!(!st.framebuffer.is_empty(), "une ligne doit avoir été rendue");
-    let line0 = &st.framebuffer[st.glue.current_line() as usize];
+    assert_eq!(st.glue.display_line(), Some(0));
+    let line0 = &st.framebuffer[st.glue.display_line().unwrap() as usize];
     assert_eq!(line0.len(), 320);
     assert_eq!(line0[0], (255, 255, 255), "pixel 0 -> couleur 1 (blanc)");
     assert_eq!(line0[1], (0, 0, 0), "pixel 1 -> couleur 0 (noir)");
@@ -564,6 +570,243 @@ fn tick_rend_une_trame_complete() {
         st.framebuffer.iter().all(|line| line.len() == 320),
         "chaque ligne rendue doit avoir la largeur de la résolution basse"
     );
+}
+
+/// Suppression de bordure haute STE bout-en-bout : une écriture `$FF820A`
+/// bien placée en tout début de trame doit faire apparaître des lignes
+/// supplémentaires (venant du blanking haut, normalement invisible) au
+/// DÉBUT du framebuffer de la trame.
+///
+/// Ticke ligne par ligne (512 cycles à la fois), pas la trame entière en
+/// un seul appel : `Glue::tick` remet `display_start`/`display_end` à leur
+/// valeur nominale au bouclage de trame, DANS le même appel qui les aurait
+/// étendus — un `tick()` couvrant la trame entière d'un coup perdrait donc
+/// l'extension avant même que la boucle de rattrapage de rendu n'ait eu
+/// l'occasion de l'utiliser (voir la doc de `Glue::display_index`). Sans
+/// conséquence en usage réel : l'appelant (frontend SDL2, `AtariSt::tick`
+/// documentée pour ça) ticke après CHAQUE instruction CPU, une poignée de
+/// cycles à la fois, jamais une trame entière — seul un test "en gros"
+/// comme un géant `tick(512*313)` isolé y serait exposé.
+#[test]
+fn ecriture_glue_sync_precoce_supprime_la_bordure_haute_bout_en_bout() {
+    let mut st = AtariSt::new(0x1_0000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+    // cycle ~200 dans la ligne : assez tôt pour rester dans la fenêtre de
+    // suppression de bordure VERTICALE (`LINE_REMOVE_BORDER_CYCLE`=504),
+    // mais hors des fenêtres de nudge HORIZONTAL `LEFT_PLUS_2`/
+    // `RIGHT_MINUS_2` (`<=36`) et `RIGHT_OFF` (`]372,376]`) — écrire à
+    // cycle 0 pile déclencherait AUSSI le nudge horizontal (même registre,
+    // effet réel et voulu du matériel, voir `Shifter::write_sync`), ce qui
+    // brouillerait ce test dédié à l'effet vertical seul.
+    st.tick(200);
+    st.write8(GLUE_SYNC, 0x00); // bit1=0 : 60Hz
+
+    st.tick(312); // termine la ligne 0
+    for _ in 0..312 {
+        st.tick(512);
+    }
+
+    // 63-34 = 29 lignes supplémentaires (voir `Glue::write_sync`), en plus
+    // des 200 lignes nominales.
+    assert_eq!(
+        st.framebuffer.len(),
+        229,
+        "200 lignes nominales + 29 lignes de bordure haute révélées"
+    );
+    assert!(st.framebuffer.iter().all(|line| line.len() == 320));
+}
+
+/// Symétrique : suppression de bordure basse bout-en-bout, écriture juste
+/// avant la fin nominale de la fenêtre affichée. Même raison de ticker
+/// ligne par ligne que le test précédent.
+#[test]
+fn ecriture_glue_sync_en_fin_d_affichage_supprime_la_bordure_basse_bout_en_bout() {
+    let mut st = AtariSt::new(0x1_0000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+
+    for _ in 0..262 {
+        st.tick(512); // jusqu'à la dernière ligne affichée nominale (262, PAL)
+    }
+    // Même raison qu'au test précédent (cycle ~200, hors fenêtres de nudge
+    // horizontal) : voir le commentaire là-bas.
+    st.tick(200);
+    st.write8(GLUE_SYNC, 0x00); // bit1=0 : 60Hz
+    st.tick(312); // termine cette ligne
+    for _ in 0..50 {
+        st.tick(512); // le reste de la trame
+    }
+
+    assert_eq!(
+        st.framebuffer.len(),
+        247,
+        "200 lignes nominales + 47 lignes de bordure basse révélées"
+    );
+    assert!(st.framebuffer.iter().all(|line| line.len() == 320));
+}
+
+/// Suppression de bordure DROITE (`RIGHT_OFF`) bout-en-bout, via une
+/// écriture `$FF820A` en milieu de trame (loin des bords, pour n'activer
+/// QUE l'effet horizontal côté `Shifter` — voir `Shifter::write_sync` — et
+/// pas l'overscan vertical de `Glue::write_sync`, qui ne se déclenche que
+/// près du haut/bas de la fenêtre affichée).
+#[test]
+fn ecriture_glue_sync_en_milieu_de_ligne_supprime_la_bordure_droite_bout_en_bout() {
+    let mut st = AtariSt::new(0x1_0000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+
+    for _ in 0..100 {
+        st.tick(512); // avance jusqu'à une ligne bien affichée, loin des bords de trame
+    }
+    st.tick(374); // cycle 374 : dans la fenêtre RIGHT_OFF ]372,376]
+    st.write8(GLUE_SYNC, 0x00); // bit1=0 : 60Hz
+    st.tick(512 - 374); // termine la ligne : déclenche le rendu (HBL)
+
+    // Vérifié empiriquement (comme pour la Phase 0/1) : après 100 tick(512),
+    // `display_line()`==Some(37) et framebuffer[37] est déjà rendu (ligne
+    // PRÉCÉDENTE) — c'est le rendu qui se termine par CE tick(512-374), une
+    // ligne plus loin, qui reçoit l'écriture ci-dessus : framebuffer[38].
+    assert_eq!(
+        st.framebuffer[38].len(),
+        320 + 88,
+        "320 px nominaux + 88 px de bordure droite (44 octets, 4 plans)"
+    );
+    // Les autres lignes de la trame, non concernées par cette écriture
+    // ponctuelle, restent à la largeur nominale.
+    assert_eq!(st.framebuffer[37].len(), 320);
+}
+
+/// "Gating" cycle-exact des écritures de défilement fin STE
+/// (`$FF8264`/`$FF8265`) : une écriture avant le début d'affichage actif
+/// de la ligne courante (`Glue::line_start_cycle`, 56 en PAL) s'y applique
+/// immédiatement — voir la doc de `AtariSt::write8` sur ces adresses et
+/// `Shifter::write_hscroll`. Motif RAM identique aux tests unitaires du
+/// Shifter (plan 0, mot tout à 1) : pixel 15 reste blanc sans décalage
+/// actif, devient noir dès que le décalage+préchargement s'applique
+/// (atteint le groupe supplémentaire, laissé à zéro).
+#[test]
+fn ecriture_hscroll_avant_debut_affichage_s_applique_a_la_ligne_courante() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+    st.write16(shifter_addr::PALETTE_BASE + 2, 0x0777); // couleur 1 = blanc
+
+    // Traverse d'abord le blanking haut (63 lignes PAL, voir
+    // `Glue::display_line`) pour atteindre la première ligne réellement
+    // affichée — sans quoi l'écriture qui suit tomberait dans la bordure
+    // (toujours immédiate, ce n'est pas ce que ce test vérifie). Ce
+    // premier passage rend DÉJÀ la ligne affichée 0 (framebuffer[0], motif
+    // non pertinent ici — décalage encore nul à ce moment) : c'est la
+    // ligne affichée SUIVANTE (framebuffer[1]) que ce test cible, motif
+    // placé à l'octet 160 (0xA0, là où elle commence).
+    st.tick(512 * 63);
+    assert_eq!(st.glue.display_line(), Some(0));
+    st.write8(0x00A0, 0xFF);
+    st.write8(0x00A1, 0xFF); // plan 0, groupe 0 de la ligne affichée 1 = 0xFFFF
+
+    st.tick(4); // bien avant line_start_cycle (56 en PAL)
+    assert!(st.glue.cycles_in_line() <= st.glue.line_start_cycle());
+    st.write8(shifter_addr::HSCROLL_PREFETCH, 1);
+    assert_eq!(st.shifter.h_scroll_count(), 1, "écriture précoce : effective immédiatement");
+
+    st.tick(512 - 4); // termine la ligne affichée 1
+    let line1 = &st.framebuffer[1];
+    assert_eq!(line1[15], (0, 0, 0), "ligne affichée 1 : le décalage s'est bien appliqué à CETTE ligne");
+}
+
+/// Symétrique du test précédent : une écriture APRÈS le début d'affichage
+/// actif ne doit PAS affecter la ligne en cours, seulement la suivante.
+#[test]
+fn ecriture_hscroll_apres_debut_affichage_s_applique_a_la_ligne_suivante() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+    st.write16(shifter_addr::PALETTE_BASE + 2, 0x0777);
+
+    // Traverse le blanking haut (voir le test précédent) : rend déjà la
+    // ligne affichée 0 (motif non pertinent). Motif pour la ligne affichée
+    // 1 (débute à l'octet 160, lue SANS décalage donc SANS groupe
+    // supplémentaire : 160 octets consommés — écriture trop tardive pour
+    // elle) et pour la ligne affichée 2 (débute à l'octet 320, lue AVEC
+    // décalage une fois celui-ci effectif).
+    st.tick(512 * 63);
+    assert_eq!(st.glue.display_line(), Some(0));
+    st.write8(0x00A0, 0xFF); // 160 = 0xA0, ligne affichée 1
+    st.write8(0x00A1, 0xFF);
+    st.write8(0x0140, 0xFF); // 320 = 0x140, ligne affichée 2
+    st.write8(0x0141, 0xFF);
+
+    st.tick(100); // après line_start_cycle (56 en PAL)
+    assert!(st.glue.cycles_in_line() > st.glue.line_start_cycle());
+    st.write8(shifter_addr::HSCROLL_PREFETCH, 1);
+    assert_eq!(st.shifter.h_scroll_count(), 0, "écriture tardive : pas encore effective (en attente)");
+
+    st.tick(512 - 100); // termine la ligne affichée 1 SANS le décalage
+    assert_eq!(st.shifter.h_scroll_count(), 1, "commit à la fin de la ligne affichée 1 : effectif pour la suite");
+    let line1 = &st.framebuffer[1];
+    assert_eq!(line1[15], (255, 255, 255), "ligne affichée 1 : pas encore décalée (écriture trop tardive pour elle)");
+
+    st.tick(512); // termine la ligne affichée 2, décalage désormais actif
+    let line2 = &st.framebuffer[2];
+    assert_eq!(line2[15], (0, 0, 0), "ligne affichée 2 : décalage effectif dès cette ligne");
+}
+
+/// En bordure verticale (hors de la fenêtre affichée, voir
+/// `Glue::display_line`), il n'y a aucune ligne en cours de rendu à
+/// protéger : l'écriture s'applique TOUJOURS immédiatement, quelle que
+/// soit la position en cycles. Le tout début de la trame (blanking haut,
+/// 63 lignes PAL) est déjà une zone de bordure — pas besoin de ticker
+/// jusqu'à la bordure basse pour le vérifier.
+#[test]
+fn ecriture_en_bordure_verticale_s_applique_toujours_immediatement() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+    assert_eq!(st.glue.display_line(), None, "blanking haut dès la construction");
+
+    st.tick(100); // position quelconque, au-delà de line_start_cycle
+    st.write8(shifter_addr::HSCROLL_PREFETCH, 5);
+    assert_eq!(
+        st.shifter.h_scroll_count(),
+        5,
+        "en bordure, aucune ligne à protéger : effectif immédiatement"
+    );
+}
+
+/// `$FF820F` (LineWidth) est gaté par la fin d'affichage actif
+/// (`Glue::line_end_cycle`, 376 en PAL), PAS le début — seuil différent de
+/// celui du défilement, reproduit fidèlement (voir `Video_LineWidth_WriteByte`
+/// dans Hatari : LineWidth s'ajoute à l'adresse quand l'affichage actif se
+/// termine, pas à son début).
+#[test]
+fn ecriture_linewidth_gatee_par_la_fin_d_affichage_pas_le_debut() {
+    let mut st = AtariSt::new(0x1000, vec![]);
+    st.write8(shifter_addr::RESOLUTION, 0b00);
+
+    // Traverse le blanking haut pour atteindre le début de la première
+    // ligne affichée (voir les tests de gating du défilement plus haut) —
+    // ce passage rend déjà la ligne affichée 0 et avance le compteur vidéo
+    // de 160 octets ; le reposer à zéro rend les calculs qui suivent
+    // lisibles (avance de CETTE ligne uniquement), sans changer ce que ce
+    // test vérifie (le "gating" de l'écriture, pas la valeur absolue du
+    // compteur).
+    st.tick(512 * 63);
+    assert_eq!(st.glue.display_line(), Some(0));
+    st.write8(shifter_addr::VIDEO_COUNTER_HIGH, 0);
+    st.write8(shifter_addr::VIDEO_COUNTER_MID, 0);
+    st.write8(shifter_addr::VIDEO_COUNTER_LOW, 0);
+
+    // Écriture avant line_end_cycle (376 en PAL) : effective sur la ligne 0.
+    st.tick(370);
+    assert!(st.glue.cycles_in_line() <= st.glue.line_end_cycle());
+    st.write8(shifter_addr::LINE_WIDTH, 3);
+    assert_eq!(st.shifter.line_width(), 3, "avant la fin d'affichage : effectif immédiatement");
+    st.tick(512 - 370);
+    assert_eq!(st.read8(shifter_addr::VIDEO_COUNTER_LOW), 160 + 3 * 2, "ligne 0 : avance avec LineWidth=3");
+
+    // Écriture après line_end_cycle : différée à la ligne suivante.
+    st.tick(400);
+    assert!(st.glue.cycles_in_line() > st.glue.line_end_cycle());
+    st.write8(shifter_addr::LINE_WIDTH, 5);
+    assert_eq!(st.shifter.line_width(), 3, "après la fin d'affichage : pas encore effectif (en attente)");
+    st.tick(512 - 400);
+    assert_eq!(st.shifter.line_width(), 5, "commit à la fin de la ligne 1 : effectif pour la suite");
 }
 
 #[test]

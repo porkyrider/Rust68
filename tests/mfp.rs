@@ -86,50 +86,49 @@ fn ipr_isr_ne_s_effacent_que_par_ecriture_de_zero() {
 
 #[test]
 fn iack_calcule_le_vecteur_et_arme_isr_dans_les_deux_modes_eoi() {
+    // Bit S (bit 3 du VR) — sens contre-intuitif, confirmé contre Hatari
+    // (`mfp.c`, `MFP_ProcessIACK`) : bit POSÉ = SEI ("software
+    // end-of-interrupt", ISR reste armé jusqu'à effacement logiciel), bit à
+    // 0 = EOI AUTOMATIQUE (le silicium arme PUIS efface ISR dans le MÊME
+    // cycle IACK — jamais observable posé). Voir la doc de `Mfp::iack`.
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::AER, 0x01);
     mfp.write(reg::IERB, 1 << channel::GPIP0);
     mfp.write(reg::IMRB, 1 << channel::GPIP0);
-    mfp.write(reg::VR, 0x40); // base vecteur 0x40 (bits 7-3), pas d'auto-EOI (bit3=0)
+    mfp.write(reg::VR, 0x40); // base vecteur 0x40 (bits 7-3), bit3=0 : EOI automatique
     mfp.set_gpip_input(0, true);
 
     let vector = mfp.iack();
     assert_eq!(vector, 0x40, "vecteur = VR[7:4] | canal (canal 0 ici)");
-    assert_eq!(
-        mfp.read(reg::ISRB) & 1,
-        1,
-        "sans auto-EOI, ISR s'arme après l'IACK"
-    );
+    assert_eq!(mfp.read(reg::ISRB) & 1, 0, "EOI automatique : ISR jamais observable posé après l'IACK");
     assert_eq!(mfp.read(reg::IPRB) & 1, 0, "IPR est effacé par l'IACK");
 
-    // Mode auto-EOI (bit 3 du VR) : ISR s'arme quand même après l'IACK — ce
-    // bit dispense seulement le logiciel d'avoir à l'effacer lui-même en fin
-    // de traitement (le matériel le ferait automatiquement), il ne rend pas
-    // le bit invisible pendant que le gestionnaire tourne. Confirmé par la
-    // cartouche de diagnostic usine STe : son gestionnaire d'interruption
-    // partagé (test "T0 MFP timer") programme VR=0x48 puis distingue quel
-    // timer a déclenché en lisant précisément ces bits ISR — un mécanisme
-    // qui ne pourrait jamais fonctionner sur aucun ST/STE réel si ISR
-    // n'était jamais armé en auto-EOI.
+    // Mode SEI (bit 3 posé) : ISR s'arme et RESTE posé après l'IACK, jusqu'à
+    // effacement logiciel explicite — c'est ce mode qu'utilise la
+    // cartouche de diagnostic usine STe (test "T0 MFP timer", VR=0x48) :
+    // son gestionnaire d'interruption partagé (une seule routine aux 4
+    // vecteurs Timer A/B/C/D) distingue quel timer a déclenché en lisant
+    // précisément ces bits ISR avant de les effacer lui-même.
     let mut mfp = Mfp::new();
     mfp.write(reg::DDR, 0x00);
     mfp.write(reg::AER, 0x01);
     mfp.write(reg::IERB, 1 << channel::GPIP0);
     mfp.write(reg::IMRB, 1 << channel::GPIP0);
-    mfp.write(reg::VR, 0x48); // bit3 = auto-EOI
+    mfp.write(reg::VR, 0x48); // bit3 posé : SEI
     mfp.set_gpip_input(0, true);
     mfp.iack();
-    assert_eq!(mfp.read(reg::ISRB) & 1, 1, "auto-EOI : ISR s'arme aussi après l'IACK");
+    assert_eq!(mfp.read(reg::ISRB) & 1, 1, "SEI : ISR reste armé après l'IACK");
 }
 
 #[test]
 fn iack_exclut_le_bit_s_auto_eoi_du_vecteur() {
-    // Le bit 3 du VR (S, auto-EOI) est un bit de contrôle séparé, PAS le
-    // bit de poids fort du numéro de canal : seuls VR[7:4] forment la base
-    // du vecteur, les 4 bits de canal (0-15) occupent tout le bas. Un TOS
-    // réel programme VR=0x48 (base 0x40, auto-EOI actif) puis installe ses
-    // gestionnaires à `0x100 + canal*4` (vecteur `0x40 | canal`) — confondre
+    // Le bit 3 du VR (S, SEI/software-EOI quand posé — voir la doc de
+    // `Mfp::iack`) est un bit de contrôle séparé, PAS le bit de poids fort
+    // du numéro de canal : seuls VR[7:4] forment la base du vecteur, les 4
+    // bits de canal (0-15) occupent tout le bas. Un TOS réel programme
+    // VR=0x48 (base 0x40, SEI actif) puis installe ses gestionnaires à
+    // `0x100 + canal*4` (vecteur `0x40 | canal`) — confondre
     // le bit S avec le bit haut du canal calculerait `0x48 | canal` à la
     // place, un décalage de 8 vecteurs (32 octets) qui fait vectorer vers
     // un gestionnaire jamais installé (bug réel rencontré en faisant
@@ -171,6 +170,87 @@ fn priorite_du_canal_le_plus_haut() {
     assert_eq!(vector & 0x07, channel::GPIP2);
     let vector2 = mfp.iack();
     assert_eq!(vector2 & 0x07, channel::GPIP0);
+}
+
+#[test]
+fn un_isr_de_priorite_inferieure_ne_bloque_pas_un_canal_superieur() {
+    // Canal 5 (GPIP5, priorité basse) déjà "in service" : un nouveau canal
+    // de priorité STRICTEMENT supérieure (TIMER_A=13) doit quand même
+    // pouvoir demander service — c'est la préemption d'un ISR de priorité
+    // inférieure par un canal supérieur, le vrai comportement MC68901
+    // (voir la doc de `Mfp::highest_priority_pending`).
+    let mut mfp = Mfp::new();
+    // Mode SEI (bit 3 du VR posé) : ISR reste armé après l'IACK jusqu'à
+    // effacement logiciel — nécessaire ici pour observer la préemption (en
+    // EOI automatique, ISR ne reste jamais posé, voir la doc de
+    // `Mfp::iack`).
+    mfp.write(reg::VR, 0x08);
+    mfp.write(reg::DDR, 0x00);
+    mfp.write(reg::AER, 0xFF);
+    mfp.write(reg::IERB, 1 << channel::GPIP5);
+    mfp.write(reg::IMRB, 1 << channel::GPIP5);
+    mfp.set_gpip_input(5, true);
+    let v = mfp.iack(); // GPIP5 passe "in service" (ISR armé, IPR effacé)
+    assert_eq!(v & 0x0F, channel::GPIP5);
+    assert_eq!(mfp.read(reg::ISRB) & (1 << channel::GPIP5), 1 << channel::GPIP5);
+
+    mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
+    mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
+    mfp.write(reg::TADR, 1);
+    mfp.write(reg::TACR, 1); // démarre, ÷4
+    mfp.tick(1000); // largement de quoi déclencher au moins une fois
+
+    assert!(
+        mfp.interrupt_requested(),
+        "TIMER_A (canal 13) doit préempter GPIP5 (canal 7) déjà in-service"
+    );
+    let v2 = mfp.iack();
+    assert_eq!(v2 & 0x0F, channel::TIMER_A, "TIMER_A doit être le canal acquitté");
+}
+
+#[test]
+fn un_isr_de_priorite_superieure_bloque_un_canal_inferieur() {
+    // Symétrique du test précédent : canal 13 (TIMER_A) in service, un
+    // nouveau canal 5 (GPIP2, priorité inférieure) pending+non masqué ne
+    // doit PAS générer de requête tant que TIMER_A n'est pas acquitté.
+    let mut mfp = Mfp::new();
+    // Mode SEI (bit 3 du VR posé), même raison que le test précédent : ISR
+    // doit rester posé après l'IACK pour observer le blocage.
+    mfp.write(reg::VR, 0x08);
+    mfp.write(reg::IERA, 1 << (channel::TIMER_A - 8));
+    mfp.write(reg::IMRA, 1 << (channel::TIMER_A - 8));
+    mfp.write(reg::TADR, 1);
+    mfp.write(reg::TACR, 1);
+    mfp.tick(1000);
+    assert!(mfp.interrupt_requested());
+    let v = mfp.iack();
+    assert_eq!(v & 0x0F, channel::TIMER_A);
+    assert_eq!(
+        mfp.read(reg::ISRA) & (1 << (channel::TIMER_A - 8)),
+        1 << (channel::TIMER_A - 8)
+    );
+
+    mfp.write(reg::DDR, 0x00);
+    mfp.write(reg::AER, 0xFF);
+    mfp.write(reg::IERB, 1 << channel::GPIP2);
+    mfp.write(reg::IMRB, 1 << channel::GPIP2);
+    mfp.set_gpip_input(2, true);
+
+    assert_eq!(mfp.read(reg::IPRB) & (1 << channel::GPIP2), 1 << channel::GPIP2, "GPIP2 reste pending");
+    assert!(
+        !mfp.interrupt_requested(),
+        "GPIP2 (canal 2) ne doit pas demander service tant que TIMER_A (canal 13) est in-service"
+    );
+
+    // Acquitter TIMER_A (SEI, mode armé explicitement ci-dessus) libère la
+    // voie pour GPIP2.
+    mfp.write(reg::ISRA, 0x00);
+    assert!(
+        mfp.interrupt_requested(),
+        "TIMER_A acquitté : GPIP2 redevient éligible"
+    );
+    let v2 = mfp.iack();
+    assert_eq!(v2 & 0x0F, channel::GPIP2);
 }
 
 #[test]

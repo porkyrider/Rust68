@@ -43,6 +43,7 @@ use rust68::peripherals::atari_st::drive_sound::{wav, DriveSound, Slot};
 use rust68::peripherals::atari_st::msa;
 use rust68::peripherals::atari_st::stx::StxImage;
 use rust68::peripherals::atari_st::wd1772::{FloppyDisk, RawDiskImage};
+use rust68::peripherals::atari_st::ym2149::mix_channels_model;
 use rust68::systems::atari_st::AtariSt;
 use rust68::trace::FileTraceSink;
 use rust68::{Bus, Cpu, TraceSink, TracingBus};
@@ -1134,15 +1135,22 @@ fn main() {
                 drive_sound.mix_into(&mut drive_sample);
                 let raw_left = raw_left + drive_sample[0] as f32;
                 let raw_right = raw_right + drive_sample[0] as f32;
-                // DC retiré AVANT le gain (artefact de notre mixage PSG, pas
-                // un phénomène physique que le volume devrait mettre à
-                // l'échelle) ; gain lissé APRÈS (voir sa doc plus haut).
+                // DC retiré AVANT le filtre Microwire (artefact de notre
+                // mixage PSG, pas un phénomène physique que le volume/le
+                // filtre devrait mettre à l'échelle) ; gain lissé (évite un
+                // « clic » de zipper noise sur un changement de volume
+                // brutal) puis injecté DANS le filtre graves/aigus (façon
+                // Hatari, `DmaSnd_IIRfilterL`/`R` — le gain s'applique à
+                // l'entrée du filtre, pas en aval, voir la doc de
+                // `Microwire::filter_left`).
                 let dc_left = dc_blocker_left.process(raw_left);
                 let dc_right = dc_blocker_right.process(raw_right);
                 gain_smooth_left += (st.microwire.left_gain() - gain_smooth_left) * GAIN_SMOOTH_COEFF;
                 gain_smooth_right += (st.microwire.right_gain() - gain_smooth_right) * GAIN_SMOOTH_COEFF;
-                let left = (dc_left * gain_smooth_left).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                let right = (dc_right * gain_smooth_right).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                let filtered_left = st.microwire.filter_left(dc_left, gain_smooth_left);
+                let filtered_right = st.microwire.filter_right(dc_right, gain_smooth_right);
+                let left = filtered_left.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                let right = filtered_right.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                 // Entrelacé L,R,L,R... (file audio stéréo, voir `desired_spec`).
                 audio_buffer.push(left);
                 audio_buffer.push(right);
@@ -1235,20 +1243,23 @@ fn main() {
 /// d'échantillonnage audio) donnerait un repliement de spectre sonnant
 /// comme un parasite granuleux plutôt qu'une tonalité propre) et le DMA
 /// Sound (STE, vrais échantillons gauche/droite indépendants) en un
-/// échantillon stéréo, **brut** : ni gain Microwire ni retrait de DC ni
-/// écrêtage — voir leur application séparée dans `main` (gain lissé pour
-/// éviter un « clic » de zipper noise, DC retiré avant ce gain puisque
-/// c'est un artefact de ce mixage, pas un phénomène physique que le volume
-/// devrait mettre à l'échelle).
+/// échantillon stéréo, **brut** : ni gain Microwire (volume ET graves/
+/// aigus) ni retrait de DC ni écrêtage — voir leur application séparée
+/// dans `main` (gain lissé pour éviter un « clic » de zipper noise, DC
+/// retiré avant ce gain puisque c'est un artefact de ce mixage, pas un
+/// phénomène physique que le volume devrait mettre à l'échelle ; filtre
+/// graves/aigus après, façon Hatari `DmaSnd_Apply_LMC` — voir la doc de
+/// `Microwire`).
 ///
-/// Chaque contribution est réduite de moitié pour laisser de la marge et
-/// éviter l'écrêtage quand les deux sources jouent en même temps — pas un
-/// étage de gain fidèle au LMC1992 (bass/treble non filtrés, voir la doc de
-/// `DmaSound`), suffisant pour une lecture correcte et sans coupure.
+/// Les 3 canaux PSG sont combinés de façon NON-LINÉAIRE (façon Hatari,
+/// [`mix_channels_model`], voir sa doc) plutôt que sommés : le DAC réel du
+/// YM2149 sature nettement en dessous de 3× une seule voie quand plusieurs
+/// canaux jouent à pleine amplitude simultanément. Le résultat
+/// (`0.0..=65535.0`) est centré et réduit de moitié pour laisser de la
+/// marge et éviter l'écrêtage une fois combiné au DMA Sound.
 fn mix_sample(ym_levels: [f32; 3], dma_lr: (i8, i8)) -> (f32, f32) {
-    let total = ym_levels[0] + ym_levels[1] + ym_levels[2];
-    // total in 0.0..=93.0 ; centre sur 0 et met à l'échelle sur la moitié de la plage i16.
-    let ym_sample = (total - 46.0) * (i16::MAX as f32 / 46.0) / 2.0;
+    let combined = mix_channels_model(ym_levels); // 0.0..=65535.0
+    let ym_sample = (combined - 32767.5) * (i16::MAX as f32 / 32767.5) / 2.0;
 
     let (l, r) = dma_lr;
     // Échantillons PCM 8 bits signés (-128..127), mis à l'échelle sur

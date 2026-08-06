@@ -1,7 +1,7 @@
 #![cfg(feature = "atari-st")]
 //! Tests unitaires du YM2149 (`rust68::peripherals::atari_st::ym2149`).
 
-use rust68::peripherals::atari_st::ym2149::{Ym2149, bus_offset, reg};
+use rust68::peripherals::atari_st::ym2149::{Ym2149, bus_offset, mix_channels_model, reg};
 
 fn select(chip: &mut Ym2149, r: u8) {
     chip.write(bus_offset::SELECT, r);
@@ -60,8 +60,9 @@ fn tonalite_bascule_au_rythme_programme() {
         levels.push(chip.channel_level(0));
     }
     // Période minimale (1) : bascule au bout de 8 cycles puce, puis
-    // alterne 30 (0x0F*2) / 0 tous les 8 cycles suivants.
-    assert_eq!(levels, vec![30, 0, 30, 0, 30, 0]);
+    // alterne 31 (VOLUME_4_TO_5[0x0F], pas un simple ×2 — voir
+    // `Ym2149::channel_level`) / 0 tous les 8 cycles suivants.
+    assert_eq!(levels, vec![31, 0, 31, 0, 31, 0]);
 }
 
 #[test]
@@ -76,15 +77,15 @@ fn take_averaged_levels_moyenne_les_bascules_intermediaires() {
     write_reg(&mut chip, reg::TONE_A_FINE, 1); // bascule tous les 8 cycles puce
     write_reg(&mut chip, reg::TONE_A_COARSE, 0);
     write_reg(&mut chip, reg::MIXER, 0b0000_1000); // tonalité A active, bruit A coupé
-    write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F); // niveau 30 quand "haut"
+    write_reg(&mut chip, reg::AMPLITUDE_A, 0x0F); // niveau 31 quand "haut" (VOLUME_4_TO_5[0x0F])
 
     // Un seul gros tick couvrant un nombre ENTIER de périodes complètes (80
     // cycles puce = 320 cycles CPU = 5 × 16 cycles, période=1 basculant
     // tous les 8 cycles puce) : la moyenne doit valoir exactement 50% du
-    // niveau max (30), pas juste l'état final ponctuel après la boucle.
+    // niveau max (31), pas juste l'état final ponctuel après la boucle.
     chip.tick(320);
     let levels = chip.take_averaged_levels();
-    assert!((levels[0] - 15.0).abs() < 0.01, "moyenne attendue = 15 (50% de 30), obtenu {}", levels[0]);
+    assert!((levels[0] - 15.5).abs() < 0.01, "moyenne attendue = 15.5 (50% de 31), obtenu {}", levels[0]);
 
     // L'accumulateur est remis à zéro : un appel immédiatement après sans
     // nouveau tick() ne doit pas réutiliser l'ancienne moyenne.
@@ -100,7 +101,7 @@ fn mixer_coupe_tonalite_ou_bruit_selon_les_bits() {
     // doit rester au niveau plein (portillon "activé" = 1 en interne).
     write_reg(&mut chip, reg::MIXER, 0b0000_1001);
     chip.tick(100);
-    assert_eq!(chip.channel_level(0), 30, "tone+bruit coupés : porte toujours ouverte");
+    assert_eq!(chip.channel_level(0), 31, "tone+bruit coupés : porte toujours ouverte");
 }
 
 #[test]
@@ -197,4 +198,53 @@ fn port_a_bascule_entre_entree_et_sortie_selon_ddr() {
     write_reg(&mut chip, reg::MIXER, 0b0100_0000);
     write_reg(&mut chip, reg::IO_PORT_A, 0x99);
     assert_eq!(read_reg(&mut chip, reg::IO_PORT_A), 0x99);
+}
+
+// --- Mixage non-linéaire 3 canaux (façon Hatari) --------------------------
+
+#[test]
+fn silence_total_donne_un_niveau_quasi_nul() {
+    assert!(mix_channels_model([0.0, 0.0, 0.0]) < 0.01);
+}
+
+#[test]
+fn trois_canaux_au_maximum_donnent_le_niveau_maximum() {
+    let level = mix_channels_model([31.0, 31.0, 31.0]);
+    assert!((level - 65535.0).abs() < 1.0, "attendu ~65535, obtenu {level}");
+}
+
+#[test]
+fn le_mixage_sature_au_lieu_de_sommer_lineairement() {
+    // Propriété centrale du modèle non-linéaire : combiner 3 canaux à
+    // pleine amplitude ne doit PAS donner 3× le niveau d'un seul canal
+    // (le DAC réel sature) — une simple somme linéaire donnerait
+    // exactement 3× par construction.
+    let one_channel = mix_channels_model([31.0, 0.0, 0.0]);
+    let three_channels = mix_channels_model([31.0, 31.0, 31.0]);
+    assert!(
+        three_channels < one_channel * 3.0,
+        "3 canaux ({three_channels}) devrait saturer sous 3× 1 canal ({})",
+        one_channel * 3.0
+    );
+    // Toujours strictement croissant (plus de canaux actifs = plus fort),
+    // juste pas proportionnellement.
+    assert!(three_channels > one_channel);
+}
+
+#[test]
+fn le_mixage_est_croissant_avec_le_niveau_d_un_canal() {
+    let low = mix_channels_model([5.0, 0.0, 0.0]);
+    let high = mix_channels_model([25.0, 0.0, 0.0]);
+    assert!(high > low, "un niveau de canal plus élevé doit donner une sortie plus forte");
+}
+
+#[test]
+fn interpolation_fractionnaire_reste_entre_les_niveaux_entiers_voisins() {
+    // `take_averaged_levels` renvoie des niveaux FRACTIONNAIRES (moyenne
+    // temporelle) — le modèle doit rester monotone/borné pour une valeur
+    // intermédiaire, pas juste pour des entiers.
+    let at_10 = mix_channels_model([10.0, 0.0, 0.0]);
+    let at_10_5 = mix_channels_model([10.5, 0.0, 0.0]);
+    let at_11 = mix_channels_model([11.0, 0.0, 0.0]);
+    assert!(at_10 < at_10_5 && at_10_5 < at_11, "10={at_10} 10.5={at_10_5} 11={at_11}");
 }

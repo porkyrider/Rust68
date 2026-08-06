@@ -117,6 +117,11 @@ pub const DMA_ADDR_MID: u32 = 0xFF860B;
 /// Compteur d'adresse DMA, octet bas.
 pub const DMA_ADDR_LOW: u32 = 0xFF860D;
 
+/// Registre de synchronisation du GLUE (bit 1 = sélection 50/60Hz externe)
+/// — voir [`crate::peripherals::atari_st::glue::Glue::write_sync`] pour la
+/// suppression de bordure verticale STE que sa cycle-position déclenche.
+pub const GLUE_SYNC: u32 = 0xFF820A;
+
 /// Base des registres du Blitter, sur STE réel.
 pub const BLITTER_BASE: u32 = 0xFF8A00;
 
@@ -135,20 +140,19 @@ pub const IO_END: u32 = 0x00FF_FFFF;
 pub const CARTRIDGE_BASE: u32 = 0xFA0000;
 pub const CARTRIDGE_END: u32 = 0xFBFFFF;
 
-/// Lignes visibles par trame (200, en basse/moyenne résolution, quel que
-/// soit PAL/NTSC — voir [`AtariSt::tick`] pour l'usage vis-à-vis du Timer B
-/// du MFP).
-const VISIBLE_LINES: usize = 200;
-
-/// DMA sound + Microwire (STE), non implémenté : simple stub qui répond
-/// `0x00` en lecture (pas `0xFF` comme le reste de la zone d'E/S non
-/// émulée) et ignore les écritures. Nécessaire car le TOS >= 1.62 (STE)
-/// écrit puis relit le registre Microwire (`$FF8922`) en boucle en
-/// attendant qu'il retombe à zéro (fin de décalage série) au tout début du
-/// boot — avec la réponse générique `0xFF` (bits toujours à 1), cette
-/// attente ne se termine jamais. Pas une émulation réelle du DMA
-/// sound/LMC1992 : juste de quoi ne pas bloquer indéfiniment un TOS STE
-/// qui sonde cette zone.
+/// DMA sound (STE) — voir [`crate::peripherals::atari_st::dma_sound::DmaSound`]
+/// (registre-fidèle, lecture PCM 8 bits mono/stéréo aux 4 fréquences
+/// matérielles, simplifié : pas de FIFO 8 octets ni de filtre passe-bas,
+/// voir sa doc de module). Le Microwire/LMC1992 (`$FF8920`/`22`/`24`) est
+/// géré séparément, voir [`crate::peripherals::atari_st::microwire::Microwire`].
+/// En dessous de `$FF8922` (registre Microwire DATA), une réponse `0x00`
+/// (pas `0xFF` comme le reste de la zone d'E/S non émulée) reste nécessaire
+/// pour les adresses non mappées à un registre réel de ces deux
+/// périphériques : le TOS >= 1.62 (STE) écrit puis relit le registre
+/// Microwire DATA en boucle en attendant qu'il retombe à zéro (fin de
+/// décalage série) au tout début du boot — avec la réponse générique
+/// `0xFF` (bits toujours à 1), cette attente ne se terminerait jamais (voir
+/// le commentaire sur ce cas particulier dans [`AtariSt::read8`]).
 pub const STE_DMA_SOUND_BASE: u32 = 0xFF8900;
 pub const STE_DMA_SOUND_END: u32 = 0xFF893F;
 /// Registre Microwire DATA (interface série vers le mixeur LMC1992) — voir
@@ -822,19 +826,21 @@ impl AtariSt {
         let mut guard = 0u64;
         while self.last_absolute_line < absolute_line_now && guard < lines_per_frame {
             self.last_absolute_line += 1;
-            let idx = (self.last_absolute_line % lines_per_frame) as usize;
+            let absolute_line = (self.last_absolute_line % lines_per_frame) as u32;
             // Câblage matériel réel ST/STE : le Shifter ne fetch (et donc
-            // n'avance son compteur vidéo) QUE pendant les lignes visibles
-            // (200, quel que soit PAL/NTSC) — pas pendant le blanking
-            // vertical. Idem pour l'entrée externe TBI du Timer B du MFP,
-            // reliée au signal de balayage actif (DE), pas au HBL brut :
-            // elle ne pulse que sur ces mêmes lignes visibles. C'est
-            // exactement ce que le boot TOS exploite pour détecter qu'il
-            // vient d'entrer en VBL : il programme le Timer B en mode
-            // event-count puis attend que la valeur cesse de changer (~615
-            // lectures stables), ce qui n'arrive jamais tant qu'on reste
-            // dans la zone visible.
-            if idx < VISIBLE_LINES {
+            // n'avance son compteur vidéo) QUE pendant les lignes affichées
+            // (`Glue::display_index`, fenêtre nominale de 200 lignes,
+            // potentiellement étendue par une suppression de bordure
+            // haute/basse STE — voir `peripherals::atari_st::shifter`) —
+            // pas pendant le blanking vertical. Idem pour l'entrée externe
+            // TBI du Timer B du MFP, reliée au signal de balayage actif
+            // (DE), pas au HBL brut : elle ne pulse que sur ces mêmes
+            // lignes affichées. C'est exactement ce que le boot TOS
+            // exploite pour détecter qu'il vient d'entrer en VBL : il
+            // programme le Timer B en mode event-count puis attend que la
+            // valeur cesse de changer (~615 lectures stables), ce qui
+            // n'arrive jamais tant qu'on reste dans la zone affichée.
+            if let Some(idx) = self.glue.display_index(absolute_line).map(|i| i as usize) {
                 let row = self.shifter.render_scanline(&self.ram);
                 if idx >= self.framebuffer.len() {
                     self.framebuffer.resize(idx + 1, Vec::new());
@@ -1045,6 +1051,9 @@ impl AtariSt {
                 | shifter::addr::VIDEO_COUNTER_MID
                 | shifter::addr::VIDEO_COUNTER_LOW
                 | shifter::addr::RESOLUTION
+                | shifter::addr::HSCROLL_NO_PREFETCH
+                | shifter::addr::HSCROLL_PREFETCH
+                | shifter::addr::LINE_WIDTH
         ) || (shifter::addr::PALETTE_BASE..shifter::addr::PALETTE_BASE + 32).contains(&addr)
     }
 
@@ -1132,6 +1141,7 @@ impl AtariSt {
             ACIA_KEYBOARD_CONTROL | ACIA_KEYBOARD_DATA => return "acia-keyboard",
             ACIA_MIDI_CONTROL | ACIA_MIDI_DATA => return "acia-midi",
             YM2149_SELECT | YM2149_DATA => return "ym2149",
+            GLUE_SYNC => return "glue",
             _ if Self::is_shifter_addr(addr) => return "shifter",
             FDC_DATA | DMA_MODE | DMA_ADDR_HIGH | DMA_ADDR_MID | DMA_ADDR_LOW => return "wd1772-dma",
             _ if blitter_present && (BLITTER_BASE..BLITTER_BASE + blitter::reg::END).contains(&addr) => {
@@ -1193,6 +1203,7 @@ impl Bus for AtariSt {
             ACIA_MIDI_DATA => return self.acia_midi.read(acia::reg::DATA),
             YM2149_SELECT => return self.ym2149.read(ym2149::bus_offset::SELECT),
             YM2149_DATA => return self.ym2149.read(ym2149::bus_offset::DATA),
+            GLUE_SYNC => return self.glue.read_sync(),
             _ if Self::is_shifter_addr(addr) => return self.shifter.read(addr),
             FDC_DATA => return self.wd1772.read(self.dma_register_select),
             DMA_MODE => return self.dma_register_select,
@@ -1436,6 +1447,58 @@ impl Bus for AtariSt {
             }
             YM2149_DATA => {
                 self.ym2149.write(ym2149::bus_offset::DATA, value);
+                return;
+            }
+            // Registre de synchronisation du GLUE ($FF820A) : registre
+            // matériel UNIQUE, mais deux effets distincts modélisés dans
+            // deux composants séparés — un switch vers 60Hz bien placé en
+            // cycle près du haut/bas de la fenêtre affichée supprime la
+            // bordure VERTICALE correspondante pour la trame en cours
+            // (`Glue::write_sync`), tandis qu'un switch bien placé près de
+            // la fin de ligne (`RIGHT_OFF`) ou très tôt dans la ligne
+            // (nudges `LEFT_PLUS_2`/`RIGHT_MINUS_2`) supprime/ajuste la
+            // bordure HORIZONTALE de la ligne en cours (`Shifter::write_sync`,
+            // voir sa doc de module) — les deux ont besoin de la position en
+            // cycles dans la ligne, connue seulement du board.
+            GLUE_SYNC => {
+                self.glue.write_sync(value);
+                self.shifter.write_sync(value, self.glue.cycles_in_line());
+                return;
+            }
+            // Défilement fin STE ($FF8264/$FF8265) et largeur de ligne
+            // ($FF820F) : contrairement aux autres registres Shifter, leur
+            // effet dépend du CYCLE d'écriture dans la ligne courante — une
+            // écriture avant le début d'affichage actif (ou pendant une
+            // ligne hors zone visible, bordure haute/basse : rien à
+            // protéger) s'applique à la ligne EN COURS, une écriture plus
+            // tardive est différée à la ligne suivante (`pending_*` côté
+            // `Shifter`). Seuils cycle-exacts identiques à Hatari
+            // (`video.c`, `Video_HorScroll_Write`/`Video_LineWidth_WriteByte`) :
+            // `line_start_cycle()` (56 PAL/52 NTSC) pour le défilement,
+            // `line_end_cycle()` (376 PAL/372 NTSC, fin d'affichage actif)
+            // pour la largeur de ligne — seuil différent car LineWidth
+            // s'ajoute à l'adresse au moment où l'affichage actif se
+            // termine, pas à son début.
+            shifter::addr::HSCROLL_NO_PREFETCH | shifter::addr::HSCROLL_PREFETCH => {
+                let visible = self.glue.display_line().is_some();
+                let apply_now = !visible || self.glue.cycles_in_line() <= self.glue.line_start_cycle();
+                let prefetch = addr == shifter::addr::HSCROLL_PREFETCH;
+                self.shifter.write_hscroll(value, prefetch, apply_now);
+                return;
+            }
+            shifter::addr::LINE_WIDTH => {
+                let visible = self.glue.display_line().is_some();
+                let apply_now = !visible || self.glue.cycles_in_line() <= self.glue.line_end_cycle();
+                self.shifter.write_line_width(value, apply_now);
+                return;
+            }
+            // Résolution ($FF8260) : même principe que ci-dessus, la
+            // position en cycles dans la ligne détermine si un passage bref
+            // en haute résolution/retour déclenche le trick de suppression
+            // de bordure gauche STE (`LEFT_OFF_2_STE`, voir la doc de
+            // module de `Shifter`) — seul le board connaît cette position.
+            shifter::addr::RESOLUTION => {
+                self.shifter.write_resolution(value, self.glue.cycles_in_line());
                 return;
             }
             _ if Self::is_shifter_addr(addr) => {

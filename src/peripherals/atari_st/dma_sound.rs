@@ -3,11 +3,27 @@
 //! en mono ou stéréo.
 //!
 //! Reproduit le comportement fonctionnel de Hatari (`dmaSnd.c`), simplifié :
-//! pas de FIFO 8 octets ni de filtres passe-bas/LMC1992 (bass/treble) —
-//! seuls l'avancement du compteur de trame, la boucle/arrêt de fin de trame,
-//! et la conversion de fréquence vers le taux de sortie hôte sont modélisés.
-//! Suffisant pour une lecture correcte et sans coupure ; le filtrage de
-//! tonalité reste un raffinement non demandé à ce stade.
+//! pas de FIFO 8 octets — seuls l'avancement du compteur de trame, la
+//! boucle/arrêt de fin de trame, et la conversion de fréquence vers le
+//! taux de sortie hôte sont modélisés. Le filtre passe-bas/LMC1992
+//! (bass/treble) EST modélisé, mais côté `Microwire` (voir sa doc de
+//! module), en aval du mixage PSG+DMA Sound — pas ici, qui ne fournit que
+//! les échantillons PCM bruts.
+//!
+//! **FIFO 8 octets, délibérément pas modélisé** : sur silicium réel, la
+//! RAM est lue par blocs de 8 octets une fois par HBL (pas en continu au
+//! rythme de la fréquence d'échantillonnage) — Hatari le modélise
+//! fidèlement (`DmaSnd_FIFO_Refill`/`DmaSnd_FIFO_PullByte`, `dmaSnd.c`) car
+//! cette granularité HBL a un effet audible réel sur les rares logiciels
+//! qui réécrivent le tampon d'échantillons PENDANT la lecture (Hatari cite
+//! nommément "Mental Hangover" et "Power Up Plus") : selon que la RAM est
+//! relue au rythme HBL ou au moment exact de chaque échantillon consommé
+//! (ce que fait ce module), l'écriture en direct devient audible avec un
+//! décalage différent (jusqu'à ~1 HBL). Effet réel mais étroit (aucun cas
+//! connu dans ce projet aujourd'hui) ; Steem SSE lui-même ne modélise pas
+//! de FIFO pour le DMA Sound STE (son "FIFO" à lui est celui du contrôleur
+//! DMA disquette/ACSI, un périphérique différent) — à reconsidérer si un
+//! jeu/démo concret révèle un problème, pas anticipé sans cas connu.
 //!
 //! ## Registres (adresses relatives à `STE_DMA_SOUND_BASE` = `0xFF8900`)
 //! Voir [`reg`]. Le Microwire (`$FF8920`/`$FF8922`/`$FF8924`) est un

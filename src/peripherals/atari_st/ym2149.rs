@@ -14,10 +14,23 @@
 //! de convertir [`Ym2149::channel_level`] en échantillons audio réels selon
 //! son propre pipeline de sortie.
 //!
+//! ## Mixage non-linéaire des 3 canaux (façon Hatari)
+//! [`mix_channels_model`] combine 3 niveaux de canal (0-31) en un seul
+//! échantillon, en modélisant le DAC réel de la puce comme trois
+//! résistances de tirage réglables en parallèle sur une résistance de
+//! charge fixe (diviseur de tension) — PAS une simple somme des 3 niveaux :
+//! le silicium réel n'est physiquement pas un sommateur linéaire (combiner
+//! 2-3 voies à pleine amplitude sature nettement en dessous de 3× une seule
+//! voie). Formule et constantes reprises telles quelles de Hatari
+//! (`sound.c`, `YM2149_BuildModelVolumeTable`, modèle attribué à David
+//! Savinkoff, analyse de mesures réelles par Paulo Simoes et Benjamin
+//! Gerard) — voir la doc de la fonction pour le détail.
+//!
 //! ## Limitations connues (v1)
-//! - Pas de conversion en échantillons PCM : seuls les niveaux numériques
-//!   0-31 par canal sont exposés (mélange tonalité/bruit/enveloppe déjà
-//!   fait, mais pas de courbe DAC ni de filtrage analogique simulés).
+//! - Pas de conversion en échantillons PCM allant au-delà du mixage 3
+//!   canaux ci-dessus : pas de filtrage analogique en aval simulé (voir
+//!   plutôt `Microwire` pour le filtre graves/aigus LMC1992, en aval du
+//!   mixage PSG+DMA Sound).
 //! - Signification des bits des ports A/B (sélection lecteur, joystick,
 //!   Centronics...) non interprétée : ce sont des registres 8 bits bruts,
 //!   à charge du board de leur donner un sens.
@@ -459,7 +472,83 @@ impl Ym2149 {
         if amplitude & 0x10 != 0 {
             self.envelope.level()
         } else {
-            (amplitude & 0x0F) * 2
+            VOLUME_4_TO_5[(amplitude & 0x0F) as usize]
         }
     }
+}
+
+/// Conversion volume fixe 4 bits (registre d'amplitude) -> échelle 5 bits
+/// (0-31, même échelle que l'enveloppe) — telle que MESURÉE sur silicium
+/// réel (Hatari, `sound.c`, `YmVolume4to5`), PAS un simple ×2 :
+/// `volume5 = volume4*2+1`, sauf 0 et 1 qui restent 0 et 1 (pour que 0
+/// reste bien 0 et que 15 devienne bien 31, aux deux extrémités). Utilisée
+/// par [`Ym2149::channel_level`] ; l'enveloppe, elle, parcourt déjà
+/// nativement 0-31 en pas de 1 (voir [`Envelope::level`]) et n'a pas besoin
+/// de cette conversion.
+const VOLUME_4_TO_5: [u8; 16] = [0, 1, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31];
+
+/// Table des 32 "conductances" par canal du modèle de mixage non-linéaire
+/// 3 voies, façon Hatari (`YM2149_BuildModelVolumeTable`, `sound.c`) —
+/// construite une seule fois (calcul récursif partant du niveau 31, voir
+/// [`build_conductance_table`]).
+fn conductance_table() -> &'static [f64; 32] {
+    static TABLE: std::sync::OnceLock<[f64; 32]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_conductance_table)
+}
+
+/// Construit la table de conductances — voir [`conductance_table`]. Modèle
+/// physique du DAC réel : chaque canal est vu comme une résistance de
+/// tirage réglable (0-31), le niveau 31 correspondant à la conductance la
+/// plus élevée (résistance la plus faible). `FOURTH2` (racine quatrième de
+/// deux) et `WARP` sont repris tels quels de Hatari, où `WARP` est
+/// documenté comme "mesuré à 1.65932 depuis 46602" (résultat empirique,
+/// pas dérivé analytiquement).
+fn build_conductance_table() -> [f64; 32] {
+    const FOURTH2: f64 = 1.19;
+    const WARP: f64 = 1.666666666666666667;
+    let mut conductance = 2.0 / 3.0 / (1.0 - 1.0 / WARP) - 2.0 / 3.0; // = 1.0
+    let mut table = [0.0f64; 32];
+    for i in (1..=31).rev() {
+        table[i] = conductance / 2.0;
+        conductance = 1.0 / (1.0 - 1.0 / FOURTH2 / (1.0 / conductance + 1.0)) - 1.0;
+    }
+    table[0] = 1.0e-8; // évite une division par zéro (silence total)
+    table
+}
+
+/// Conductance interpolée linéairement pour un niveau FRACTIONNAIRE
+/// (0.0-31.0) — [`Ym2149::take_averaged_levels`] renvoie une moyenne
+/// temporelle (anti-repliement), pas un niveau entier 0-31 comme le
+/// ferait un échantillonnage instantané façon Hatari ; interpoler entre
+/// les 2 entrées de table les plus proches est une adaptation raisonnable
+/// de ce modèle discret à une entrée continue (l'écart entre deux niveaux
+/// adjacents du DAC réel est de toute façon faible, ~1.19× en amplitude).
+fn conductance_at(table: &[f64; 32], level: f32) -> f64 {
+    let level = level.clamp(0.0, 31.0);
+    let lo = level.floor() as usize;
+    let hi = (lo + 1).min(31);
+    let frac = (level - lo as f32) as f64;
+    table[lo] * (1.0 - frac) + table[hi] * frac
+}
+
+/// Combine 3 niveaux de canal (0-31, voir [`Ym2149::channel_level`]/
+/// [`Ym2149::take_averaged_levels`]) en un seul échantillon de sortie
+/// NON-LINÉAIRE, façon Hatari (`YM2149_BuildModelVolumeTable`,
+/// `YM_MODEL_MIXING`) — voir la doc de module. Renvoie une valeur dans
+/// `0.0..=65535.0` (0 = silence, 65535 = les 3 canaux au maximum
+/// simultanément) ; à centrer/mettre à l'échelle par l'appelant selon son
+/// propre pipeline de sortie (voir `atari_st_sdl2.rs::mix_sample`).
+///
+/// Formule reprise telle quelle de Hatari (`sound.c`, commentaire attribué
+/// à David Savinkoff) : `(MaxVol*WARP) / (1.0 +
+/// 1.0/(conductance_i+conductance_j+conductance_k))` — un diviseur de
+/// tension entre la résistance de charge fixe (normalisée à 1.0) et les 3
+/// résistances de tirage réglables en parallèle.
+pub fn mix_channels_model(levels: [f32; 3]) -> f32 {
+    const MAX_VOL: f64 = 65535.0;
+    const WARP: f64 = 1.666666666666666667;
+    let table = conductance_table();
+    let sum =
+        conductance_at(table, levels[0]) + conductance_at(table, levels[1]) + conductance_at(table, levels[2]);
+    ((MAX_VOL * WARP) / (1.0 + 1.0 / sum)) as f32
 }

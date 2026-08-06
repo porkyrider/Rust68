@@ -13,16 +13,22 @@
 //! board, pas à la puce).
 //!
 //! ## Limitations connues (v1)
-//! - Pas de résolution de priorité imbriquée entre canaux : le canal actif
-//!   de plus haute priorité masque simplement tous les autres tant qu'il
-//!   n'est pas acquitté, conformément au mode le plus courant, mais sans
-//!   modéliser l'interruption d'un ISR de priorité inférieure par un
-//!   nouveau canal de priorité supérieure en cours de service.
 //! - L'USART est un modèle "au byte" (pas de bit start/stop/parité ni de
 //!   génération de baud rate réelle) : `push_rx_byte`/`take_tx_byte`
-//!   simulent la réception/émission au niveau octet.
+//!   simulent la réception/émission au niveau octet — choix délibéré, RS232
+//!   n'est pas dans le périmètre visé (aucun logiciel testé n'en dépend au
+//!   niveau bit).
 //! - `tick()` suppose une horloge CPU fixe à 8 MHz (ST/STE) pour convertir
-//!   les cycles CPU en cycles d'horloge MFP réelle (2.4576 MHz).
+//!   les cycles CPU en cycles d'horloge MFP réelle (2.4576 MHz) — choix
+//!   délibéré cohérent avec le reste du board (`model::MachineProfile`
+//!   documente `cpu_hz` comme informatif seul pour la même raison).
+//! - Si plusieurs périodes de timer s'écoulent en un seul appel `tick()`
+//!   (rare : `tick_delay_timer` traite déjà tous les décréments réellement
+//!   dus, y compris un éventuel rebouclage complet du compteur 8 bits), le
+//!   canal ne s'arme qu'une fois — conforme au silicium réel, où `IPR` est
+//!   un simple bit et pas un compteur d'occurrences : une deuxième
+//!   expiration avant acquittement de la première ne peut de toute façon
+//!   pas être distinguée matériellement.
 
 /// Offsets des registres dans l'espace d'adressage de la puce (÷2 : sur
 /// Atari ST réel, le MFP est mappé aux adresses impaires 0xFFFA01,
@@ -331,7 +337,19 @@ impl Mfp {
             reg::ISRB => self.isr &= 0xFF00 | value as u16,
             reg::IMRA => self.imr = (self.imr & 0x00FF) | ((value as u16) << 8),
             reg::IMRB => self.imr = (self.imr & 0xFF00) | value as u16,
-            reg::VR => self.vr = value,
+            reg::VR => {
+                // Transition bit S (bit 3) de 1 (SEI, "software
+                // end-of-interrupt") vers 0 (EOI automatique) : le silicium
+                // efface ISRA/ISRB EN BLOC — confirmé contre Hatari
+                // (`MFP_VectorReg_WriteByte`, `mfp.c`). Voir la doc de
+                // `Self::iack` pour le sens exact du bit S (INVERSÉ par
+                // rapport à une lecture superficielle du datasheet — bit
+                // posé = SEI, PAS "auto").
+                if self.vr & 0x08 != 0 && value & 0x08 == 0 {
+                    self.isr = 0;
+                }
+                self.vr = value;
+            }
             reg::TACR => {
                 self.ta.control = value & 0x0F;
                 self.ta.reload();
@@ -513,43 +531,74 @@ impl Mfp {
         }
     }
 
-    /// Vrai si au moins un canal pending+enabled+non masqué demande service
-    /// — c'est ce signal que le board doit relayer vers `Bus::irq_level`
-    /// (câblé sur IPL6 sur ST/STE réel).
+    /// Vrai si au moins un canal éligible (voir
+    /// [`Self::highest_priority_pending`]) demande service — c'est ce
+    /// signal que le board doit relayer vers `Bus::irq_level` (câblé sur
+    /// IPL6 sur ST/STE réel).
     pub fn interrupt_requested(&self) -> bool {
-        self.ipr & self.imr != 0
+        self.highest_priority_pending().is_some()
     }
 
     /// Canal actif de plus haute priorité (15 = le plus prioritaire, table
-    /// du datasheet), parmi ceux pending+enabled+non masqués.
+    /// du datasheet) parmi ceux pending+enabled+non masqués, **à condition
+    /// qu'aucun canal de priorité STRICTEMENT supérieure ne soit déjà "in
+    /// service"** (ISR) — résolution de priorité imbriquée conforme au
+    /// vrai MC68901 : un ISR de priorité inférieure en cours de traitement
+    /// est préemptable par un nouveau canal de priorité supérieure, mais
+    /// bloque (le temps de son propre traitement) tout canal de priorité
+    /// inférieure ou égale, qui reste pending sans jamais générer de
+    /// requête IPL tant que le canal supérieur reste in-service. Confirmé
+    /// contre Hatari (`mfp.c`, `MFP_InterruptRequest`/
+    /// `MFP_CheckPendingInterrupts` : le masque de "canaux de priorité
+    /// supérieure" appliqué à ISR avant d'autoriser une requête) — notre
+    /// numérotation de canal (0-15, `channel` ci-dessus) code déjà l'ordre
+    /// de priorité complet dans un seul entier, donc "canaux de priorité
+    /// supérieure au canal N" est simplement "bits d'index > N" sur `isr`,
+    /// sans distinction A/B à faire séparément.
     fn highest_priority_pending(&self) -> Option<u8> {
-        let active = self.ipr & self.imr;
-        if active == 0 {
-            None
-        } else {
-            Some(15 - active.leading_zeros() as u8)
+        let mut higher_mask: u16 = 0; // aucun canal de priorité > 15
+        for chan in (0..=15u8).rev() {
+            let bit = 1u16 << chan;
+            if self.ipr & self.imr & bit != 0 && self.isr & higher_mask == 0 {
+                return Some(chan);
+            }
+            higher_mask |= bit;
         }
+        None
     }
 
     /// Cycle d'acquittement d'interruption (IACK) : calcule le vecteur pour
     /// le canal actif de plus haute priorité, efface son bit pending, et
-    /// arme son bit "in service".
+    /// arme (ou pas, voir ci-dessous) son bit "in service" selon le bit S
+    /// (bit 3) du VR.
     ///
-    /// Armé dans les deux modes du bit S du VR (bit 3, "automatic
-    /// end-of-interrupt"), pas seulement en mode logiciel : ce bit dispense
-    /// le logiciel d'avoir à *effacer* ISR lui-même en fin de traitement (le
-    /// matériel le fait automatiquement), mais ISR reste bien lisible
-    /// PENDANT le traitement — confirmé par la cartouche de diagnostic
-    /// usine STe (test "T0 MFP timer"), dont le gestionnaire d'interruption
-    /// partagé (une seule routine installée aux 4 vecteurs Timer A/B/C/D)
-    /// distingue quel timer a déclenché en lisant précisément ces bits ISR,
-    /// alors même qu'elle programme VR=0x48 (auto-EOI posé) : si ISR n'était
-    /// jamais armé dans ce mode, ce mécanisme ne pourrait fonctionner sur
-    /// aucun ST/STE réel. Notre ancienne lecture ("jamais armé en auto-EOI")
-    /// venait d'une interprétation du datasheet jamais vérifiée contre du
-    /// vrai logiciel — corrigée ici après l'avoir vue bloquer ce test précis
-    /// (le compteur $284 attendu à zéro restait bloqué à une valeur non
-    /// nulle, ISRA jamais vu posé par le gestionnaire).
+    /// **Sens du bit S — attention, contre-intuitif** : bit posé (1) =
+    /// **SEI** ("software end-of-interrupt") : ISR s'arme à l'IACK et reste
+    /// posé jusqu'à effacement logiciel explicite (écriture de 0 dans
+    /// ISRA/ISRB) — c'est CE mode qu'utilise la cartouche de diagnostic
+    /// usine STe (test "T0 MFP timer", VR=0x48, bit S posé), dont le
+    /// gestionnaire d'interruption partagé (une seule routine aux 4
+    /// vecteurs Timer A/B/C/D) distingue quel timer a déclenché en lisant
+    /// précisément ces bits ISR avant de les effacer lui-même. Bit à 0 = EOI
+    /// **automatique** : le silicium arme PUIS efface ISR dans le MÊME
+    /// cycle IACK, avant même que le CPU n'ait récupéré le vecteur — ISR
+    /// n'est donc jamais observable posé pour ce canal dans ce mode.
+    /// Confirmé contre Hatari (`mfp.c`, `MFP_ProcessIACK` :
+    /// `if (VR & 0x08) ISR|=Bit; else ISR&=~Bit;` — bit posé = SEI).
+    ///
+    /// Une lecture précédente de ce code assumait l'inverse (bit posé =
+    /// "auto", jamais armé) puis, en la corrigeant suite au test cartouche
+    /// ci-dessus, était passée à "toujours armé quel que soit le bit" au
+    /// lieu de conditionner correctement sur le VRAI sens du bit — un canal
+    /// EOI-automatique (bit S=0) voyait alors son ISR rester bloqué posé
+    /// pour toujours (rien ne l'efface jamais dans ce mode, contrairement
+    /// au mode SEI où le logiciel s'en charge), ce qui, combiné à la
+    /// résolution de priorité imbriquée ci-dessus (un ISR posé bloque tout
+    /// canal de priorité égale/inférieure), pouvait bloquer indéfiniment
+    /// TOUS les canaux MFP de priorité inférieure après le tout premier
+    /// live EOI-automatique — reproduit en pratique par un son qui ne
+    /// s'arrête plus et une souris qui ne répond plus plus correctement
+    /// dès qu'un tel canal s'arme (ex: GEM, Bureau > Informations).
     ///
     /// Renvoie le vecteur complet : bits 7-4 = `VR[7:4]` (base programmée
     /// par le logiciel), bits 3-0 = numéro de canal (0-15 — le bit 3 du VR
@@ -565,7 +614,11 @@ impl Mfp {
         };
         let mask = 1u16 << chan;
         self.ipr &= !mask;
-        self.isr |= mask;
+        if self.vr & 0x08 != 0 {
+            self.isr |= mask; // SEI : reste posé jusqu'à effacement logiciel
+        } else {
+            self.isr &= !mask; // EOI automatique : armé PUIS effacé dans le même cycle
+        }
         (self.vr & 0xF0) | chan
     }
 
